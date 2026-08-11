@@ -5,7 +5,7 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 export const QUALITY_THRESHOLDS = Object.freeze({ standard: 68, high: 78, exceptional: 88 });
 export const STAKE_PROFILES = Object.freeze({ FLAT: "FLAT", ADAPTIVE_CAPPED: "ADAPTIVE_CAPPED", OBSERVED_10_30_90_270: "OBSERVED_10_30_90_270" });
 const AUTONOMOUS_STRATEGY = "completed-candle-horizons";
-export const AUTONOMOUS_STRATEGY_VERSION = "0.2.0";
+export const AUTONOMOUS_STRATEGY_VERSION = "0.3.0";
 const analysisTimeframes = ["1m", "5m", "15m", "1h"];
 
 export function sma(values, period) {
@@ -53,11 +53,119 @@ export function calculateIndicators(candles) {
   const baseline = sma(candles.slice(-21, -1).map((candle) => candle.volume), 20);
   const zones = candles.slice(-30, -1);
   return {
-    rsi14: rsi(closes), ema9: ema(closes, 9), ema21: ema(closes, 21), atr14: atr(candles),
+    rsi14: rsi(closes), ema9: ema(closes, 9), ema20: ema(closes, 20), ema21: ema(closes, 21), ema50: ema(closes, 50), atr14: atr(candles),
     bollingerUpper: bands?.upper ?? null, bollingerMiddle: bands?.middle ?? null, bollingerLower: bands?.lower ?? null,
     relativeVolume20: currentVolume !== undefined && baseline ? currentVolume / baseline : null,
     support: zones.length ? Math.min(...zones.map((candle) => candle.low)) : null,
     resistance: zones.length ? Math.max(...zones.map((candle) => candle.high)) : null,
+  };
+}
+
+const STRUCTURE_PIVOT_SPAN = 2;
+const STRUCTURE_LOOKBACK = 80;
+const RECENT_EVENT_BARS = 6;
+const FVG_ACTIVE_BARS = 30;
+
+function latestByIndex(items, indexKey = "index") {
+  return items.reduce((latest, item) => !latest || item[indexKey] > latest[indexKey] ? item : latest, null);
+}
+function eventAge(candles, event, indexKey = "index") {
+  return event ? candles.length - 1 - event[indexKey] : null;
+}
+function confirmedSwings(candles) {
+  const swings = [];
+  const start = Math.max(STRUCTURE_PIVOT_SPAN, candles.length - STRUCTURE_LOOKBACK);
+  for (let index = start; index < candles.length - STRUCTURE_PIVOT_SPAN; index += 1) {
+    const candle = candles[index];
+    const neighbors = candles.slice(index - STRUCTURE_PIVOT_SPAN, index + STRUCTURE_PIVOT_SPAN + 1).filter((_, offset) => offset !== STRUCTURE_PIVOT_SPAN);
+    const confirmedIndex = index + STRUCTURE_PIVOT_SPAN;
+    if (neighbors.every((item) => candle.high > item.high)) swings.push({ type: "HIGH", price: candle.high, index, occurredAt: new Date(candle.closeTime).toISOString(), confirmedIndex, confirmedAt: new Date(candles[confirmedIndex].closeTime).toISOString() });
+    if (neighbors.every((item) => candle.low < item.low)) swings.push({ type: "LOW", price: candle.low, index, occurredAt: new Date(candle.closeTime).toISOString(), confirmedIndex, confirmedAt: new Date(candles[confirmedIndex].closeTime).toISOString() });
+  }
+  return swings;
+}
+function structureBias(availableSwings) {
+  const highs = availableSwings.filter((swing) => swing.type === "HIGH").slice(-2);
+  const lows = availableSwings.filter((swing) => swing.type === "LOW").slice(-2);
+  if (highs.length < 2 || lows.length < 2) return "NEUTRAL";
+  if (highs[1].price > highs[0].price && lows[1].price > lows[0].price) return "UP";
+  if (highs[1].price < highs[0].price && lows[1].price < lows[0].price) return "DOWN";
+  return "NEUTRAL";
+}
+function fairValueGaps(candles) {
+  const gaps = [];
+  const start = Math.max(2, candles.length - STRUCTURE_LOOKBACK);
+  for (let index = start; index < candles.length; index += 1) {
+    const first = candles[index - 2]; const third = candles[index];
+    let gap = null;
+    if (third.low > first.high) gap = { direction: "UP", lower: first.high, upper: third.low };
+    if (third.high < first.low) gap = { direction: "DOWN", lower: third.high, upper: first.low };
+    if (!gap) continue;
+    const feature = { ...gap, index, createdAt: new Date(third.closeTime).toISOString(), retestIndex: null, retestedAt: null, inversionIndex: null, invertedAt: null, inversionDirection: null };
+    for (let cursor = index + 1; cursor < candles.length; cursor += 1) {
+      const candle = candles[cursor];
+      const inverted = gap.direction === "UP" ? candle.close < gap.lower : candle.close > gap.upper;
+      if (inverted) {
+        feature.inversionIndex = cursor; feature.invertedAt = new Date(candle.closeTime).toISOString(); feature.inversionDirection = gap.direction === "UP" ? "DOWN" : "UP";
+        break;
+      }
+      const touched = candle.low <= gap.upper && candle.high >= gap.lower;
+      if (touched && feature.retestIndex === null) { feature.retestIndex = cursor; feature.retestedAt = new Date(candle.closeTime).toISOString(); }
+    }
+    feature.status = feature.inversionIndex !== null ? "INVERTED" : feature.retestIndex !== null ? "RETESTED" : "ACTIVE";
+    gaps.push(feature);
+  }
+  return gaps;
+}
+function structureEvents(candles, swings) {
+  const sweeps = []; const shifts = []; const consumed = new Set();
+  const swingKey = (swing) => `${swing.type}:${swing.index}`;
+  const start = Math.max(1, candles.length - STRUCTURE_LOOKBACK);
+  for (let index = start; index < candles.length; index += 1) {
+    const candle = candles[index]; const previous = candles[index - 1];
+    const available = swings.filter((swing) => swing.confirmedIndex < index);
+    const active = available.filter((swing) => !consumed.has(swingKey(swing)));
+    const biasBeforeBreak = structureBias(available);
+    const terminalEvents = [];
+    for (const swing of active) {
+      if (swing.type === "LOW" && candle.close < swing.price) terminalEvents.push({ type: "SHIFT", swing, direction: "DOWN" });
+      else if (swing.type === "LOW" && candle.low < swing.price && candle.close > swing.price) terminalEvents.push({ type: "SWEEP", swing, direction: "UP" });
+      if (swing.type === "HIGH" && candle.close > swing.price) terminalEvents.push({ type: "SHIFT", swing, direction: "UP" });
+      else if (swing.type === "HIGH" && candle.high > swing.price && candle.close < swing.price) terminalEvents.push({ type: "SWEEP", swing, direction: "DOWN" });
+    }
+    terminalEvents.sort((left, right) => right.swing.index - left.swing.index);
+    for (const event of terminalEvents) {
+      consumed.add(swingKey(event.swing));
+      if (event.type === "SWEEP") {
+        sweeps.push({ direction: event.direction, index, level: event.swing.price, swingIndex: event.swing.index, sweptSwingAt: event.swing.occurredAt, occurredAt: new Date(candle.closeTime).toISOString() });
+      } else if ((event.direction === "UP" && previous.close <= event.swing.price) || (event.direction === "DOWN" && previous.close >= event.swing.price)) {
+        shifts.push({ direction: event.direction, index, level: event.swing.price, swingIndex: event.swing.index, kind: biasBeforeBreak === (event.direction === "UP" ? "DOWN" : "UP") ? "CHOCH" : "MSS", priorBias: biasBeforeBreak, occurredAt: new Date(candle.closeTime).toISOString() });
+      }
+    }
+  }
+  return { sweeps, shifts, activeSwings: swings.filter((swing) => !consumed.has(swingKey(swing))) };
+}
+function marketStructure(timeframe, candles) {
+  const indicators = calculateIndicators(candles); const current = candles.at(-1);
+  if (!current || candles.length < 50 || indicators.ema20 === null || indicators.ema50 === null) {
+    return { timeframe, status: "INSUFFICIENT_DATA", definitions: { pivotSpan: STRUCTURE_PIVOT_SPAN, recentEventBars: RECENT_EVENT_BARS, fvgActiveBars: FVG_ACTIVE_BARS }, latestSwingHigh: null, latestSwingLow: null, recentFvgs: { bullish: null, bearish: null }, fvgRetests: { bullish: null, bearish: null }, invertedFvgs: { bullish: null, bearish: null }, liquiditySweeps: { bullish: null, bearish: null }, marketStructureShifts: { bullish: null, bearish: null }, emaContext: { ema20: indicators.ema20, ema50: indicators.ema50, close: current?.close ?? null, direction: "NEUTRAL", dynamicContext: "UNAVAILABLE" } };
+  }
+  const swings = confirmedSwings(candles); const gaps = fairValueGaps(candles); const { sweeps, shifts, activeSwings } = structureEvents(candles, swings);
+  const latestGap = (direction) => latestByIndex(gaps.filter((gap) => gap.direction === direction && gap.inversionIndex === null && eventAge(candles, gap) <= FVG_ACTIVE_BARS));
+  const latestRetest = (direction) => latestByIndex(gaps.filter((gap) => gap.direction === direction && gap.retestIndex !== null && gap.inversionIndex === null && eventAge(candles, gap, "retestIndex") <= RECENT_EVENT_BARS), "retestIndex");
+  const latestInversion = (direction) => latestByIndex(gaps.filter((gap) => gap.inversionDirection === direction && eventAge(candles, gap, "inversionIndex") <= FVG_ACTIVE_BARS), "inversionIndex");
+  const latestEvent = (items, direction) => latestByIndex(items.filter((item) => item.direction === direction && eventAge(candles, item) <= RECENT_EVENT_BARS));
+  const emaDirection = indicators.ema20 > indicators.ema50 && current.close > indicators.ema20 ? "UP" : indicators.ema20 < indicators.ema50 && current.close < indicators.ema20 ? "DOWN" : "NEUTRAL";
+  const touchingEma20 = current.low <= indicators.ema20 && current.high >= indicators.ema20;
+  return {
+    timeframe, status: "READY", definitions: { pivotSpan: STRUCTURE_PIVOT_SPAN, recentEventBars: RECENT_EVENT_BARS, fvgActiveBars: FVG_ACTIVE_BARS },
+    latestSwingHigh: latestByIndex(activeSwings.filter((swing) => swing.type === "HIGH")), latestSwingLow: latestByIndex(activeSwings.filter((swing) => swing.type === "LOW")),
+    recentFvgs: { bullish: latestGap("UP"), bearish: latestGap("DOWN") },
+    fvgRetests: { bullish: latestRetest("UP"), bearish: latestRetest("DOWN") },
+    invertedFvgs: { bullish: latestInversion("UP"), bearish: latestInversion("DOWN") },
+    liquiditySweeps: { bullish: latestEvent(sweeps, "UP"), bearish: latestEvent(sweeps, "DOWN") },
+    marketStructureShifts: { bullish: latestEvent(shifts, "UP"), bearish: latestEvent(shifts, "DOWN") },
+    emaContext: { ema20: indicators.ema20, ema50: indicators.ema50, close: current.close, direction: emaDirection, dynamicContext: touchingEma20 ? "PRICE_TOUCHING_EMA20" : current.close > indicators.ema20 ? "PRICE_ABOVE_EMA20" : "PRICE_BELOW_EMA20" },
   };
 }
 function timeframeAnalysis(timeframe, candles) {
@@ -94,43 +202,104 @@ export function autonomousCandidates(candles, options = {}) {
   const symbol = options.symbol ?? "UNKNOWN";
   const completed = Object.fromEntries(analysisTimeframes.map((timeframe) => [timeframe, (candles[timeframe] ?? []).filter((candle) => candle.closed === true)]));
   const analyses = Object.fromEntries(analysisTimeframes.map((timeframe) => [timeframe, timeframeAnalysis(timeframe, completed[timeframe])]));
+  const structureFeatures = Object.fromEntries(["5m", "15m", "1h"].map((timeframe) => [timeframe, marketStructure(timeframe, completed[timeframe])]));
   const timeframeCloseWatermarks = Object.fromEntries(analysisTimeframes.map((timeframe) => [timeframe, completedWatermark(completed[timeframe])]));
   const triggerCandles = completed["1m"];
   const current = triggerCandles.at(-1); const previous = triggerCandles.at(-2); const triggerAtr = analyses["1m"].indicators.atr14;
   let trigger = regimeDirection(analyses["1m"]);
   if (current && previous && triggerAtr > 0) trigger = clamp((current.close - previous.close) / triggerAtr, -1, 1);
-  const complete = analysisTimeframes.every((timeframe) => completed[timeframe].length >= 30 && timeframeCloseWatermarks[timeframe]);
+  const complete = analysisTimeframes.every((timeframe) => completed[timeframe].length >= 50 && timeframeCloseWatermarks[timeframe]);
   const definitions = [
-    { horizonMinutes: 10, weights: { trigger: 0.42, "5m": 0.28, "15m": 0.2, "1h": 0.1 }, emphasis: "1m trigger with 5m/15m context" },
-    { horizonMinutes: 30, weights: { trigger: 0.15, "5m": 0.2, "15m": 0.3, "1h": 0.35 }, emphasis: "1h/15m structure with 5m confirmation" },
+    { horizonMinutes: 10, weights: { trigger: 0.42, "5m": 0.28, "15m": 0.2, "1h": 0.1 }, emphasis: "1m trigger with 5m/15m context", invalidationTimeframe: "5m" },
+    { horizonMinutes: 30, weights: { trigger: 0.15, "5m": 0.2, "15m": 0.3, "1h": 0.35 }, emphasis: "1h/15m structure with 5m confirmation", invalidationTimeframe: "15m" },
   ];
-  return definitions.map(({ horizonMinutes, weights, emphasis }) => {
+  return definitions.map(({ horizonMinutes, weights, emphasis, invalidationTimeframe }) => {
     const directions = Object.fromEntries(analysisTimeframes.map((timeframe) => [timeframe, regimeDirection(analyses[timeframe])]));
     const signedStrength = trigger * weights.trigger + directions["5m"] * weights["5m"] + directions["15m"] * weights["15m"] + directions["1h"] * weights["1h"];
     const intendedDirection = signedStrength > 0 ? 1 : signedStrength < 0 ? -1 : 0;
+    const intendedLabel = intendedDirection > 0 ? "UP" : intendedDirection < 0 ? "DOWN" : "NEUTRAL";
     const structuralAlignment = horizonMinutes === 10
       ? directions["5m"] !== 0 && directions["5m"] === directions["15m"] && trigger * directions["5m"] > 0 && (directions["1h"] === 0 || directions["1h"] === directions["5m"])
       : directions["1h"] !== 0 && directions["1h"] === directions["15m"] && (directions["5m"] === 0 || directions["5m"] === directions["1h"]) && trigger * directions["1h"] >= 0;
+    const confluenceComponents = [];
+    const addComponent = (key, label, timeframe, direction, active, weight, details) => confluenceComponents.push({ key, label, timeframe, direction, active, weight, details });
+    for (const timeframe of ["5m", "15m", "1h"]) {
+      const feature = structureFeatures[timeframe]; const factor = timeframe === "15m" ? 1.25 : timeframe === "1h" ? 1 : 0.9;
+      addComponent(`ema20_50_${timeframe}`, "EMA20/EMA50 trend and dynamic price context", timeframe, feature.emaContext.direction, feature.status === "READY" && feature.emaContext.direction !== "NEUTRAL", Math.round(4 * factor), { objective: "Active when EMA20 is on the directional side of EMA50 and the completed close is on the same side of EMA20.", ...feature.emaContext });
+      if (timeframe === "1h") continue;
+      const directionalFeature = (group, indexKey = "index") => {
+        const bullish = group.bullish; const bearish = group.bearish;
+        if (!bullish) return bearish;
+        if (!bearish) return bullish;
+        return bullish[indexKey] >= bearish[indexKey] ? bullish : bearish;
+      };
+      const gap = directionalFeature(feature.recentFvgs);
+      addComponent(`recent_fvg_${timeframe}`, "Recent unviolated fair-value gap", timeframe, gap?.direction ?? "NEUTRAL", Boolean(gap && gap.status !== "INVERTED"), Math.round(3 * factor), { objective: "Three-candle imbalance: bullish when candle three low is above candle one high; bearish when candle three high is below candle one low. Active for 30 completed bars unless closed through.", zone: gap ? { lower: gap.lower, upper: gap.upper } : null, status: gap?.status ?? "NONE", createdAt: gap?.createdAt ?? null });
+      const retest = directionalFeature(feature.fvgRetests, "retestIndex");
+      addComponent(`fvg_retest_${timeframe}`, "Recent FVG retest", timeframe, retest?.direction ?? "NEUTRAL", Boolean(retest), Math.round(4 * factor), { objective: "A later completed candle overlaps an unviolated FVG zone; event remains recent for six completed bars.", zone: retest ? { lower: retest.lower, upper: retest.upper } : null, retestedAt: retest?.retestedAt ?? null });
+      const inversion = directionalFeature(feature.invertedFvgs, "inversionIndex");
+      addComponent(`ifvg_${timeframe}`, "Inverted fair-value gap (IFVG)", timeframe, inversion?.inversionDirection ?? "NEUTRAL", Boolean(inversion), Math.round(5 * factor), { objective: "A completed close crosses the far boundary of an earlier FVG, reversing that zone's direction.", originalDirection: inversion?.direction ?? null, zone: inversion ? { lower: inversion.lower, upper: inversion.upper } : null, invertedAt: inversion?.invertedAt ?? null });
+      const sweep = directionalFeature(feature.liquiditySweeps);
+      addComponent(`liquidity_sweep_${timeframe}`, "Confirmed swing liquidity sweep", timeframe, sweep?.direction ?? "NEUTRAL", Boolean(sweep), Math.round(5 * factor), { objective: "Bullish: low trades below a previously confirmed swing low and closes back above it; bearish is the inverse. Event remains recent for six completed bars.", level: sweep?.level ?? null, occurredAt: sweep?.occurredAt ?? null });
+      const shift = directionalFeature(feature.marketStructureShifts);
+      addComponent(`market_structure_shift_${timeframe}`, "CHoCH / market-structure shift", timeframe, shift?.direction ?? "NEUTRAL", Boolean(shift), Math.round(7 * factor), { objective: "A completed close crosses a previously confirmed swing after the prior completed close remained on the other side. Opposing prior swing bias labels CHOCH; otherwise MSS.", kind: shift?.kind ?? null, level: shift?.level ?? null, priorBias: shift?.priorBias ?? null, occurredAt: shift?.occurredAt ?? null });
+    }
+    const alignedStructureWeight = confluenceComponents.filter((item) => item.active && item.direction === intendedLabel).reduce((sum, item) => sum + item.weight, 0);
+    const opposingStructureWeight = confluenceComponents.filter((item) => item.active && item.direction !== "NEUTRAL" && item.direction !== intendedLabel).reduce((sum, item) => sum + item.weight, 0);
+    const structureAdjustment = intendedDirection === 0 ? 0 : Math.round(clamp((alignedStructureWeight - opposingStructureWeight) * 0.4, -8, 8));
+    const structureContradicted = confluenceComponents.some((item) => item.active && item.key === "market_structure_shift_15m" && item.direction !== intendedLabel);
     const price = current?.close ?? 0; const atrFraction = price > 0 && triggerAtr !== null ? triggerAtr / price : Infinity;
     const volatilityRegime = atrFraction > 0.015 ? "EXTREME" : atrFraction > 0.008 ? "HIGH" : "NORMAL";
     const relativeVolume = analyses["1m"].indicators.relativeVolume20;
-    const volumeBonus = relativeVolume !== null && relativeVolume >= 1.3 ? 5 : relativeVolume !== null && relativeVolume >= 1.05 ? 2 : 0;
-    const calculatedQuality = Math.round(clamp(50 + Math.abs(signedStrength) * 45 + volumeBonus, 0, 100));
+    const volumeBonus = relativeVolume !== null && relativeVolume >= 1.3 ? 4 : relativeVolume !== null && relativeVolume >= 1.05 ? 2 : 0;
+    const baseQuality = 50 + Math.abs(signedStrength) * 38 + volumeBonus;
+    const calculatedQuality = Math.round(clamp(baseQuality + structureAdjustment, 0, 100));
     const qualityScore = complete ? calculatedQuality : 0;
     const band = qualityBand(qualityScore, thresholds);
-    const qualified = complete && structuralAlignment && volatilityRegime !== "EXTREME" && qualityScore >= thresholds.standard && intendedDirection !== 0;
-    const direction = qualified ? (intendedDirection > 0 ? "UP" : "DOWN") : "WAIT";
+    const qualifiesBeforeInvalidation = complete && structuralAlignment && !structureContradicted && volatilityRegime !== "EXTREME" && qualityScore >= thresholds.standard && intendedDirection !== 0;
+    const invalidationFeature = structureFeatures[invalidationTimeframe];
+    const invalidationClose = invalidationFeature.emaContext.close;
+    const candidateLevels = intendedDirection > 0
+      ? [
+        { price: invalidationFeature.latestSwingLow?.price, source: "CONFIRMED_SWING_LOW" },
+        { price: invalidationFeature.recentFvgs.bullish?.lower, source: "BULLISH_FVG_LOWER_BOUNDARY" },
+      ].filter((level) => Number.isFinite(level.price) && Number.isFinite(invalidationClose) && level.price < invalidationClose)
+      : intendedDirection < 0
+        ? [
+          { price: invalidationFeature.latestSwingHigh?.price, source: "CONFIRMED_SWING_HIGH" },
+          { price: invalidationFeature.recentFvgs.bearish?.upper, source: "BEARISH_FVG_UPPER_BOUNDARY" },
+        ].filter((level) => Number.isFinite(level.price) && Number.isFinite(invalidationClose) && level.price > invalidationClose)
+        : [];
+    const invalidationLevel = candidateLevels.length
+      ? candidateLevels.reduce((nearest, level) => intendedDirection > 0
+        ? (level.price > nearest.price ? level : nearest)
+        : (level.price < nearest.price ? level : nearest))
+      : null;
+    const invalidationPrice = invalidationLevel?.price ?? null;
+    const qualified = qualifiesBeforeInvalidation && invalidationPrice !== null;
+    const direction = qualified ? intendedLabel : "WAIT";
+    const invalidationBasis = intendedDirection > 0 ? "nearest active structural support" : intendedDirection < 0 ? "nearest active structural resistance" : "no directional structure";
+    const invalidation = intendedDirection === 0
+      ? `No directional ${horizonMinutes}m bias exists, so no structural invalidation can be assigned.`
+      : invalidationPrice === null
+        ? `No unbreached ${invalidationTimeframe} completed-candle structural invalidation level is available; this candidate must remain WAIT.`
+        : `${intendedDirection > 0 ? "Bullish" : "Bearish"} ${horizonMinutes}m setup invalidated by a completed ${invalidationTimeframe} close ${intendedDirection > 0 ? "below" : "above"} ${invalidationPrice.toFixed(2)} (${invalidationLevel.source.toLowerCase().replaceAll("_", " ")}).`;
+    const invalidationDetails = {
+      price: invalidationPrice, text: invalidation, timeframe: invalidationTimeframe,
+      source: invalidationLevel?.source ?? null, latestCompletedClose: Number.isFinite(invalidationClose) ? invalidationClose : null,
+      condition: intendedDirection > 0 ? "COMPLETED_CLOSE_BELOW" : intendedDirection < 0 ? "COMPLETED_CLOSE_ABOVE" : null,
+      basis: invalidationBasis,
+    };
     const reasons = complete
-      ? [`${horizonMinutes}m emphasizes ${emphasis}.`, `Completed-candle confluence produced setup quality ${qualityScore}/100 (${band}); this is not a calibrated win probability.`, `1m relative volume is ${relativeVolume === null ? "unavailable" : `${relativeVolume.toFixed(2)}x`} and volatility is ${volatilityRegime}.`, !structuralAlignment ? "Required multi-timeframe alignment is absent or contradicted." : volatilityRegime === "EXTREME" ? "Extreme 1m ATR volatility blocks entry." : direction === "WAIT" ? `Quality is below the STANDARD threshold ${thresholds.standard}.` : `${direction} alignment qualifies as ${band}.`]
-      : ["All four timeframes require at least 30 completed candles and a close watermark."];
+      ? [`${horizonMinutes}m emphasizes ${emphasis}.`, `Completed-candle confluence produced setup quality ${qualityScore}/100 (${band}); quality is an auditable rules score, NOT a probability.`, `Market-structure adjustment is ${structureAdjustment >= 0 ? "+" : ""}${structureAdjustment} points from ${alignedStructureWeight} aligned versus ${opposingStructureWeight} opposing component weight.`, `1m relative volume is ${relativeVolume === null ? "unavailable" : `${relativeVolume.toFixed(2)}x`} and volatility is ${volatilityRegime}.`, !structuralAlignment ? "Required multi-timeframe alignment is absent or contradicted." : structureContradicted ? "A recent opposing 15m CHoCH/market-structure shift blocks entry." : volatilityRegime === "EXTREME" ? "Extreme 1m ATR volatility blocks entry." : invalidationPrice === null ? "A finite, unbreached, direction-appropriate structural invalidation level from the declared timeframe is required before entry." : direction === "WAIT" ? `Quality is below the STANDARD threshold ${thresholds.standard}.` : `${direction} alignment qualifies as ${band}.`, invalidation]
+      : ["All four timeframes require at least 50 completed candles and a close watermark for EMA50/structure context.", invalidation];
     const watermarkKey = analysisTimeframes.map((timeframe) => `${timeframe}:${timeframeCloseWatermarks[timeframe] ?? "missing"}`).join("|");
-    const invalidation = intendedDirection >= 0
-      ? analyses["1m"].indicators.support === null ? [] : [`Setup invalid below 1m support ${analyses["1m"].indicators.support.toFixed(2)}.`]
-      : analyses["1m"].indicators.resistance === null ? [] : [`Setup invalid above 1m resistance ${analyses["1m"].indicators.resistance.toFixed(2)}.`];
     return {
       decisionKey: `${AUTONOMOUS_STRATEGY_VERSION}:${symbol}:${horizonMinutes}:${watermarkKey}`,
       symbol, horizonMinutes, direction, qualityScore, qualityBand: band, volatilityRegime,
-      timeframeCloseWatermarks: { ...timeframeCloseWatermarks }, reasons, invalidation,
+      timeframeCloseWatermarks: { ...timeframeCloseWatermarks }, reasons, confluenceComponents,
+      structureFeatures: { ...structureFeatures }, invalidationPrice, invalidation, invalidationDetails,
+      qualityDefinition: { classification: "DETERMINISTIC_SETUP_QUALITY_NOT_PROBABILITY", baseQuality: Math.round(clamp(baseQuality, 0, 100)), structureAdjustment, scoreRange: [0, 100] },
       strategyName: AUTONOMOUS_STRATEGY, strategyVersion: AUTONOMOUS_STRATEGY_VERSION,
     };
   });
@@ -169,7 +338,7 @@ export function analyzeMarket(candles, payoutRate, now = new Date(), options = {
   if (indicators.support !== null) invalidation.push(`Bullish scenario invalid below 1m support ${indicators.support.toFixed(2)}.`);
   if (indicators.resistance !== null) invalidation.push(`Bearish scenario invalid above 1m resistance ${indicators.resistance.toFixed(2)}.`);
   const candidates = autonomousCandidates(completedCandles, options);
-  return { direction, upScore, downScore, technicalUpProbability, technicalDownProbability, confidence: Math.abs(difference) >= 30 ? "HIGH" : Math.abs(difference) >= 15 ? "MEDIUM" : "LOW", calibrationStatus: "UNCALIBRATED", breakEvenProbability: breakEven, heuristicProbability, reasons, invalidation, timeframes, candidates, classification: "MODEL_ESTIMATE", modelVersion: "rules-v0.2.0", calculatedAt: now.toISOString() };
+  return { direction, upScore, downScore, technicalUpProbability, technicalDownProbability, confidence: Math.abs(difference) >= 30 ? "HIGH" : Math.abs(difference) >= 15 ? "MEDIUM" : "LOW", calibrationStatus: "UNCALIBRATED", breakEvenProbability: breakEven, heuristicProbability, reasons, invalidation, timeframes, candidates, classification: "MODEL_ESTIMATE", modelVersion: "rules-v0.3.0", calculatedAt: now.toISOString() };
 }
 export function adaptiveStake(input) {
   const reasons = []; const breakEven = breakEvenProbability(input.payoutRate);

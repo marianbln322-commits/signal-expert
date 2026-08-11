@@ -45,6 +45,7 @@ export async function createApplication(options = {}) {
     enabled: config.autonomousEnabled && config.tradingMode === "paper", profile: config.autonomousProfile, scanMs: config.autonomousScanMs,
     symbols: config.autonomousSymbols, horizons: config.autonomousHorizons, baseFraction: config.baseStakeFraction, maxFraction: config.maxStakeFraction,
     absoluteCap: config.absoluteStakeCap, dailyProfitTarget: config.dailyProfitTarget, dailyLossLimit: config.autonomousDailyLossLimit,
+    segmentGateEnabled: config.autonomousSegmentGateEnabled, segmentMinSample: config.autonomousSegmentMinSample,
     thresholds: config.qualityThresholds, observedLadder: config.observedLadder, payoutRate: config.payoutRate,
   } });
   const rate = new Map();

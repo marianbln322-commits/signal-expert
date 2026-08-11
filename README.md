@@ -6,7 +6,8 @@ Local-first, auditable BTCUSDT/ETHUSDT market analytics and event-futures resear
 
 - Official public MEXC Spot REST ticker, depth and completed 1m/5m/15m/1h candles with source/receive timestamps.
 - Explicit Binance public market-data fallback when MEXC is unreachable; the active source and original MEXC error are always displayed.
-- RSI, EMA, ATR, Bollinger Bands, relative volume and local support/resistance.
+- RSI, EMA 9/20/21/50, ATR, Bollinger Bands, relative volume and local support/resistance.
+- Objective completed-candle market structure: confirmed swings, FVG/IFVG zones and retests, liquidity sweeps, CHoCH/MSS, explicit structural invalidation, and auditable confluence components.
 - Explainable `UP`, `DOWN` or `WAIT` research verdict plus separate completed-candle setup quality for 10m and 30m.
 - Autonomous **paper-only** scheduler for BTCUSDT/ETHUSDT: ranks 10m/30m setups, opens at most one position, waits for settlement, then scans again.
 - Bankroll-aware sizing for 500–1,000 USDT research accounts with `FLAT`, `ADAPTIVE_CAPPED`, and exact `OBSERVED_10_30_90_270` simulation profiles.
@@ -20,9 +21,9 @@ Local-first, auditable BTCUSDT/ETHUSDT market analytics and event-futures resear
 
 ## Autonomous paper strategy
 
-Version 0.2.0 enables the local autonomous scheduler by default only while `TRADING_MODE=paper`. It evaluates deterministic candidates once per unique set of completed 1m/5m/15m/1h candle close timestamps. A 10m setup emphasizes the completed 1m trigger and aligned 5m/15m structure without a contradictory 1h regime; a 30m setup requires aligned 1h/15m structure with non-adverse 5m and 1m confirmation. ATR volatility and relative volume contribute to the quality score. Extreme short-term volatility blocks entry.
+Version 0.3.0 enables the local autonomous scheduler by default only while `TRADING_MODE=paper`. It evaluates deterministic candidates once per unique set of completed 1m/5m/15m/1h candle close timestamps. A 10m setup emphasizes the completed 1m trigger and aligned 5m/15m context; a 30m setup emphasizes 1h/15m structure with 5m confirmation. EMA20/50 context, three-candle fair-value gaps and retests, inverted FVGs, confirmed swing liquidity sweeps, and completed-close CHoCH/MSS events contribute auditable confluence. Every eligible direction also requires a finite, direction-appropriate invalidation level from completed-candle structure. ATR volatility and relative volume remain part of the quality score, and extreme short-term volatility blocks entry.
 
-Setup quality (`STANDARD` ≥68, `HIGH` ≥78, `EXCEPTIONAL` ≥88) is a transparent rules score, **not** a historical or calibrated success probability. The default `ADAPTIVE_CAPPED` profile starts from 0.5% of current paper equity, applies a 1×/1.5×/2× quality multiplier, and permits at most one calculated recovery. A previous loss can select a recovery stage but can never create a setup. Every exact stake must fit all hard limits; the application blocks rather than silently reduces an unaffordable stake.
+Setup quality (`STANDARD` ≥68, `HIGH` ≥78, `EXCEPTIONAL` ≥88) is a transparent deterministic rules score, **not** a historical or calibrated success probability. Each confluence component records its timeframe, direction, objective definition, active state, and weight. The default `ADAPTIVE_CAPPED` profile starts from 0.5% of current paper equity, applies a 1×/1.5×/2× quality multiplier, and permits at most one calculated recovery. A previous loss can select a recovery stage but can never create a setup. Every exact stake must fit all hard limits; the application blocks rather than silently reduces an unaffordable stake.
 
 Default 500 USDT example at an 80% configured payout:
 
@@ -30,12 +31,16 @@ Default 500 USDT example at an 80% configured payout:
 STANDARD base stake: 2.50 USDT
 one calculated recovery after losing 2.50: 5.63 USDT
 maximum per-position bankroll fraction: 2% (10 USDT)
-daily paper target / gross-loss stop: +5 / -10 USDT
+daily PAPER stop-at-profit / gross-loss stop: +100 / -10 USDT
 ```
 
-`OBSERVED_10_30_90_270` reproduces that ladder exactly for comparison, but the same hard limits apply. On the default 500 USDT account its later stages are therefore blocked rather than allowed to endanger most of the simulated bankroll. The remaining all-profile UTC daily loss allowance is included in every new stake cap, so switching profiles cannot reset that safety budget. Pause/resume controls, the latest decision/reasons, profile/stage, active position, measured P&L, sample-sized win rate, ROI, drawdown, and loss streak are visible in the dashboard. Daily target/loss pauses automatically reset on the next UTC day; operator and exhausted-profile pauses require explicit resume.
+`OBSERVED_10_30_90_270` reproduces that ladder exactly for comparison, but the same hard limits apply. On the default 500 USDT account its later stages are therefore blocked rather than allowed to endanger most of the simulated bankroll. The remaining all-profile UTC daily loss allowance is included in every new stake cap, so switching profiles cannot reset that safety budget.
 
-Configure the simulation in `.env` with `PAPER_INITIAL_BANKROLL` (for example 500 or 1000), `AUTONOMOUS_STAKE_PROFILE`, stake fractions/cap, daily limits, thresholds, symbols, and horizons. These parameters define a research experiment; they do not create or guarantee a monthly income.
+Learning and eligibility are reported separately for BTC/ETH × 10m/30m. Each segment remains `WARMUP` until the configured minimum number of decisive autonomous PAPER outcomes (default 20). After that, its Wilson 95% interval is compared with the configured payout break-even rate: a lower bound above break-even is `VALIDATED`, an upper bound below break-even is `UNDERPERFORMING`, and overlapping evidence remains `MONITOR`. When the segment gate is enabled, only an `UNDERPERFORMING` segment is blocked; the scheduler may still select the next-ranked eligible candidate.
+
+The dashboard shows the four live setup cards, active confluence components, explicit invalidation, FVG/IFVG and EMA20/50 chart overlays, recent autonomous decisions, and segmented measured outcomes. Entry sound is browser opt-in and triggers only for a newly observed autonomous PAPER open after page load. Pause/resume controls, profile/stage, active position, measured P&L, sample-sized win rate, ROI, drawdown, and loss streak remain visible. The +100 USDT default is a **stop-after-profit safety threshold**, not a target the software promises to earn: after realized daily autonomous PAPER profit reaches it, new entries pause for that UTC day. The -10 USDT loss stop and all stake/exposure limits remain independent and active. Daily safety pauses automatically reset on the next UTC day; operator and exhausted-profile pauses require explicit resume.
+
+Configure the simulation in `.env` with `PAPER_INITIAL_BANKROLL` (for example 500 or 1000), `AUTONOMOUS_STAKE_PROFILE`, stake fractions/cap, daily safety limits, thresholds, symbols, horizons, `AUTONOMOUS_SEGMENT_GATE_ENABLED`, and `AUTONOMOUS_SEGMENT_MIN_SAMPLE`. These parameters define a research experiment; they do not create or guarantee a monthly income.
 
 ## Critical limitation
 

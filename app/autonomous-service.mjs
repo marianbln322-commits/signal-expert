@@ -71,8 +71,36 @@ export class AutonomousService {
     this.persistState(patch); this.reconcileConfiguredProfile();
   }
   scopedPerformance() { return this.database.autonomousPerformance({ profile: this.state?.profile ?? this.settings.profile, strategyVersion: AUTONOMOUS_STRATEGY_VERSION }); }
+  segmentSafeguards() {
+    return this.database.autonomousSegmentSafeguards({
+      symbols: this.settings.symbols, horizons: this.settings.horizons, minSample: this.settings.segmentMinSample,
+      profile: this.state?.profile ?? this.settings.profile, strategyVersion: AUTONOMOUS_STRATEGY_VERSION, payoutRate: this.settings.payoutRate,
+    });
+  }
+  candidateDetails(candidate, safeguard = null) {
+    return {
+      volatilityRegime: candidate.volatilityRegime ?? null,
+      confluenceComponents: candidate.confluenceComponents ?? [],
+      structureFeatures: candidate.structureFeatures ?? {},
+      qualityDefinition: candidate.qualityDefinition ?? { classification: "DETERMINISTIC_SETUP_QUALITY_NOT_PROBABILITY" },
+      segmentSafeguard: safeguard ? { ...safeguard, gateEnabled: this.settings.segmentGateEnabled } : null,
+    };
+  }
+  liveCandidates() {
+    return this.settings.symbols.flatMap((symbol) => {
+      const snapshot = this.market.snapshot(symbol); const candidates = snapshot?.analysis?.candidates ?? [];
+      return this.settings.horizons.map((horizonMinutes) => {
+        const candidate = candidates.find((item) => item.horizonMinutes === horizonMinutes);
+        return candidate ? { ...candidate, available: snapshot?.health?.dataUsable === true } : { symbol, horizonMinutes, available: false, direction: "WAIT", qualityScore: null, qualityClassification: "UNAVAILABLE_NOT_A_PROBABILITY", reason: "Completed market data or analysis is unavailable." };
+      });
+    });
+  }
   performance() {
-    return { ...this.scopedPerformance(), targets: { dailyProfit: this.settings.dailyProfitTarget, dailyLoss: this.settings.dailyLossLimit } };
+    return {
+      ...this.scopedPerformance(), segments: this.segmentSafeguards(),
+      segmentGate: { enabled: this.settings.segmentGateEnabled, minSample: this.settings.segmentMinSample },
+      targets: { dailyProfit: this.settings.dailyProfitTarget, dailyStopAtProfit: this.settings.dailyProfitTarget, dailyLoss: this.settings.dailyLossLimit, classification: "STOP_AT_PROFIT_SAFETY_THRESHOLD_NOT_PROMISED_INCOME" },
+    };
   }
   status() {
     const openPosition = this.database.openAutonomousPosition();
@@ -80,11 +108,13 @@ export class AutonomousService {
     return {
       mode: "PAPER_ONLY", liveExecutionAvailable: false, enabled: this.settings.enabled, schedulerBusy: this.busy,
       nextScanAt: this.nextScanAt, state: this.state, openPosition, latestDecision,
+      liveCandidates: this.liveCandidates(), recentDecisions: this.database.recentAutonomousDecisions(20),
       policy: {
         profile: this.state?.profile ?? this.settings.profile, strategyVersion: AUTONOMOUS_STRATEGY_VERSION, symbols: this.settings.symbols, horizonsMinutes: this.settings.horizons,
         scanMs: this.settings.scanMs, baseStakeFraction: this.settings.baseFraction, maxStakeFraction: this.settings.maxFraction,
         absoluteStakeCap: this.settings.absoluteCap, qualityThresholds: this.settings.thresholds, observedLadder: this.settings.observedLadder,
-        dailyProfitTarget: this.settings.dailyProfitTarget, dailyLossLimit: this.settings.dailyLossLimit,
+        dailyStopAtProfit: this.settings.dailyProfitTarget, dailyLossLimit: this.settings.dailyLossLimit,
+        segmentGateEnabled: this.settings.segmentGateEnabled, segmentMinSample: this.settings.segmentMinSample,
       },
     };
   }
@@ -96,7 +126,7 @@ export class AutonomousService {
       this.resumeExpiredDailyPause(); this.reconcileSettlements(); this.reconcileConfiguredProfile();
       if (!this.settings.enabled || this.state.status === "PAUSED") return;
       const performance = this.scopedPerformance();
-      if (performance.daily.pnl >= this.settings.dailyProfitTarget) { this.pause("Daily autonomous paper profit target reached."); return; }
+      if (performance.daily.pnl >= this.settings.dailyProfitTarget) { this.pause("Daily autonomous paper stop-at-profit reached; this safety threshold is not promised income."); return; }
       if (performance.combinedDaily.grossLoss >= this.settings.dailyLossLimit) { this.pause("Daily autonomous paper loss stop reached across all profiles."); return; }
       const existingOpen = this.database.openAutonomousPosition();
       if (existingOpen) {
@@ -120,8 +150,24 @@ export class AutonomousService {
       if (!eligible.length) return;
       const account = this.paper.account(); const exposureHeadroom = Math.max(0, account.equity * 0.35 - account.locked);
       const dailyLossHeadroom = Math.max(0, this.settings.dailyLossLimit - performance.combinedDaily.grossLoss);
+      const safeguards = this.segmentSafeguards();
+      const safeguardBySegment = new Map(safeguards.map((item) => [`${item.symbol}:${item.horizonMinutes}`, item]));
+      const safeguardReason = (safeguard) => {
+        const interval = safeguard.wilson95.lower === null ? "unavailable before decisive outcomes" : `${(safeguard.wilson95.lower * 100).toFixed(1)}%-${(safeguard.wilson95.upper * 100).toFixed(1)}%`;
+        const breakEven = safeguard.breakEvenReference.rate === null ? "unavailable" : `${(safeguard.breakEvenReference.rate * 100).toFixed(1)}%`;
+        return `Segment safeguard ${safeguard.status}: ${safeguard.decisiveSample}/${safeguard.minSample} decisive outcomes, Wilson 95% ${interval}, break-even reference ${breakEven}; gate ${this.settings.segmentGateEnabled ? "enabled" : "disabled"}.`;
+      };
       for (let index = 0; index < eligible.length; index += 1) {
         const candidate = eligible[index];
+        const safeguard = safeguardBySegment.get(`${candidate.symbol}:${candidate.horizonMinutes}`);
+        const segmentReason = safeguardReason(safeguard);
+        const activeReasons = [...candidate.reasons, segmentReason];
+        const details = this.candidateDetails(candidate, safeguard);
+        this.database.updateAutonomousDecision(candidate.id, { action: "WAIT", reasons: activeReasons, details, updatedAt: new Date().toISOString() });
+        if (this.settings.segmentGateEnabled && safeguard.status === "UNDERPERFORMING") {
+          this.database.updateAutonomousDecision(candidate.id, { action: "BLOCKED", reasons: [...activeReasons, "Candidate blocked because this symbol+horizon segment's Wilson upper bound is below break-even."], details, updatedAt: new Date().toISOString() });
+          continue;
+        }
         const plan = planAutonomousStake({
           candidate, profile: this.state.profile, stage: this.state.recoveryStage, previousLoss: this.state.previousLoss,
           bankroll: account.equity, payoutRate: this.settings.payoutRate, available: account.available, exposureHeadroom, dailyLossHeadroom,
@@ -129,11 +175,11 @@ export class AutonomousService {
           thresholds: this.settings.thresholds, observedLadder: this.settings.observedLadder,
         });
         if (!plan.allowed) {
-          this.database.updateAutonomousDecision(candidate.id, { action: "BLOCKED", reasons: [...candidate.reasons, ...plan.reasons], updatedAt: new Date().toISOString() });
+          this.database.updateAutonomousDecision(candidate.id, { action: "BLOCKED", reasons: [...activeReasons, ...plan.reasons], details, updatedAt: new Date().toISOString() });
           continue;
         }
         try {
-          const decisionReasons = [...candidate.reasons, ...plan.reasons];
+          const decisionReasons = [...activeReasons, ...plan.reasons];
           const position = this.paper.openAutonomous({ symbol: candidate.symbol, direction: candidate.direction, horizonMinutes: candidate.horizonMinutes, stake: plan.stake }, {
             decisionId: candidate.id, strategyName: candidate.strategyName, strategyVersion: candidate.strategyVersion,
             qualityScore: candidate.qualityScore, stakeProfile: this.state.profile, recoveryStage: this.state.recoveryStage,
@@ -141,10 +187,13 @@ export class AutonomousService {
           });
           this.state = { ...this.state, currentPositionId: position.id, updatedAt: position.openedAt };
           const skippedAt = new Date().toISOString();
-          for (const skipped of eligible.slice(index + 1)) this.database.updateAutonomousDecision(skipped.id, { action: "BLOCKED", reasons: [...skipped.reasons, "Not selected because a higher-ranked autonomous setup opened first."], updatedAt: skippedAt });
+          for (const skipped of eligible.slice(index + 1)) {
+            const skippedSafeguard = safeguardBySegment.get(`${skipped.symbol}:${skipped.horizonMinutes}`);
+            this.database.updateAutonomousDecision(skipped.id, { action: "BLOCKED", reasons: [...skipped.reasons, safeguardReason(skippedSafeguard), "Not selected because a higher-ranked autonomous setup opened first."], details: this.candidateDetails(skipped, skippedSafeguard), updatedAt: skippedAt });
+          }
           return;
         } catch (error) {
-          this.database.updateAutonomousDecision(candidate.id, { action: "BLOCKED", reasons: [...candidate.reasons, error instanceof Error ? error.message : "Paper open failed."], updatedAt: new Date().toISOString() });
+          this.database.updateAutonomousDecision(candidate.id, { action: "BLOCKED", reasons: [...activeReasons, error instanceof Error ? error.message : "Paper open failed."], details, updatedAt: new Date().toISOString() });
         }
       }
     } finally { this.busy = false; }
