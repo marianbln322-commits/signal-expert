@@ -5,6 +5,7 @@ Local-first, auditable BTCUSDT/ETHUSDT market analytics and event-futures resear
 ## Functional scope
 
 - Official public MEXC Spot REST ticker, depth and 1m/5m/15m candles with source/receive timestamps.
+- Explicit Binance public market-data fallback when MEXC is unreachable; the active source and original MEXC error are always displayed.
 - RSI, EMA, ATR, Bollinger Bands, relative volume and local support/resistance.
 - Explainable `UP`, `DOWN` or `WAIT` research verdict.
 - Persistent SQLite signal audit and complete 10m/30m paper ledger.
@@ -16,7 +17,7 @@ Local-first, auditable BTCUSDT/ETHUSDT market analytics and event-futures resear
 
 ## Critical limitation
 
-No official MEXC Event Futures API for live payout, contracts, exact settlement, positions or execution has been verified. Therefore Event Futures is shown as `UNAVAILABLE`, 80% is a labeled paper configuration, and no live order can be sent. The current underlying feed is MEXC **Spot**, not a proven Event Futures settlement index. The system never replaces that missing feed with invented data.
+No official MEXC Event Futures API for live payout, contracts, exact settlement, positions or execution has been verified. Therefore Event Futures is shown as `UNAVAILABLE`, 80% is a labeled paper configuration, and no live order can be sent. The primary underlying feed is MEXC **Spot**, not a proven Event Futures settlement index. If MEXC Spot is unreachable, the application may use Binance's public market-data endpoint as an explicitly labeled fallback. Binance values are never represented as MEXC values, and the exact primary-provider error is displayed. The system never replaces missing feeds with invented data.
 
 ## Downloaded package: easiest startup
 
@@ -60,10 +61,11 @@ npm run build
 
 ## Sources
 
-- [MEXC Spot API v3 documentation](https://mexcdevelop.github.io/apidocs/spot_v3_en/) — public ticker, depth and kline endpoints; default polling is 3s/15s.
+- [MEXC Spot API v3 documentation](https://mexcdevelop.github.io/apidocs/spot_v3_en/) — primary public ticker, depth and kline source; default polling is 3s/15s.
+- [Binance Market Data Only documentation](https://developers.binance.com/docs/binance-spot-api-docs/faqs/market_data_only) — independent public fallback at `data-api.binance.vision`, used only when the primary source fails and always attributed in the interface.
 - [MEXC Event Futures overview](https://www.mexc.com/es/learn/article/17827791522522) — product description only, not proof of an integration API.
 
-Responses are runtime-validated. Failed, stale or malformed data is surfaced, never silently simulated. External-source descriptions were rephrased for licensing compliance.
+Responses are runtime-validated. Failed, stale or malformed data is surfaced, never silently simulated. When fallback is active, the header changes to `DEGRADED`, the exact MEXC failure is shown, and every raw value identifies Binance as its source. Disable fallback with `MARKET_FAILOVER_ENABLED=false`. External-source descriptions were rephrased for licensing compliance.
 
 ## Security and quantitative limits
 

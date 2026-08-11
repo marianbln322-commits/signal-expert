@@ -8,6 +8,10 @@ services:
       PUBLIC_DIRECTORY: /app/public
       MIGRATION_DIRECTORY: /app/migrations
       MEXC_SPOT_BASE_URL: https://api.mexc.com
+      MARKET_FAILOVER_ENABLED: "true"
+      FALLBACK_MARKET_BASE_URL: https://data-api.binance.vision
+      PROVIDER_TIMEOUT_MS: 5000
+      PROVIDER_ATTEMPTS: 2
       MARKET_SYMBOLS: BTCUSDT,ETHUSDT
       TICKER_POLL_MS: 3000
       CANDLE_POLL_MS: 15000

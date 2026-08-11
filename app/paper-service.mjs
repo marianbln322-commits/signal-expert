@@ -21,7 +21,7 @@ export class PaperService {
     if (input.stake > account.available) throw new Error("Insufficient paper balance.");
     if ((account.locked + input.stake) / Math.max(account.equity, 1) > 0.35) throw new Error("Correlated paper exposure would exceed 35% of equity.");
     const snapshot = this.market.snapshot(input.symbol);
-    if (!snapshot || snapshot.health.market !== "LIVE" || snapshot.health.overall !== "LIVE" || !snapshot.market.data) throw new Error("Required live market/timeframe data is unavailable or stale.");
+    if (!snapshot || !snapshot.health.dataUsable || !snapshot.market.data) throw new Error("Required market/timeframe data is unavailable or stale.");
     const now = new Date(); const position = { id: randomUUID(), symbol: input.symbol, direction: input.direction, horizonMinutes: input.horizonMinutes, stake: input.stake, payoutRate: this.settings.payoutRate, entryPrice: snapshot.market.data.lastPrice, openedAt: now.toISOString(), resolvesAt: new Date(now.getTime() + input.horizonMinutes * 60000).toISOString(), status: "OPEN", settlementPrice: null, settledAt: null, pnl: null, settlementReason: null, signalVersion: snapshot.analysis?.modelVersion ?? "manual-paper", sourceName: snapshot.market.source, sourceTimestamp: snapshot.market.sourceTimestamp };
     this.positions.set(position.id, position); this.database.upsertPosition(position); return position;
   }
@@ -29,7 +29,7 @@ export class PaperService {
     const account = this.account(); const snapshot = this.market.snapshot(input.symbol); const analysis = snapshot?.analysis;
     const calibratedProbability = analysis?.calibrationStatus === "CALIBRATED" ? analysis.calibratedProbability : null;
     const price = snapshot?.market.data?.lastPrice ?? 0; const atr = analysis?.timeframes?.["1m"]?.indicators?.atr14 ?? 0; const atrFraction = price > 0 ? atr / price : Infinity;
-    return adaptiveStake({ bankroll: account.equity, baseStake: input.baseStake, cumulativeLoss: input.cumulativeLoss, targetProfit: input.targetProfit, payoutRate: this.settings.payoutRate, estimatedProbability: calibratedProbability, maxStake: input.symbol === "BTCUSDT" ? this.settings.btcMaxStake : this.settings.ethMaxStake, maxBankrollFraction: 0.15, dailyLoss: account.dailyLoss, dailyLossLimit: this.settings.dailyLossLimit, openPositions: account.openPositions, maxOpenPositions: this.settings.maxOpenPositions, dataHealthy: snapshot?.health.overall === "LIVE", volatilityRegime: atrFraction > 0.015 ? "EXTREME" : atrFraction > 0.008 ? "HIGH" : "NORMAL", correlatedExposureFraction: account.locked / Math.max(account.equity, 1) });
+    return adaptiveStake({ bankroll: account.equity, baseStake: input.baseStake, cumulativeLoss: input.cumulativeLoss, targetProfit: input.targetProfit, payoutRate: this.settings.payoutRate, estimatedProbability: calibratedProbability, maxStake: input.symbol === "BTCUSDT" ? this.settings.btcMaxStake : this.settings.ethMaxStake, maxBankrollFraction: 0.15, dailyLoss: account.dailyLoss, dailyLossLimit: this.settings.dailyLossLimit, openPositions: account.openPositions, maxOpenPositions: this.settings.maxOpenPositions, dataHealthy: snapshot?.health.dataUsable === true, volatilityRegime: atrFraction > 0.015 ? "EXTREME" : atrFraction > 0.008 ? "HIGH" : "NORMAL", correlatedExposureFraction: account.locked / Math.max(account.equity, 1) });
   }
   settleDue() {
     const now = Date.now();

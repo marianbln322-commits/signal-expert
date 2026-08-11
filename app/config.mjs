@@ -9,6 +9,14 @@ function numberValue(name, fallback, { min = -Infinity, max = Infinity, integer 
   return value;
 }
 
+function booleanValue(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  if (["1", "true", "yes", "on"].includes(raw.toLowerCase())) return true;
+  if (["0", "false", "no", "off"].includes(raw.toLowerCase())) return false;
+  throw new Error(`${name} must be true or false`);
+}
+
 const supportedSymbols = new Set(["BTCUSDT", "ETHUSDT"]);
 const symbols = (process.env.MARKET_SYMBOLS ?? "BTCUSDT,ETHUSDT").split(",").map((item) => item.trim().toUpperCase()).filter(Boolean);
 if (!symbols.length || symbols.some((symbol) => !supportedSymbols.has(symbol))) throw new Error("MARKET_SYMBOLS supports BTCUSDT and ETHUSDT only");
@@ -19,6 +27,10 @@ export const config = Object.freeze({
   host: process.env.API_HOST ?? "127.0.0.1",
   port: numberValue("API_PORT", 4100, { min: 1, max: 65535, integer: true }),
   mexcBaseUrl: (process.env.MEXC_SPOT_BASE_URL ?? "https://api.mexc.com").replace(/\/$/, ""),
+  fallbackMarketBaseUrl: (process.env.FALLBACK_MARKET_BASE_URL ?? "https://data-api.binance.vision").replace(/\/$/, ""),
+  marketFailoverEnabled: booleanValue("MARKET_FAILOVER_ENABLED", true),
+  providerTimeoutMs: numberValue("PROVIDER_TIMEOUT_MS", 5000, { min: 1000, max: 30000, integer: true }),
+  providerAttempts: numberValue("PROVIDER_ATTEMPTS", 2, { min: 1, max: 5, integer: true }),
   symbols,
   tickerPollMs: numberValue("TICKER_POLL_MS", 3000, { min: 1000, integer: true }),
   candlePollMs: numberValue("CANDLE_POLL_MS", 15000, { min: 5000, integer: true }),

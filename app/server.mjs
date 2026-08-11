@@ -4,7 +4,7 @@ import { extname, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { config } from "./config.mjs";
 import { Database } from "./database.mjs";
-import { MexcSpotProvider } from "./mexc-provider.mjs";
+import { FailoverMarketProvider, MexcSpotProvider } from "./mexc-provider.mjs";
 import { MarketService } from "./market-service.mjs";
 import { PaperService } from "./paper-service.mjs";
 
@@ -29,7 +29,10 @@ function validateQuote(value) {
 
 export async function createApplication(options = {}) {
   const database = options.database ?? new Database(config.databasePath, config.migrationDirectory);
-  const provider = options.provider ?? new MexcSpotProvider(config.mexcBaseUrl);
+  const provider = options.provider ?? new FailoverMarketProvider(
+    new MexcSpotProvider(config.mexcBaseUrl, { timeoutMs: config.providerTimeoutMs, attempts: config.providerAttempts }),
+    config.marketFailoverEnabled ? new MexcSpotProvider(config.fallbackMarketBaseUrl, { timeoutMs: config.providerTimeoutMs, attempts: config.providerAttempts }) : null,
+  );
   const market = new MarketService({ provider, symbols: config.symbols, staleAfterMs: config.staleAfterMs, payoutRate: config.payoutRate, database });
   const paper = new PaperService({ market, database, settings: { payoutRate: config.payoutRate, initialBankroll: config.initialBankroll, dailyLossLimit: config.dailyLossLimit, maxOpenPositions: config.maxOpenPositions, btcMaxStake: config.btcMaxStake, ethMaxStake: config.ethMaxStake } });
   const rate = new Map();

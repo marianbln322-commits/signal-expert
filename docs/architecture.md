@@ -7,7 +7,9 @@ Read-only MEXC Spot analytics plus explicitly labeled 10m/30m paper contracts fo
 ## Data flow
 
 ```text
-MEXC Spot REST v3
+MEXC Spot REST v3 (primary)
+  -> explicit Binance public fallback only when primary fails
+  -> active source + primary error displayed
   -> timeout, retry, runtime schema checks
   -> in-memory market cache and freshness state
   -> deterministic quantitative engine

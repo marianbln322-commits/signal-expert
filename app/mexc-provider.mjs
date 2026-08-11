@@ -4,28 +4,41 @@ function positive(value, label) { const parsed = number(value, label); if (parse
 function nonnegative(value, label) { const parsed = number(value, label); if (parsed < 0) throw new Error(`${label} must be nonnegative`); return parsed; }
 function string(value, label) { if (typeof value !== "string" || !value.trim()) throw new Error(`${label} is not a string`); return value; }
 
+export function describeProviderError(error) {
+  if (!(error instanceof Error)) return "Unknown provider error";
+  const cause = error.cause instanceof Error ? error.cause : null;
+  const code = cause?.code ?? error.code;
+  const detail = cause?.message && cause.message !== error.message ? `: ${cause.message}` : "";
+  return `${error.message}${code ? ` [${code}]` : ""}${detail}`;
+}
+
 export class MexcSpotProvider {
-  constructor(baseUrl, { fetchImpl = fetch, timeoutMs = 8000 } = {}) {
-    this.baseUrl = baseUrl.replace(/\/$/, ""); this.fetchImpl = fetchImpl; this.timeoutMs = timeoutMs;
-    const official = new URL(this.baseUrl).hostname === "api.mexc.com";
-    this.sourceId = official ? "MEXC_SPOT_REST" : "CONFIGURED_MARKET_PROVIDER";
-    this.name = official ? "MEXC Spot REST v3" : `Configured provider (${new URL(this.baseUrl).origin})`;
-    this.official = official;
+  constructor(baseUrl, { fetchImpl = fetch, timeoutMs = 5000, attempts = 2, identity } = {}) {
+    this.baseUrl = baseUrl.replace(/\/$/, ""); this.fetchImpl = fetchImpl; this.timeoutMs = timeoutMs; this.attempts = attempts;
+    const hostname = new URL(this.baseUrl).hostname;
+    const officialMexc = hostname === "api.mexc.com";
+    const officialBinance = hostname === "data-api.binance.vision";
+    this.sourceId = identity?.sourceId ?? (officialMexc ? "MEXC_SPOT_REST" : officialBinance ? "BINANCE_SPOT_REST" : "CONFIGURED_MARKET_PROVIDER");
+    this.name = identity?.name ?? (officialMexc ? "MEXC Spot REST v3" : officialBinance ? "Binance Spot Market Data" : `Configured provider (${new URL(this.baseUrl).origin})`);
+    this.official = identity?.official ?? (officialMexc || officialBinance);
   }
-  async request(path, attempts = 3) {
+  async request(path, attempts = this.attempts) {
     const url = `${this.baseUrl}${path}`; let finalError;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
       try {
-        const response = await this.fetchImpl(url, { signal: controller.signal, headers: { accept: "application/json", "user-agent": "signal-expert/0.1" } });
-        if (!response.ok) { const error = new Error(`Market provider HTTP ${response.status}`); error.status = response.status; throw error; }
+        const response = await this.fetchImpl(url, { signal: controller.signal, headers: { accept: "application/json", "user-agent": "signal-expert/0.1.1" } });
+        if (!response.ok) { const error = new Error(`${this.name} HTTP ${response.status}`); error.status = response.status; throw error; }
         return { payload: await response.json(), receivedAt: new Date(), url };
       } catch (error) { finalError = error; if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, 300 * 2 ** attempt)); }
       finally { clearTimeout(timeout); }
     }
-    throw finalError instanceof Error ? finalError : new Error("Market provider request failed");
+    throw new Error(`${this.name}: ${describeProviderError(finalError)}`, { cause: finalError });
   }
-  envelope(data, response, sourceTimestamp) { const timestamp = new Date(sourceTimestamp); if (!Number.isFinite(timestamp.getTime())) throw new Error("Invalid source timestamp"); return { data, source: this.sourceId, sourceUrl: response.url, sourceTimestamp: timestamp.toISOString(), receivedAt: response.receivedAt.toISOString() }; }
+  envelope(data, response, sourceTimestamp) {
+    const timestamp = new Date(sourceTimestamp); if (!Number.isFinite(timestamp.getTime())) throw new Error("Invalid source timestamp");
+    return { data, source: this.sourceId, sourceName: this.name, sourceUrl: response.url, sourceTimestamp: timestamp.toISOString(), receivedAt: response.receivedAt.toISOString(), failover: { active: false, primarySource: this.sourceId, primaryError: null } };
+  }
   async ticker(symbol) {
     const response = await this.request(`/api/v3/ticker/24hr?symbol=${encodeURIComponent(symbol)}`); const raw = object(response.payload, "ticker"); const returned = string(raw.symbol, "symbol");
     if (returned !== symbol) throw new Error(`Ticker symbol mismatch: expected ${symbol}, received ${returned}`);
@@ -52,4 +65,29 @@ export class MexcSpotProvider {
     const sourceTime = latest.closed ? latest.closeTime : receivedMs;
     return this.envelope(candles, response, sourceTime);
   }
+}
+
+export class FailoverMarketProvider {
+  constructor(primary, fallback = null) {
+    this.primary = primary; this.fallback = fallback;
+    this.name = fallback ? `${primary.name} with ${fallback.name} fallback` : primary.name;
+    this.sourceId = primary.sourceId; this.official = primary.official;
+    this.providers = [primary, ...(fallback ? [fallback] : [])];
+  }
+  async call(method, args) {
+    try { return await this.primary[method](...args); }
+    catch (primaryError) {
+      const primaryMessage = describeProviderError(primaryError);
+      if (!this.fallback) throw new Error(`Primary provider unavailable — ${primaryMessage}`, { cause: primaryError });
+      try {
+        const envelope = await this.fallback[method](...args);
+        return { ...envelope, failover: { active: true, primarySource: this.primary.sourceId, primaryName: this.primary.name, primaryError: primaryMessage, fallbackSource: this.fallback.sourceId, fallbackName: this.fallback.name, switchedAt: new Date().toISOString() } };
+      } catch (fallbackError) {
+        throw new Error(`All market providers failed — primary: ${primaryMessage}; fallback: ${describeProviderError(fallbackError)}`, { cause: fallbackError });
+      }
+    }
+  }
+  ticker(...args) { return this.call("ticker", args); }
+  depth(...args) { return this.call("depth", args); }
+  klines(...args) { return this.call("klines", args); }
 }
