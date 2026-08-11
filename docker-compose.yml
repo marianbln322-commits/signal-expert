@@ -1,0 +1,28 @@
+services:
+  signal-expert:
+    build: .
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 4100
+      DATABASE_PATH: /app/data/signal-expert.db
+      PUBLIC_DIRECTORY: /app/public
+      MIGRATION_DIRECTORY: /app/migrations
+      MEXC_SPOT_BASE_URL: https://api.mexc.com
+      MARKET_SYMBOLS: BTCUSDT,ETHUSDT
+      TICKER_POLL_MS: 3000
+      CANDLE_POLL_MS: 15000
+      STALE_AFTER_MS: 30000
+      PAPER_PAYOUT_RATE: ${PAPER_PAYOUT_RATE:-0.80}
+      PAPER_INITIAL_BANKROLL: ${PAPER_INITIAL_BANKROLL:-1200}
+      PAPER_DAILY_LOSS_LIMIT: ${PAPER_DAILY_LOSS_LIMIT:-60}
+      PAPER_MAX_OPEN_POSITIONS: ${PAPER_MAX_OPEN_POSITIONS:-2}
+      PAPER_BTC_MAX_STAKE: ${PAPER_BTC_MAX_STAKE:-250}
+      PAPER_ETH_MAX_STAKE: ${PAPER_ETH_MAX_STAKE:-150}
+      TRADING_MODE: paper
+    ports:
+      - "4100:4100"
+    volumes:
+      - signal_expert_data:/app/data
+    restart: unless-stopped
+volumes:
+  signal_expert_data:
