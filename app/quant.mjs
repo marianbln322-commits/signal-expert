@@ -68,13 +68,14 @@ export function breakEvenProbability(payoutRate) {
   return Number.isFinite(payoutRate) && payoutRate > 0 ? 1 / (1 + payoutRate) : 1;
 }
 export function analyzeMarket(candles, payoutRate, now = new Date()) {
-  const timeframes = Object.fromEntries(["1m", "5m", "15m"].map((timeframe) => [timeframe, timeframeAnalysis(timeframe, candles[timeframe])]));
+  const completedCandles = Object.fromEntries(["1m", "5m", "15m", "1h"].map((timeframe) => [timeframe, (candles[timeframe] ?? []).filter((candle) => candle.closed === true)]));
+  const timeframes = Object.fromEntries(["1m", "5m", "15m", "1h"].map((timeframe) => [timeframe, timeframeAnalysis(timeframe, completedCandles[timeframe])]));
   let upScore = 50; let downScore = 50; const reasons = []; const invalidation = [];
   const applyRegime = (analysis, weight) => {
     if (analysis.regime === "BULLISH") { upScore += weight; downScore -= weight / 2; reasons.push(`${analysis.timeframe}: bullish structure.`); }
     if (analysis.regime === "BEARISH") { downScore += weight; upScore -= weight / 2; reasons.push(`${analysis.timeframe}: bearish structure.`); }
   };
-  applyRegime(timeframes["15m"], 14); applyRegime(timeframes["5m"], 10);
+  applyRegime(timeframes["1h"], 18); applyRegime(timeframes["15m"], 14); applyRegime(timeframes["5m"], 10);
   const current = candles["1m"].at(-1); const previous = candles["1m"].at(-2); const indicators = timeframes["1m"].indicators;
   if (indicators.rsi14 !== null && indicators.rsi14 >= 75) { downScore += 10; reasons.push(`1m RSI ${indicators.rsi14.toFixed(1)} shows extension, not a reversal by itself.`); }
   if (indicators.rsi14 !== null && indicators.rsi14 <= 25) { upScore += 10; reasons.push(`1m RSI ${indicators.rsi14.toFixed(1)} shows extension, not a reversal by itself.`); }

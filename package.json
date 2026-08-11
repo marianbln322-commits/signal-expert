@@ -1,6 +1,6 @@
 {
   "name": "signal-expert",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "description": "Transparent MEXC market analytics and event-futures research platform",

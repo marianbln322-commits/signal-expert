@@ -1,7 +1,7 @@
 import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-const version = process.argv[2] ?? "0.1.1";
+const version = process.argv[2] ?? "0.1.2";
 if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error("Version must use x.y.z format.");
 const root = resolve(import.meta.dirname, "..");
 const releaseRoot = resolve(root, "release");

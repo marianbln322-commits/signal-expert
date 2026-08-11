@@ -1,7 +1,7 @@
 import { analyzeMarket } from "./quant.mjs";
-const timeframes = ["1m", "5m", "15m"];
+const timeframes = ["1m", "5m", "15m", "1h"];
 const emptyState = () => ({
-  ticker: null, depth: null, candles: { "1m": null, "5m": null, "15m": null }, analysis: null,
+  ticker: null, depth: null, candles: { "1m": null, "5m": null, "15m": null, "1h": null }, analysis: null,
   errors: { ticker: null, depth: null, candles: {} }, lastAttemptAt: null,
 });
 

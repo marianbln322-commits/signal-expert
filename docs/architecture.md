@@ -2,7 +2,7 @@
 
 ## MVP boundary
 
-Read-only MEXC Spot analytics plus explicitly labeled 10m/30m paper contracts for BTCUSDT and ETHUSDT. Live Event Futures execution remains unavailable until official endpoints and exact settlement semantics are verified.
+Read-only MEXC Spot analytics plus explicitly labeled 10m/30m paper contracts for BTCUSDT and ETHUSDT. The decision engine uses completed candles only on 1m, 5m, 15m and 1h. Live Event Futures execution remains unavailable until official endpoints and exact settlement semantics are verified.
 
 ## Data flow
 
@@ -31,7 +31,7 @@ Paper request -> input/cap checks -> immutable entry timestamp
 
 ## Model v0.1
 
-Rules are used because no historical Event Futures labels exist. Inputs are EMA 9/21, RSI 14, ATR 14, Bollinger 20/2, relative volume and wick rejection. `WAIT` is the default. MEXC Spot is only a proxy; polling cannot reproduce tick settlement; the heuristic probability is uncalibrated and excluded from adaptive sizing by default.
+Rules are used because no historical Event Futures labels exist. Inputs are the completed 1h higher-timeframe regime, completed 15m/5m structure, and completed 1m trigger with EMA 9/21, RSI 14, ATR 14, Bollinger 20/2, relative volume and wick rejection. Forming candles are discarded at both the service and model boundaries. `WAIT` is the default. MEXC Spot is only a proxy; polling cannot reproduce tick settlement; the heuristic probability is uncalibrated and excluded from adaptive sizing by default.
 
 Paper settlement is independent of candle availability: it uses the first fresh ticker at or after expiry and refunds the contract when that observation is more than 30 seconds late. The local server binds to loopback by default; network exposure through Docker is explicit.
 

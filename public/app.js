@@ -53,7 +53,11 @@ function renderMarket() {
     const spread = ticker.askPrice && ticker.bidPrice ? ticker.askPrice - ticker.bidPrice : null;
     $("spread").textContent = spread === null ? "—" : money(spread, 4); $("volume").textContent = `${money(ticker.quoteVolume24h / 1e6, 1)}M USDT`; $("book-spread").textContent = `Spread ${spread === null ? "—" : money(spread, 4)}`;
   } else clearTicker();
-  chart(snapshot.candles[state.timeframe].data);
+  const candleEnvelope = snapshot.candles[state.timeframe];
+  const completedCandles = (candleEnvelope.data ?? []).filter((candle) => candle.closed === true);
+  chart(completedCandles);
+  const latestCompleted = completedCandles.at(-1);
+  $("closed-candle-time").textContent = latestCompleted ? `Latest completed ${state.timeframe} candle closed ${time(new Date(latestCompleted.closeTime).toISOString())} · ${completedCandles.length} closed candles` : `No completed ${state.timeframe} candle is available`;
   const analysis = snapshot.analysis; const timeframe = analysis?.timeframes[state.timeframe]; const indicators = timeframe?.indicators;
   const fields = [["REGIME", timeframe?.regime], ["RSI 14", indicators?.rsi14?.toFixed(1)], ["ATR 14", indicators?.atr14?.toFixed(2)], ["REL. VOLUME", indicators?.relativeVolume20 ? `${indicators.relativeVolume20.toFixed(2)}×` : null], ["SUPPORT", indicators?.support?.toFixed(2)], ["RESISTANCE", indicators?.resistance?.toFixed(2)]];
   $("indicators").innerHTML = fields.map(([label, value]) => `<div><small>${label}</small><b>${value ?? "—"}</b></div>`).join("");

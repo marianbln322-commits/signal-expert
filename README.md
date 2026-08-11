@@ -4,7 +4,7 @@ Local-first, auditable BTCUSDT/ETHUSDT market analytics and event-futures resear
 
 ## Functional scope
 
-- Official public MEXC Spot REST ticker, depth and 1m/5m/15m candles with source/receive timestamps.
+- Official public MEXC Spot REST ticker, depth and completed 1m/5m/15m/1h candles with source/receive timestamps.
 - Explicit Binance public market-data fallback when MEXC is unreachable; the active source and original MEXC error are always displayed.
 - RSI, EMA, ATR, Bollinger Bands, relative volume and local support/resistance.
 - Explainable `UP`, `DOWN` or `WAIT` research verdict.
@@ -67,11 +67,15 @@ npm run build
 
 Responses are runtime-validated. Failed, stale or malformed data is surfaced, never silently simulated. When fallback is active, the header changes to `DEGRADED`, the exact MEXC failure is shown, and every raw value identifies Binance as its source. Disable fallback with `MARKET_FAILOVER_ENABLED=false`. External-source descriptions were rephrased for licensing compliance.
 
+## Gate for live Event Futures execution
+
+Real orders are intentionally absent until the authenticated Event Futures integration contract is verified. The exact required Index, payout, contract, idempotency, reconciliation, settlement and secret-handling operations are documented in [`docs/live-execution-gate.md`](docs/live-execution-gate.md). Spot or fallback prices are never used to pretend that an Event Futures order was accepted.
+
 ## Security and quantitative limits
 
 No API key, signing, custody, withdrawal or live-execution code exists. Inputs and provider payloads are validated, requests use timeout and bounded backoff, HTTP responses use restrictive security headers, and local API calls are rate-limited.
 
-The model combines EMA 9/21 regime, RSI 14, ATR-normalized impulse, relative volume and wick rejection. Its probability is a bounded heuristic explicitly marked `UNCALIBRATED`; adaptive sizing blocks it by default until prospective outcomes support Brier score, log-loss and calibration analysis.
+The model combines the 1h higher-timeframe regime, 15m/5m structure, and 1m trigger using EMA 9/21, RSI 14, ATR-normalized impulse, relative volume and wick rejection. Only candles whose provider close timestamp has passed are admitted to the model or displayed on the chart; the forming candle is excluded. Its probability is a bounded heuristic explicitly marked `UNCALIBRATED`; adaptive sizing blocks it by default until prospective outcomes support Brier score, log-loss and calibration analysis.
 
 ```text
 required recovery stake = (cumulative loss + target profit) / payout rate

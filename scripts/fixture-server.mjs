@@ -18,7 +18,7 @@ const provider = {
   name: "Development fixture — not live",
   async ticker(symbol) { const eth = symbol === "ETHUSDT"; return envelope({ symbol, lastPrice: eth ? 1927.71 : 65266.4, bidPrice: eth ? 1927.70 : 65266.3, askPrice: eth ? 1927.72 : 65266.5, priceChange: eth ? 1.2 : 82.4, priceChangePercent: eth ? 0.06 : 0.13, high24h: eth ? 1937.86 : 65320, low24h: eth ? 1912.28 : 64730.5, baseVolume24h: 12000, quoteVolume24h: eth ? 23_000_000 : 390_000_000, tradeCount24h: 32000 }); },
   async depth(symbol) { const base = symbol === "ETHUSDT" ? 1927.71 : 65266.4; return envelope({ lastUpdateId: 1, bids: Array.from({ length: 20 }, (_, i) => ({ price: base - (i + 1) * 0.5, quantity: 0.2 + Math.abs(Math.sin(i)) * 2 })), asks: Array.from({ length: 20 }, (_, i) => ({ price: base + (i + 1) * 0.5, quantity: 0.2 + Math.abs(Math.cos(i)) * 2 })) }); },
-  async klines(symbol, timeframe) { const minutes = { "1m": 1, "5m": 5, "15m": 15 }[timeframe]; return envelope(candles(minutes, symbol === "ETHUSDT" ? 1750 : 65000)); },
+  async klines(symbol, timeframe) { const minutes = { "1m": 1, "5m": 5, "15m": 15, "1h": 60 }[timeframe]; return envelope(candles(minutes, symbol === "ETHUSDT" ? 1750 : 65000)); },
 };
 const database = new Database(resolve("data/browser-fixture.db"), resolve("migrations"));
 const application = await createApplication({ database, provider });
