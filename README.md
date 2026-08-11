@@ -12,12 +12,24 @@ Local-first, auditable BTCUSDT/ETHUSDT market analytics and event-futures resear
 - Adaptive recovery guard that blocks stale data, absent edge, caps and excessive exposure.
 - Responsive local dashboard and `LIVE`, `STALE`, `ERROR`, `UNAVAILABLE` health states.
 - Zero third-party runtime dependencies; Node.js standard library only.
+- Cross-platform launcher with a single-instance lock, automatic free-port selection, health-gated browser opening and clean shutdown.
 
 ## Critical limitation
 
 No official MEXC Event Futures API for live payout, contracts, exact settlement, positions or execution has been verified. Therefore Event Futures is shown as `UNAVAILABLE`, 80% is a labeled paper configuration, and no live order can be sent. The current underlying feed is MEXC **Spot**, not a proven Event Futures settlement index. The system never replaces that missing feed with invented data.
 
-## Run locally
+## Downloaded package: easiest startup
+
+The release archive is self-contained and does not need `npm install`. Install [Node.js 22 LTS](https://nodejs.org/) once, extract the archive, then:
+
+- **Windows:** double-click `START-SIGNAL-EXPERT.cmd`.
+- **macOS/Linux:** run `./start-signal-expert.sh` from a terminal.
+
+The launcher validates Node, creates local SQLite storage, finds the first free port starting at `4100`, starts the server on `127.0.0.1`, waits for the health check, and opens the browser. If another Signal Expert instance is already running, it opens that instance instead of starting a conflicting server. Keep the launcher window open and press `Ctrl+C` to stop cleanly.
+
+To choose a preferred port, set `SIGNAL_EXPERT_PORT`; if occupied, the launcher automatically tries the next ports. Set `NO_BROWSER=1` for headless startup.
+
+## Developer startup
 
 Node.js 22.5+ is required. No package installation is needed. The server binds to `127.0.0.1` by default; Docker exposure is an explicit deployment choice.
 

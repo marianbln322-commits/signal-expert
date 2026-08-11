@@ -12,6 +12,7 @@
     "lint": "node --check app/config.mjs && node --check app/quant.mjs && node --check app/mexc-provider.mjs && node --check app/database.mjs && node --check app/market-service.mjs && node --check app/paper-service.mjs && node --check app/server.mjs && node --check public/app.js",
     "typecheck": "npm run lint",
     "test": "node --test",
-    "db:migrate": "node scripts/migrate.mjs"
+    "db:migrate": "node scripts/migrate.mjs",
+    "package:release": "node scripts/package-release.mjs"
   }
 }
