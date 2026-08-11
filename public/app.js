@@ -1,4 +1,4 @@
-const state = { symbol: "BTCUSDT", timeframe: "1m", snapshot: null, account: null };
+const state = { symbol: "BTCUSDT", timeframe: "1m", snapshot: null, account: null, autonomous: null, performance: null };
 const $ = (id) => document.getElementById(id);
 const money = (value, digits = 2) => Number(value).toLocaleString("ro-RO", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 const pct = (value) => `${(value * 100).toFixed(2)}%`;
@@ -72,15 +72,44 @@ function renderBook(book) {
   const rows = (items, type) => items.map((level) => `<div class="book-row ${type}"><i style="width:${level.quantity/max*100}%"></i><span>${money(level.price,2)}</span><span>${money(level.quantity,5)}</span></div>`).join("");
   $("asks").innerHTML = rows((book?.asks ?? []).slice(0, 6).reverse(), "ask"); $("bids").innerHTML = rows((book?.bids ?? []).slice(0, 6), "bid");
 }
+function renderAutonomous() {
+  const autonomous = state.autonomous; const performance = state.performance;
+  if (!autonomous || !performance) return;
+  const runtime = autonomous.state ?? {}; const policy = autonomous.policy ?? {}; const decision = autonomous.latestDecision; const position = autonomous.openPosition;
+  const running = autonomous.enabled && runtime.status === "RUNNING";
+  $("auto-state").textContent = autonomous.enabled ? runtime.status ?? "STARTING" : "DISABLED";
+  $("auto-state").className = `mode ${running ? "auto-running" : "auto-paused"}`;
+  $("auto-toggle").textContent = running ? "Pause autonomous paper" : "Resume autonomous paper";
+  $("auto-toggle").disabled = !autonomous.enabled;
+  $("auto-profile").textContent = policy.profile ?? "—";
+  $("auto-stage").textContent = `${runtime.recoveryStage ?? 0}${runtime.previousLoss ? ` · loss ${money(runtime.previousLoss)}` : ""}`;
+  $("auto-next-scan").textContent = autonomous.nextScanAt ? time(autonomous.nextScanAt) : "—";
+  $("auto-position").innerHTML = position
+    ? `<strong>OPEN PAPER</strong><span>${escape(position.symbol)} · ${escape(position.direction)} · ${position.horizonMinutes}m · ${money(position.stake)} USDT</span><small>Quality ${position.qualityScore}/100 · resolves ${time(position.resolvesAt)}</small>`
+    : `<strong>${runtime.status === "PAUSED" ? "PAUSED" : "SCANNING"}</strong><span>${escape(runtime.pauseReason ?? "No autonomous position is open.")}</span><small>One-position lock is active.</small>`;
+  const action = decision?.action ?? "WAIT"; $("auto-action").textContent = action; $("auto-action").className = `verdict ${action === "OPEN" ? "verdict-up" : action === "BLOCKED" ? "verdict-down" : "verdict-wait"}`;
+  $("auto-quality").textContent = decision ? `${decision.qualityScore}/100` : "—"; $("auto-band").textContent = decision ? `${decision.qualityBand} setup quality · uncalibrated` : "No completed setup yet";
+  $("auto-market").textContent = decision ? `${decision.symbol} / ${decision.horizonMinutes}m` : "—"; $("auto-direction").textContent = decision?.direction ?? "—";
+  $("auto-cap").textContent = policy.absoluteStakeCap == null ? "—" : `${money(policy.absoluteStakeCap)} USDT · ${(policy.maxStakeFraction * 100).toFixed(1)}% equity`;
+  $("auto-limits").textContent = policy.dailyProfitTarget == null ? "—" : `+${money(policy.dailyProfitTarget)} / −${money(policy.dailyLossLimit)} USDT`;
+  $("auto-reasons").innerHTML = (decision?.reasons ?? [runtime.pauseReason ?? "Waiting for completed-candle evaluation."]).slice(0, 5).map((reason) => `<li>${escape(reason)}</li>`).join("");
+  const totals = performance.allTime; const daily = performance.daily;
+  $("auto-sample").textContent = `${totals.positions} settled · ${escape(performance.scope?.profile ?? policy.profile ?? "current profile")}`;
+  $("auto-daily-pnl").textContent = `${money(daily.pnl)} USDT`; $("auto-daily-pnl").className = daily.pnl >= 0 ? "positive" : "negative";
+  $("auto-total-pnl").textContent = `${money(totals.pnl)} USDT`; $("auto-total-pnl").className = totals.pnl >= 0 ? "positive" : "negative";
+  $("auto-win-rate").textContent = totals.winRate == null ? "—" : `${(totals.winRate * 100).toFixed(1)}% (${totals.wins}W/${totals.losses}L)`;
+  $("auto-roi").textContent = totals.roiOnStake == null ? "—" : pct(totals.roiOnStake);
+  $("auto-drawdown").textContent = `${money(totals.maxDrawdown)} USDT`; $("auto-loss-streak").textContent = String(totals.maxConsecutiveLosses);
+}
 function renderAccount() {
   const account = state.account; if (!account) return;
   $("payout").textContent = pct(account.payout.value); $("equity").textContent = `${money(account.equity)} USDT`; $("available").textContent = money(account.available); $("pnl").textContent = money(account.realizedPnl); $("pnl").className = account.realizedPnl >= 0 ? "positive" : "negative"; $("database").textContent = `Database: ${account.persistence.mode}`; $("record-count").textContent = `${account.positions.length} records`;
-  $("positions").innerHTML = account.positions.length ? account.positions.slice(0, 10).map((position) => `<tr><td>${time(position.openedAt)}</td><td>${position.symbol}</td><td class="${position.direction === "UP" ? "positive" : "negative"}">${position.direction}</td><td>${position.horizonMinutes}m</td><td>${money(position.entryPrice)}</td><td>${money(position.stake)}</td><td><span class="position-status">${position.status}</span></td><td>${position.pnl == null ? "—" : money(position.pnl)}</td></tr>`).join("") : '<tr><td colspan="8" class="empty">No paper positions yet.</td></tr>';
+  $("positions").innerHTML = account.positions.length ? account.positions.slice(0, 10).map((position) => `<tr><td>${time(position.openedAt)}</td><td><span class="origin origin-${String(position.origin ?? "MANUAL").toLowerCase()}">${escape(position.origin ?? "MANUAL")}</span></td><td>${escape(position.symbol)}</td><td class="${position.direction === "UP" ? "positive" : "negative"}">${escape(position.direction)}</td><td>${position.horizonMinutes}m</td><td>${money(position.entryPrice)}</td><td>${money(position.stake)}</td><td><span class="position-status">${escape(position.status)}</span></td><td>${position.pnl == null ? "—" : money(position.pnl)}</td></tr>`).join("") : '<tr><td colspan="9" class="empty">No paper positions yet.</td></tr>';
 }
 async function refresh() {
   try {
-    const [snapshot, account] = await Promise.all([request(`/api/v1/market/${state.symbol}`), request("/api/v1/paper/account")]);
-    state.snapshot = snapshot; state.account = account; renderMarket(); renderAccount(); $("connection-error").classList.add("hidden");
+    const [snapshot, account, autonomous, performance] = await Promise.all([request(`/api/v1/market/${state.symbol}`), request("/api/v1/paper/account"), request("/api/v1/autonomous/status"), request("/api/v1/autonomous/performance")]);
+    state.snapshot = snapshot; state.account = account; state.autonomous = autonomous; state.performance = performance; renderMarket(); renderAccount(); renderAutonomous(); $("connection-error").classList.add("hidden");
   } catch (error) { $("connection-error").classList.remove("hidden"); $("connection-error").querySelector("span").textContent = error.message; status($("health"), "OFFLINE"); }
 }
 async function openPaper(direction) {
@@ -93,7 +122,14 @@ async function riskQuote() {
   try { const result = await request("/api/v1/paper/risk-quote", { method: "POST", body: JSON.stringify({ symbol: state.symbol, cumulativeLoss: Number($("loss").value), targetProfit: 4, baseStake: 5, estimatedProbability: null }) }); output.innerHTML = `<div class="risk-result ${result.allowed ? "allowed" : "blocked"}"><strong>${result.allowed ? "ALLOWED" : "BLOCKED"}</strong><span>Required stake: ${money(result.requiredRecoveryStake)} USDT</span><span>Expected value: ${result.expectedValue == null ? "Unavailable" : money(result.expectedValue)}</span><ul>${result.reasons.map((reason) => `<li>${escape(reason)}</li>`).join("")}</ul></div>`; }
   catch (error) { output.textContent = error.message; }
 }
+async function changeAutonomousState() {
+  const action = state.autonomous?.state?.status === "RUNNING" ? "pause" : "resume";
+  const button = $("auto-toggle"); button.disabled = true;
+  try { await request("/api/v1/autonomous/state", { method: "POST", body: JSON.stringify({ action }) }); await refresh(); }
+  catch (error) { $("auto-position").innerHTML = `<strong>REQUEST FAILED</strong><span>${escape(error.message)}</span>`; }
+  finally { button.disabled = false; }
+}
 document.querySelectorAll("[data-symbol]").forEach((button) => button.addEventListener("click", () => { state.symbol = button.dataset.symbol; document.querySelectorAll("[data-symbol]").forEach((item) => item.classList.toggle("active", item === button)); state.snapshot = null; refresh(); }));
 document.querySelectorAll("[data-timeframe]").forEach((button) => button.addEventListener("click", () => { state.timeframe = button.dataset.timeframe; document.querySelectorAll("[data-timeframe]").forEach((item) => item.classList.toggle("active", item === button)); renderMarket(); }));
 document.querySelectorAll("[data-direction]").forEach((button) => button.addEventListener("click", () => openPaper(button.dataset.direction)));
-$("risk-button").addEventListener("click", riskQuote); setInterval(() => { $("clock").textContent = `UTC ${new Date().toISOString().slice(11,19)}`; }, 1000); setInterval(refresh, 3000); refresh();
+$("risk-button").addEventListener("click", riskQuote); $("auto-toggle").addEventListener("click", changeAutonomousState); setInterval(() => { $("clock").textContent = `UTC ${new Date().toISOString().slice(11,19)}`; }, 1000); setInterval(refresh, 3000); refresh();

@@ -1,6 +1,6 @@
 {
   "name": "signal-expert",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Transparent MEXC market analytics and event-futures research platform",
@@ -9,7 +9,7 @@
     "dev": "node --watch app/server.mjs",
     "start": "node app/server.mjs",
     "build": "node scripts/build.mjs",
-    "lint": "node --check app/config.mjs && node --check app/quant.mjs && node --check app/mexc-provider.mjs && node --check app/database.mjs && node --check app/market-service.mjs && node --check app/paper-service.mjs && node --check app/server.mjs && node --check public/app.js",
+    "lint": "node --check app/config.mjs && node --check app/quant.mjs && node --check app/mexc-provider.mjs && node --check app/database.mjs && node --check app/market-service.mjs && node --check app/paper-service.mjs && node --check app/autonomous-service.mjs && node --check app/server.mjs && node --check public/app.js",
     "typecheck": "npm run lint",
     "test": "node --test",
     "db:migrate": "node scripts/migrate.mjs",

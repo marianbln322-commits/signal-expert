@@ -3,12 +3,9 @@ import { resolve } from "node:path";
 function numberValue(name, fallback, { min = -Infinity, max = Infinity, integer = false } = {}) {
   const raw = process.env[name];
   const value = raw === undefined || raw === "" ? fallback : Number(raw);
-  if (!Number.isFinite(value) || value < min || value > max || (integer && !Number.isInteger(value))) {
-    throw new Error(`${name} has an invalid value`);
-  }
+  if (!Number.isFinite(value) || value < min || value > max || (integer && !Number.isInteger(value))) throw new Error(`${name} has an invalid value`);
   return value;
 }
-
 function booleanValue(name, fallback) {
   const raw = process.env[name];
   if (raw === undefined || raw === "") return fallback;
@@ -16,12 +13,35 @@ function booleanValue(name, fallback) {
   if (["0", "false", "no", "off"].includes(raw.toLowerCase())) return false;
   throw new Error(`${name} must be true or false`);
 }
+function listValue(name, fallback, map = (value) => value) {
+  const values = (process.env[name] ?? fallback).split(",").map((value) => map(value.trim())).filter((value) => value !== "");
+  if (!values.length || new Set(values).size !== values.length) throw new Error(`${name} must contain unique values`);
+  return values;
+}
 
 const supportedSymbols = new Set(["BTCUSDT", "ETHUSDT"]);
-const symbols = (process.env.MARKET_SYMBOLS ?? "BTCUSDT,ETHUSDT").split(",").map((item) => item.trim().toUpperCase()).filter(Boolean);
-if (!symbols.length || symbols.some((symbol) => !supportedSymbols.has(symbol))) throw new Error("MARKET_SYMBOLS supports BTCUSDT and ETHUSDT only");
+const symbols = listValue("MARKET_SYMBOLS", "BTCUSDT,ETHUSDT", (value) => value.toUpperCase());
+if (symbols.some((symbol) => !supportedSymbols.has(symbol))) throw new Error("MARKET_SYMBOLS supports BTCUSDT and ETHUSDT only");
 const tradingMode = process.env.TRADING_MODE ?? "paper";
 if (!new Set(["read-only", "paper"]).has(tradingMode)) throw new Error("TRADING_MODE must be read-only or paper");
+const autonomousSymbols = listValue("AUTONOMOUS_SYMBOLS", "BTCUSDT,ETHUSDT", (value) => value.toUpperCase());
+if (autonomousSymbols.some((symbol) => !supportedSymbols.has(symbol) || !symbols.includes(symbol))) throw new Error("AUTONOMOUS_SYMBOLS must be configured BTCUSDT/ETHUSDT market symbols");
+const autonomousHorizons = listValue("AUTONOMOUS_HORIZONS", "10,30", Number);
+if (autonomousHorizons.some((horizon) => ![10, 30].includes(horizon))) throw new Error("AUTONOMOUS_HORIZONS supports 10 and 30 only");
+const profileAliases = { ADAPTIVE: "ADAPTIVE_CAPPED", FLAT: "FLAT", ADAPTIVE_CAPPED: "ADAPTIVE_CAPPED", OBSERVED: "OBSERVED_10_30_90_270", OBSERVED_10_30_90_270: "OBSERVED_10_30_90_270" };
+const autonomousProfile = profileAliases[(process.env.AUTONOMOUS_STAKE_PROFILE ?? "adaptive").trim().toUpperCase()];
+if (!autonomousProfile) throw new Error("AUTONOMOUS_STAKE_PROFILE must be flat, adaptive, or observed");
+const observedLadder = listValue("AUTONOMOUS_OBSERVED_LADDER", "10,30,90,270", Number);
+if (observedLadder.length !== 4 || observedLadder.some((stake) => !Number.isFinite(stake) || stake <= 0)) throw new Error("AUTONOMOUS_OBSERVED_LADDER must contain four positive stakes");
+const baseStakeFraction = numberValue("AUTONOMOUS_BASE_STAKE_FRACTION", 0.005, { min: 0.0001, max: 1 });
+const maxStakeFraction = numberValue("AUTONOMOUS_MAX_STAKE_FRACTION", 0.02, { min: 0.0001, max: 1 });
+if (maxStakeFraction < baseStakeFraction) throw new Error("AUTONOMOUS_MAX_STAKE_FRACTION must be at least the base fraction");
+const qualityThresholds = Object.freeze({
+  standard: numberValue("AUTONOMOUS_STANDARD_THRESHOLD", 68, { min: 0, max: 100, integer: true }),
+  high: numberValue("AUTONOMOUS_HIGH_THRESHOLD", 78, { min: 0, max: 100, integer: true }),
+  exceptional: numberValue("AUTONOMOUS_EXCEPTIONAL_THRESHOLD", 88, { min: 0, max: 100, integer: true }),
+});
+if (!(qualityThresholds.standard < qualityThresholds.high && qualityThresholds.high < qualityThresholds.exceptional)) throw new Error("Autonomous quality thresholds must increase from STANDARD to HIGH to EXCEPTIONAL");
 
 export const config = Object.freeze({
   host: process.env.API_HOST ?? "127.0.0.1",
@@ -39,10 +59,22 @@ export const config = Object.freeze({
   publicDirectory: resolve(process.env.PUBLIC_DIRECTORY ?? "public"),
   migrationDirectory: resolve(process.env.MIGRATION_DIRECTORY ?? "migrations"),
   payoutRate: numberValue("PAPER_PAYOUT_RATE", 0.8, { min: 0.01, max: 2 }),
-  initialBankroll: numberValue("PAPER_INITIAL_BANKROLL", 1200, { min: 1 }),
-  dailyLossLimit: numberValue("PAPER_DAILY_LOSS_LIMIT", 60, { min: 1 }),
+  initialBankroll: numberValue("PAPER_INITIAL_BANKROLL", 500, { min: 1 }),
+  dailyLossLimit: numberValue("PAPER_DAILY_LOSS_LIMIT", 10, { min: 0.01 }),
   maxOpenPositions: numberValue("PAPER_MAX_OPEN_POSITIONS", 2, { min: 1, max: 5, integer: true }),
   btcMaxStake: numberValue("PAPER_BTC_MAX_STAKE", 250, { min: 1 }),
   ethMaxStake: numberValue("PAPER_ETH_MAX_STAKE", 150, { min: 1 }),
+  autonomousEnabled: booleanValue("AUTONOMOUS_ENABLED", true),
+  autonomousProfile,
+  autonomousScanMs: numberValue("AUTONOMOUS_SCAN_MS", 5000, { min: 1000, integer: true }),
+  autonomousSymbols,
+  autonomousHorizons,
+  baseStakeFraction,
+  maxStakeFraction,
+  absoluteStakeCap: numberValue("AUTONOMOUS_ABSOLUTE_STAKE_CAP", 25, { min: 0.01 }),
+  dailyProfitTarget: numberValue("AUTONOMOUS_DAILY_PROFIT_TARGET", 5, { min: 0.01 }),
+  autonomousDailyLossLimit: numberValue("AUTONOMOUS_DAILY_LOSS_LIMIT", 10, { min: 0.01 }),
+  qualityThresholds,
+  observedLadder,
   tradingMode,
 });

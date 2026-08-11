@@ -7,6 +7,7 @@ import { Database } from "./database.mjs";
 import { FailoverMarketProvider, MexcSpotProvider } from "./mexc-provider.mjs";
 import { MarketService } from "./market-service.mjs";
 import { PaperService } from "./paper-service.mjs";
+import { AutonomousService } from "./autonomous-service.mjs";
 
 const jsonHeaders = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer", "x-frame-options": "DENY" };
 const types = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml" };
@@ -27,14 +28,25 @@ function validateQuote(value) {
   return { symbol: value.symbol, cumulativeLoss: value.cumulativeLoss, targetProfit: value.targetProfit, baseStake: value.baseStake, estimatedProbability: value.estimatedProbability };
 }
 
+function validateAutonomousAction(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 1 || !["pause", "resume"].includes(value.action)) throw new Error("Invalid autonomous state action");
+  return value.action;
+}
+
 export async function createApplication(options = {}) {
   const database = options.database ?? new Database(config.databasePath, config.migrationDirectory);
   const provider = options.provider ?? new FailoverMarketProvider(
     new MexcSpotProvider(config.mexcBaseUrl, { timeoutMs: config.providerTimeoutMs, attempts: config.providerAttempts }),
     config.marketFailoverEnabled ? new MexcSpotProvider(config.fallbackMarketBaseUrl, { timeoutMs: config.providerTimeoutMs, attempts: config.providerAttempts }) : null,
   );
-  const market = new MarketService({ provider, symbols: config.symbols, staleAfterMs: config.staleAfterMs, payoutRate: config.payoutRate, database });
+  const market = new MarketService({ provider, symbols: config.symbols, staleAfterMs: config.staleAfterMs, payoutRate: config.payoutRate, database, candidateThresholds: config.qualityThresholds });
   const paper = new PaperService({ market, database, settings: { payoutRate: config.payoutRate, initialBankroll: config.initialBankroll, dailyLossLimit: config.dailyLossLimit, maxOpenPositions: config.maxOpenPositions, btcMaxStake: config.btcMaxStake, ethMaxStake: config.ethMaxStake } });
+  const autonomous = new AutonomousService({ market, paper, database, settings: {
+    enabled: config.autonomousEnabled && config.tradingMode === "paper", profile: config.autonomousProfile, scanMs: config.autonomousScanMs,
+    symbols: config.autonomousSymbols, horizons: config.autonomousHorizons, baseFraction: config.baseStakeFraction, maxFraction: config.maxStakeFraction,
+    absoluteCap: config.absoluteStakeCap, dailyProfitTarget: config.dailyProfitTarget, dailyLossLimit: config.autonomousDailyLossLimit,
+    thresholds: config.qualityThresholds, observedLadder: config.observedLadder, payoutRate: config.payoutRate,
+  } });
   const rate = new Map();
   const server = createServer(async (request, response) => {
     const started = Date.now(); const ip = request.socket.remoteAddress ?? "local"; const bucket = rate.get(ip) ?? { count: 0, reset: started + 60000 };
@@ -44,14 +56,25 @@ export async function createApplication(options = {}) {
     if (request.method === "POST") {
       if (!(request.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) return sendJson(response, 415, { error: "UNSUPPORTED_MEDIA_TYPE", message: "application/json is required" });
       const origin = request.headers.origin;
-      try { if (origin && new URL(origin).host !== request.headers.host) return sendJson(response, 403, { error: "ORIGIN_REJECTED", message: "Cross-origin state changes are not allowed" }); }
+      if (url.pathname === "/api/v1/autonomous/state") {
+        if (!origin) return sendJson(response, 403, { error: "ORIGIN_REQUIRED", message: "Autonomous control requires a same-origin browser request" });
+        try {
+          const parsedOrigin = new URL(origin); const localHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+          if (parsedOrigin.protocol !== "http:" || parsedOrigin.host !== request.headers.host || !localHosts.has(parsedOrigin.hostname)) return sendJson(response, 403, { error: "ORIGIN_REJECTED", message: "Autonomous control is restricted to the local dashboard origin" });
+        } catch { return sendJson(response, 403, { error: "ORIGIN_REJECTED", message: "Invalid origin" }); }
+      }
+      try { if (origin && new URL(origin).origin !== `http://${request.headers.host}`) return sendJson(response, 403, { error: "ORIGIN_REJECTED", message: "Cross-origin state changes are not allowed" }); }
       catch { return sendJson(response, 403, { error: "ORIGIN_REJECTED", message: "Invalid origin" }); }
     }
     try {
-      if (request.method === "GET" && url.pathname === "/health") return sendJson(response, 200, { status: "ok", timestamp: new Date().toISOString(), mode: config.tradingMode, database: database.health(), liveExecution: { available: false, reason: "MEXC Event Futures execution API is not verified." } });
+      if (request.method === "GET" && url.pathname === "/health") return sendJson(response, 200, { status: "ok", timestamp: new Date().toISOString(), mode: config.tradingMode, database: database.health(), autonomousExecution: { mode: "PAPER_ONLY", enabled: config.autonomousEnabled && config.tradingMode === "paper", liveAvailable: false }, liveExecution: { available: false, reason: "MEXC Event Futures execution API is not verified; autonomous execution is PAPER only." } });
       if (request.method === "GET" && url.pathname === "/api/v1/sources") return sendJson(response, 200, { timestamp: new Date().toISOString(), sources: market.sources() });
       if (request.method === "GET" && url.pathname.startsWith("/api/v1/market/")) { const symbol = url.pathname.split("/").at(-1).toUpperCase(); const snapshot = market.snapshot(symbol); return snapshot ? sendJson(response, 200, snapshot) : sendJson(response, 404, { error: "NOT_FOUND", message: "Symbol not configured" }); }
       if (request.method === "GET" && url.pathname === "/api/v1/paper/account") return sendJson(response, 200, paper.account());
+      if (request.method === "GET" && url.pathname === "/api/v1/autonomous/status") return sendJson(response, 200, autonomous.status());
+      if (request.method === "GET" && url.pathname === "/api/v1/autonomous/performance") return sendJson(response, 200, autonomous.performance());
+      if (request.method === "POST" && url.pathname === "/api/v1/autonomous/state") return sendJson(response, 200, autonomous.setAction(validateAutonomousAction(await body(request))));
+      if (url.pathname === "/api/v1/autonomous/status" || url.pathname === "/api/v1/autonomous/performance" || url.pathname === "/api/v1/autonomous/state") return sendJson(response, 405, { error: "METHOD_NOT_ALLOWED" });
       if (request.method === "POST" && url.pathname === "/api/v1/paper/positions") { if (config.tradingMode !== "paper") return sendJson(response, 403, { error: "DISABLED", message: "Paper trading disabled" }); const position = paper.open(validatePaper(await body(request))); return sendJson(response, 201, position); }
       if (request.method === "POST" && url.pathname === "/api/v1/paper/risk-quote") return sendJson(response, 200, paper.riskQuote(validateQuote(await body(request))));
       if (request.method !== "GET") return sendJson(response, 404, { error: "NOT_FOUND" });
@@ -62,8 +85,8 @@ export async function createApplication(options = {}) {
     } catch (error) { sendJson(response, error.message?.includes("Invalid") ? 400 : 409, { error: "REQUEST_REJECTED", message: error instanceof Error ? error.message : "Request failed" }); }
     finally { if (Date.now() - started > 1000) console.warn(JSON.stringify({ level: "warn", event: "slow_request", path: url.pathname, durationMs: Date.now() - started })); }
   });
-  await market.start(config.tickerPollMs, config.candlePollMs); paper.initialize();
-  return { server, market, paper, database, async close() { market.stop(); paper.stop(); await new Promise((done) => server.close(done)); database.close(); } };
+  await market.start(config.tickerPollMs, config.candlePollMs); paper.initialize(); autonomous.start();
+  return { server, market, paper, autonomous, database, async close() { market.stop(); autonomous.stop(); paper.stop(); if (server.listening) await new Promise((done) => server.close(done)); database.close(); } };
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;

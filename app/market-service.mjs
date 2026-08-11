@@ -6,8 +6,8 @@ const emptyState = () => ({
 });
 
 export class MarketService {
-  constructor({ provider, symbols, staleAfterMs, payoutRate, database }) {
-    this.provider = provider; this.symbols = symbols; this.staleAfterMs = staleAfterMs; this.payoutRate = payoutRate; this.database = database;
+  constructor({ provider, symbols, staleAfterMs, payoutRate, database, candidateThresholds }) {
+    this.provider = provider; this.symbols = symbols; this.staleAfterMs = staleAfterMs; this.payoutRate = payoutRate; this.database = database; this.candidateThresholds = candidateThresholds;
     this.states = new Map(symbols.map((symbol) => [symbol, emptyState()])); this.timers = []; this.tickerBusy = false; this.candleBusy = false;
   }
   async start(tickerPollMs, candlePollMs) {
@@ -47,7 +47,7 @@ export class MarketService {
         });
         if (complete && timeframes.every((timeframe) => this.status(state.candles[timeframe]) === "LIVE")) {
           const closed = Object.fromEntries(timeframes.map((timeframe) => [timeframe, state.candles[timeframe].data.filter((candle) => candle.closed)]));
-          state.analysis = analyzeMarket(closed, this.payoutRate);
+          state.analysis = analyzeMarket(closed, this.payoutRate, new Date(), { symbol, thresholds: this.candidateThresholds });
           state.analysis.sources = Object.fromEntries(timeframes.map((timeframe) => [timeframe, { source: state.candles[timeframe].source, sourceName: state.candles[timeframe].sourceName, sourceUrl: state.candles[timeframe].sourceUrl, sourceTimestamp: state.candles[timeframe].sourceTimestamp, receivedAt: state.candles[timeframe].receivedAt, failover: state.candles[timeframe].failover }]));
           this.database.insertSignal(symbol, state.analysis, state.candles["1m"].sourceTimestamp);
         } else state.analysis = null;
