@@ -1,4 +1,4 @@
-const state = { symbol: "BTCUSDT", timeframe: "1m", snapshot: null, account: null, autonomous: null, performance: null };
+const state = { symbol: "BTCUSDT", timeframe: "1m", snapshot: null, account: null, autonomous: null, performance: null, manualSignals: null };
 const $ = (id) => document.getElementById(id);
 const money = (value, digits = 2) => Number(value).toLocaleString("ro-RO", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 const pct = (value) => `${(Number(value) * 100).toFixed(2)}%`;
@@ -11,9 +11,10 @@ const segmentClass = (value) => ["WARMUP", "MONITOR", "VALIDATED", "UNDERPERFORM
 
 let soundEnabled = false;
 let audioContext = null;
-let openPositionBaselineReady = false;
-let lastOpenPositionId = null;
-try { soundEnabled = localStorage.getItem("signal-expert-entry-sound") === "enabled"; } catch { soundEnabled = false; }
+let manualSignalBaselineReady = false;
+let knownReadySignalIds = new Set();
+let manualDeadlineTimer = null;
+try { soundEnabled = localStorage.getItem("signal-expert-manual-signal-sound") === "enabled"; } catch { soundEnabled = false; }
 
 async function request(path, options) {
   const response = await fetch(path, { ...options, headers: { "content-type": "application/json", ...options?.headers } });
@@ -45,12 +46,37 @@ function currentCandidate() {
   return candidates.sort((left, right) => (right.qualityScore ?? -1) - (left.qualityScore ?? -1) || left.horizonMinutes - right.horizonMinutes)[0] ?? null;
 }
 
+function currentManualSignal() {
+  const signals = state.manualSignals?.ready?.filter((signal) => signal.symbol === state.symbol) ?? [];
+  return signals.sort((left, right) => (right.qualityScore ?? -1) - (left.qualityScore ?? -1) || left.horizonMinutes - right.horizonMinutes)[0] ?? null;
+}
+
+function remaining(value) {
+  const milliseconds = new Date(value).getTime() - Date.now();
+  if (!Number.isFinite(milliseconds)) return "—";
+  if (milliseconds <= 0) return "00:00";
+  const seconds = Math.ceil(milliseconds / 1000);
+  const minutes = Math.floor(seconds / 60);
+  return `${String(minutes).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function manualLifecycleClass(value) {
+  return ["ENTER_NOW", "TRACKING_DO_NOT_ENTER_LATE", "WAIT", "EXPIRED", "DISABLED"].includes(value) ? value.toLowerCase().replaceAll("_", "-") : "wait";
+}
+
+function localManualActionState(signal, now = Date.now(), enabled = state.manualSignals?.enabled === true) {
+  if (signal?.status !== "READY") return signal?.status ?? "WAIT";
+  if (!enabled) return "DISABLED";
+  const deadline = new Date(signal.entryValidUntil).getTime();
+  return Number.isFinite(deadline) && now < deadline ? "ENTER_NOW" : "TRACKING_DO_NOT_ENTER_LATE";
+}
+
 function latestStructureItem(group, indexKey = "index") {
   const items = [group?.bullish, group?.bearish].filter(Boolean);
   return items.sort((left, right) => (right[indexKey] ?? -1) - (left[indexKey] ?? -1))[0] ?? null;
 }
 
-function chart(candles, candidate = null) {
+function chart(candles, candidate = null, manualSignal = null) {
   if (!candles?.length) {
     $("chart").innerHTML = '<div class="chart-empty">Waiting for verified completed candles…</div>';
     return;
@@ -89,6 +115,9 @@ function chart(candles, candidate = null) {
   for (const [swing, label] of [[structure?.latestSwingHigh, "SWING H"], [structure?.latestSwingLow, "SWING L"]]) {
     if (!inRange(swing?.price)) continue;
     svg += `<line x1="${pad}" x2="${width - pad}" y1="${y(swing.price)}" y2="${y(swing.price)}" stroke="#8ba5c9" opacity=".45" stroke-dasharray="3 6"/><text x="${pad + 7}" y="${y(swing.price) - 4}" class="zone-label" fill="#8ba5c9">${label}</text>`;
+  }
+  if (inRange(manualSignal?.entryPrice)) {
+    svg += `<line x1="${pad}" x2="${width - pad}" y1="${y(manualSignal.entryPrice)}" y2="${y(manualSignal.entryPrice)}" stroke="#ffffff" stroke-width="1.2" stroke-dasharray="4 4"/><text x="${pad + 7}" y="${y(manualSignal.entryPrice) - 5}" class="zone-label" fill="#ffffff">SIGNAL ENTRY</text>`;
   }
   if (inRange(candidate?.invalidationPrice)) {
     svg += `<line x1="${pad}" x2="${width - pad}" y1="${y(candidate.invalidationPrice)}" y2="${y(candidate.invalidationPrice)}" stroke="#ffbf4b" stroke-width="1.4" stroke-dasharray="9 5"/><text x="${width - pad - 88}" y="${y(candidate.invalidationPrice) - 5}" class="zone-label" fill="#ffbf4b">INVALIDATION</text>`;
@@ -150,7 +179,7 @@ function renderMarket() {
   } else clearTicker();
   const candleEnvelope = snapshot.candles[state.timeframe];
   const completedCandles = (candleEnvelope.data ?? []).filter((candle) => candle.closed === true);
-  chart(completedCandles, currentCandidate());
+  chart(completedCandles, currentCandidate(), currentManualSignal());
   const latestCompleted = completedCandles.at(-1);
   $("closed-candle-time").textContent = latestCompleted ? `Latest completed ${state.timeframe} candle closed ${time(new Date(latestCompleted.closeTime).toISOString())} · ${completedCandles.length} closed candles` : `No completed ${state.timeframe} candle is available`;
   const analysis = snapshot.analysis;
@@ -176,6 +205,59 @@ function renderBook(book) {
   const rows = (items, type) => items.map((level) => `<div class="book-row ${type}"><i style="width:${level.quantity / max * 100}%"></i><span>${money(level.price, 2)}</span><span>${money(level.quantity, 5)}</span></div>`).join("");
   $("asks").innerHTML = rows((book?.asks ?? []).slice(0, 6).reverse(), "ask");
   $("bids").innerHTML = rows((book?.bids ?? []).slice(0, 6), "bid");
+}
+
+function manualConfidenceFor(symbol, horizonMinutes, strategyVersion = "0.3.0") {
+  return state.manualSignals?.empiricalConfidence?.find((item) => item.symbol === symbol && item.horizonMinutes === horizonMinutes && item.strategyVersion === strategyVersion) ?? null;
+}
+
+function renderManualSignals() {
+  const manual = state.manualSignals;
+  if (!manual) return;
+  const bySegment = new Map((manual.current ?? []).map((signal) => [`${signal.symbol}:${signal.horizonMinutes}`, signal]));
+  const segments = ["BTCUSDT", "ETHUSDT"].flatMap((symbol) => [10, 30].map((horizonMinutes) => ({ symbol, horizonMinutes })));
+  $("manual-signal-state").textContent = manual.enabled ? "SCANNING" : "DISABLED";
+  $("manual-signal-state").className = `mode ${manual.enabled ? "auto-running" : "auto-paused"}`;
+  $("manual-signal-scan").textContent = manual.nextScanAt ? time(manual.nextScanAt) : "—";
+  $("manual-signal-source").textContent = state.snapshot?.market?.status === "LIVE" ? `${state.snapshot.market.sourceName ?? state.snapshot.market.source} · ${time(state.snapshot.market.sourceTimestamp)}` : "No fresh verified Spot ticker";
+  $("manual-signal-cards").innerHTML = segments.map(({ symbol, horizonMinutes }) => {
+    const signal = bySegment.get(`${symbol}:${horizonMinutes}`);
+    const confidence = manualConfidenceFor(symbol, horizonMinutes, signal?.strategyVersion);
+    if (!signal) return `<article class="manual-card manual-wait"><div class="manual-card-head"><strong>${symbol} · ${horizonMinutes}m</strong><span>WAIT</span></div><p>No completed-candle evaluation has been recorded yet.</p><small>Entry and confidence remain unavailable.</small></article>`;
+    const actionState = localManualActionState(signal);
+    const actionable = actionState === "ENTER_NOW";
+    const tracking = actionState === "TRACKING_DO_NOT_ENTER_LATE";
+    const confidenceText = confidence?.measuredRate == null ? "N/A" : pct(confidence.measuredRate);
+    const confidenceDetail = confidence?.measuredRate == null
+      ? `${confidence?.decisiveSample ?? 0}/${confidence?.minDecisiveSample ?? manual.policy?.minDecisiveSample ?? 20} decisive proxy outcomes`
+      : `Wilson 95% ${pct(confidence.wilson95.lower)}–${pct(confidence.wilson95.upper)} · n=${confidence.decisiveSample}`;
+    const instruction = actionable ? `ENTER ${signal.direction} NOW` : tracking ? "TRACKING · DO NOT ENTER LATE" : actionState === "DISABLED" ? "DISABLED · NO ENTRY" : signal.status === "EXPIRED" ? `PROXY RESULT · ${signal.proxyOutcome ?? "EXPIRED"}` : "WAIT · NO ENTRY";
+    const timer = actionable ? `entry closes ${remaining(signal.entryValidUntil)}` : tracking ? `proxy observation in ${remaining(signal.resolvesAt)}` : signal.status === "EXPIRED" ? `resolved ${time(signal.resolvedAt)}` : "no entry window";
+    const sourceName = signal.entrySource?.sourceName ?? signal.entrySource?.source ?? "No entry source";
+    const fallback = signal.entrySource?.failover?.active === true;
+    const invalidation = signal.invalidation?.text ?? (Number.isFinite(signal.invalidationPrice) ? `Completed-candle invalidation ${money(signal.invalidationPrice)}` : "No finite invalidation");
+    return `<article class="manual-card manual-${manualLifecycleClass(actionState)}">
+      <div class="manual-card-head"><strong>${escape(symbol)} · ${horizonMinutes}m</strong><span>${escape(actionState)}</span></div>
+      <div class="manual-instruction ${directionClass(signal.direction)}">${escape(instruction)}</div>
+      <div class="manual-price"><small>SPOT-PROXY ENTRY</small><b>${Number.isFinite(signal.entryPrice) ? money(signal.entryPrice) : "—"}</b><span>${escape(timer)}</span></div>
+      <div class="manual-stats"><div><small>SETUP QUALITY</small><b>${signal.qualityScore}/100</b><span>${escape(signal.qualityBand)}</span></div><div><small>EMPIRICAL CONFIDENCE</small><b>${confidenceText}</b><span>${escape(confidenceDetail)}</span></div></div>
+      <p class="manual-invalidation">${escape(invalidation)}</p>
+      <div class="provenance"><span>${escape(sourceName)}</span><span>${time(signal.entrySource?.sourceTimestamp)}</span><span class="${fallback ? "fallback-badge" : "raw-tag"}">${fallback ? "FALLBACK" : "PRIMARY/ATTRIBUTED"}</span></div>
+      <small>${escape(signal.reasons?.at(-1) ?? "Completed-candle evaluation recorded.")}</small>
+    </article>`;
+  }).join("");
+  $("manual-confidence").innerHTML = (manual.empiricalConfidence ?? []).map((confidence) => `<div class="confidence-row">
+    <strong>${escape(confidence.symbol)} · ${confidence.horizonMinutes}m</strong><span class="segment-${segmentClass(confidence.status)}">${escape(confidence.status)}</span>
+    <b>${confidence.measuredRate == null ? "Not available" : pct(confidence.measuredRate)}</b><small>${confidence.decisiveSample}/${confidence.minDecisiveSample} decisive · ${confidence.correct} correct / ${confidence.incorrect} incorrect · Spot proxy only</small>
+  </div>`).join("") || '<div class="empty-card">No prospective proxy outcomes yet.</div>';
+  $("manual-history").innerHTML = (manual.recent ?? []).slice(0, 12).map((signal) => `<div class="manual-history-row">
+    <span>${time(signal.generatedAt)}</span><strong>${escape(signal.symbol)} · ${signal.horizonMinutes}m</strong><b class="${directionClass(signal.direction)}">${escape(signal.direction)}</b><span>${escape(localManualActionState(signal))}</span><span>${signal.qualityScore}/100</span><small>${escape(signal.proxyOutcome ?? signal.reasons?.at(-1) ?? "Recorded")}</small>
+  </div>`).join("") || '<div class="empty-card">No manual research signal history yet.</div>';
+  notifyNewManualSignal(manual.ready ?? []);
+  if (manualDeadlineTimer) clearTimeout(manualDeadlineTimer);
+  const now = Date.now();
+  const nextDeadline = (manual.ready ?? []).map((signal) => new Date(signal.entryValidUntil).getTime()).filter((deadline) => Number.isFinite(deadline) && deadline > now).sort((left, right) => left - right)[0];
+  manualDeadlineTimer = nextDeadline === undefined ? null : setTimeout(() => { manualDeadlineTimer = null; renderManualSignals(); }, Math.max(1, nextDeadline - now + 1));
 }
 
 function renderLiveSetups() {
@@ -233,15 +315,15 @@ function playEntrySound() {
   } catch { /* Browser audio is optional and may be unavailable. */ }
 }
 
-function notifyNewAutonomousOpen(position) {
-  const currentId = position?.id ?? null;
-  if (!openPositionBaselineReady) {
-    lastOpenPositionId = currentId;
-    openPositionBaselineReady = true;
+function notifyNewManualSignal(signals) {
+  const currentIds = new Set(signals.filter((signal) => localManualActionState(signal) === "ENTER_NOW").map((signal) => signal.id));
+  if (!manualSignalBaselineReady) {
+    knownReadySignalIds = currentIds;
+    manualSignalBaselineReady = true;
     return;
   }
-  if (currentId && currentId !== lastOpenPositionId) playEntrySound();
-  lastOpenPositionId = currentId;
+  if ([...currentIds].some((id) => !knownReadySignalIds.has(id))) playEntrySound();
+  knownReadySignalIds = new Set([...knownReadySignalIds, ...currentIds]);
 }
 
 function renderAutonomous() {
@@ -284,7 +366,7 @@ function renderAutonomous() {
   $("auto-win-rate").textContent = totals.winRate == null ? "—" : `${(totals.winRate * 100).toFixed(1)}% (${totals.wins}W/${totals.losses}L)`;
   $("auto-roi").textContent = totals.roiOnStake == null ? "—" : pct(totals.roiOnStake);
   $("auto-drawdown").textContent = `${money(totals.maxDrawdown)} USDT`; $("auto-loss-streak").textContent = String(totals.maxConsecutiveLosses);
-  renderLiveSetups(); renderRecentAlerts(); renderSegmentMetrics(); notifyNewAutonomousOpen(position);
+  renderLiveSetups(); renderRecentAlerts(); renderSegmentMetrics();
 }
 
 function renderAccount() {
@@ -299,9 +381,9 @@ function renderAccount() {
 
 async function refresh() {
   try {
-    const [snapshot, account, autonomous, performance] = await Promise.all([request(`/api/v1/market/${state.symbol}`), request("/api/v1/paper/account"), request("/api/v1/autonomous/status"), request("/api/v1/autonomous/performance")]);
-    state.snapshot = snapshot; state.account = account; state.autonomous = autonomous; state.performance = performance;
-    renderMarket(); renderAccount(); renderAutonomous(); $("connection-error").classList.add("hidden");
+    const [snapshot, account, autonomous, performance, manualSignals] = await Promise.all([request(`/api/v1/market/${state.symbol}`), request("/api/v1/paper/account"), request("/api/v1/autonomous/status"), request("/api/v1/autonomous/performance"), request("/api/v1/manual-signals/status")]);
+    state.snapshot = snapshot; state.account = account; state.autonomous = autonomous; state.performance = performance; state.manualSignals = manualSignals;
+    renderMarket(); renderAccount(); renderAutonomous(); renderManualSignals(); $("connection-error").classList.add("hidden");
   } catch (error) {
     $("connection-error").classList.remove("hidden"); $("connection-error").querySelector("span").textContent = error.message; status($("health"), "OFFLINE");
   }
@@ -336,7 +418,7 @@ function configureSound() {
   input.checked = soundEnabled;
   input.addEventListener("change", () => {
     soundEnabled = input.checked;
-    try { localStorage.setItem("signal-expert-entry-sound", soundEnabled ? "enabled" : "disabled"); } catch { /* Persistence is optional. */ }
+    try { localStorage.setItem("signal-expert-manual-signal-sound", soundEnabled ? "enabled" : "disabled"); } catch { /* Persistence is optional. */ }
     if (soundEnabled) {
       try { audioContext ??= new (window.AudioContext || window.webkitAudioContext)(); audioContext.resume(); } catch { /* Audio remains optional. */ }
     }

@@ -8,6 +8,7 @@ import { FailoverMarketProvider, MexcSpotProvider } from "./mexc-provider.mjs";
 import { MarketService } from "./market-service.mjs";
 import { PaperService } from "./paper-service.mjs";
 import { AutonomousService } from "./autonomous-service.mjs";
+import { ManualSignalService } from "./manual-signal-service.mjs";
 
 const jsonHeaders = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer", "x-frame-options": "DENY" };
 const types = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml" };
@@ -48,6 +49,17 @@ export async function createApplication(options = {}) {
     segmentGateEnabled: config.autonomousSegmentGateEnabled, segmentMinSample: config.autonomousSegmentMinSample,
     thresholds: config.qualityThresholds, observedLadder: config.observedLadder, payoutRate: config.payoutRate,
   } });
+  const manualSignals = new ManualSignalService({ market, database, settings: {
+    enabled: config.manualSignalsEnabled && config.tradingMode === "paper",
+    scanMs: config.manualSignalScanMs,
+    entryWindowMs: config.manualSignalEntryWindowMs,
+    maxResolutionLagMs: config.manualSignalMaxResolutionLagMs,
+    minDecisiveSample: config.manualSignalMinDecisiveSample,
+    confidenceGateEnabled: config.manualSignalConfidenceGateEnabled,
+    payoutRate: config.payoutRate,
+    symbols: config.symbols,
+    horizons: [10, 30],
+  } });
   const rate = new Map();
   const server = createServer(async (request, response) => {
     const started = Date.now(); const ip = request.socket.remoteAddress ?? "local"; const bucket = rate.get(ip) ?? { count: 0, reset: started + 60000 };
@@ -68,14 +80,24 @@ export async function createApplication(options = {}) {
       catch { return sendJson(response, 403, { error: "ORIGIN_REJECTED", message: "Invalid origin" }); }
     }
     try {
-      if (request.method === "GET" && url.pathname === "/health") return sendJson(response, 200, { status: "ok", timestamp: new Date().toISOString(), mode: config.tradingMode, database: database.health(), autonomousExecution: { mode: "PAPER_ONLY", enabled: config.autonomousEnabled && config.tradingMode === "paper", liveAvailable: false }, liveExecution: { available: false, reason: "MEXC Event Futures execution API is not verified; autonomous execution is PAPER only." } });
+      if (request.method === "GET" && url.pathname === "/health") return sendJson(response, 200, { status: "ok", timestamp: new Date().toISOString(), mode: config.tradingMode, database: database.health(), autonomousExecution: { mode: "PAPER_ONLY", enabled: config.autonomousEnabled && config.tradingMode === "paper", liveAvailable: false }, manualSignals: { mode: "MANUAL_SIGNALS_ONLY", enabled: config.manualSignalsEnabled && config.tradingMode === "paper", marketClassification: "SPOT_PROXY", settlementClassification: "NOT_EVENT_FUTURES_SETTLEMENT", liveExecutionAvailable: false }, liveExecution: { available: false, reason: "No verified MEXC Event Futures execution API is connected; the application supplies manual research signals and PAPER shadow outcomes only." } });
       if (request.method === "GET" && url.pathname === "/api/v1/sources") return sendJson(response, 200, { timestamp: new Date().toISOString(), sources: market.sources() });
       if (request.method === "GET" && url.pathname.startsWith("/api/v1/market/")) { const symbol = url.pathname.split("/").at(-1).toUpperCase(); const snapshot = market.snapshot(symbol); return snapshot ? sendJson(response, 200, snapshot) : sendJson(response, 404, { error: "NOT_FOUND", message: "Symbol not configured" }); }
       if (request.method === "GET" && url.pathname === "/api/v1/paper/account") return sendJson(response, 200, paper.account());
       if (request.method === "GET" && url.pathname === "/api/v1/autonomous/status") return sendJson(response, 200, autonomous.status());
       if (request.method === "GET" && url.pathname === "/api/v1/autonomous/performance") return sendJson(response, 200, autonomous.performance());
+      if (request.method === "GET" && url.pathname === "/api/v1/manual-signals/status") {
+        if (url.searchParams.getAll("symbol").length > 1) throw new Error("Invalid symbol query");
+        const requestedSymbol = url.searchParams.get("symbol"); const symbol = requestedSymbol === null ? null : requestedSymbol.toUpperCase();
+        if (symbol !== null && !config.symbols.includes(symbol)) throw new Error("Invalid symbol query");
+        return sendJson(response, 200, manualSignals.status(symbol));
+      }
+      if (request.method === "GET" && /^\/api\/v1\/manual-signals\/[^/]+$/.test(url.pathname)) {
+        const id = decodeURIComponent(url.pathname.split("/").at(-1)); const signal = manualSignals.byId(id);
+        return signal ? sendJson(response, 200, signal) : sendJson(response, 404, { error: "NOT_FOUND", message: "Manual research signal not found" });
+      }
       if (request.method === "POST" && url.pathname === "/api/v1/autonomous/state") return sendJson(response, 200, autonomous.setAction(validateAutonomousAction(await body(request))));
-      if (url.pathname === "/api/v1/autonomous/status" || url.pathname === "/api/v1/autonomous/performance" || url.pathname === "/api/v1/autonomous/state") return sendJson(response, 405, { error: "METHOD_NOT_ALLOWED" });
+      if (url.pathname === "/api/v1/autonomous/status" || url.pathname === "/api/v1/autonomous/performance" || url.pathname === "/api/v1/autonomous/state" || url.pathname === "/api/v1/manual-signals/status" || /^\/api\/v1\/manual-signals\/[^/]+$/.test(url.pathname)) return sendJson(response, 405, { error: "METHOD_NOT_ALLOWED" });
       if (request.method === "POST" && url.pathname === "/api/v1/paper/positions") { if (config.tradingMode !== "paper") return sendJson(response, 403, { error: "DISABLED", message: "Paper trading disabled" }); const position = paper.open(validatePaper(await body(request))); return sendJson(response, 201, position); }
       if (request.method === "POST" && url.pathname === "/api/v1/paper/risk-quote") return sendJson(response, 200, paper.riskQuote(validateQuote(await body(request))));
       if (request.method !== "GET") return sendJson(response, 404, { error: "NOT_FOUND" });
@@ -86,8 +108,8 @@ export async function createApplication(options = {}) {
     } catch (error) { sendJson(response, error.message?.includes("Invalid") ? 400 : 409, { error: "REQUEST_REJECTED", message: error instanceof Error ? error.message : "Request failed" }); }
     finally { if (Date.now() - started > 1000) console.warn(JSON.stringify({ level: "warn", event: "slow_request", path: url.pathname, durationMs: Date.now() - started })); }
   });
-  await market.start(config.tickerPollMs, config.candlePollMs); paper.initialize(); autonomous.start();
-  return { server, market, paper, autonomous, database, async close() { market.stop(); autonomous.stop(); paper.stop(); if (server.listening) await new Promise((done) => server.close(done)); database.close(); } };
+  await market.start(config.tickerPollMs, config.candlePollMs); paper.initialize(); autonomous.start(); manualSignals.start();
+  return { server, market, paper, autonomous, manualSignals, database, async close() { manualSignals.stop(); market.stop(); autonomous.stop(); paper.stop(); if (server.listening) await new Promise((done) => server.close(done)); database.close(); } };
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;

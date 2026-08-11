@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 
 const positionColumns = `id,symbol,direction,horizon_minutes AS horizonMinutes,stake,payout_rate AS payoutRate,entry_price AS entryPrice,opened_at AS openedAt,resolves_at AS resolvesAt,status,settlement_price AS settlementPrice,settled_at AS settledAt,pnl,signal_version AS signalVersion,source_name AS sourceName,source_timestamp AS sourceTimestamp,settlement_reason AS settlementReason,origin,decision_id AS decisionId,strategy_name AS strategyName,strategy_version AS strategyVersion,quality_score AS qualityScore,stake_profile AS stakeProfile,recovery_stage AS recoveryStage`;
 const decisionColumns = `id,decision_key AS decisionKey,symbol,horizon_minutes AS horizonMinutes,direction,quality_score AS qualityScore,quality_band AS qualityBand,timeframe_watermarks_json AS timeframeWatermarksJson,strategy_name AS strategyName,strategy_version AS strategyVersion,profile,stage,action,stake,reasons_json AS reasonsJson,details_json AS detailsJson,invalidation_json AS invalidationJson,invalidation_price AS invalidationPrice,paper_position_id AS paperPositionId,created_at AS createdAt,updated_at AS updatedAt`;
+const manualSignalColumns = `id,candidate_key AS candidateKey,symbol,horizon_minutes AS horizonMinutes,direction,lifecycle_status AS status,quality_score AS qualityScore,quality_band AS qualityBand,reasons_json AS reasonsJson,details_json AS detailsJson,timeframe_watermarks_json AS timeframeWatermarksJson,invalidation_json AS invalidationJson,invalidation_price AS invalidationPrice,strategy_name AS strategyName,strategy_version AS strategyVersion,generated_at AS generatedAt,entry_price AS entryPrice,entry_at AS entryAt,entry_valid_until AS entryValidUntil,resolves_at AS resolvesAt,entry_source_json AS entrySourceJson,candle_sources_json AS candleSourcesJson,market_classification AS marketClassification,settlement_classification AS settlementClassification,proxy_outcome AS proxyOutcome,resolution_price AS resolutionPrice,resolution_source_json AS resolutionSourceJson,resolved_at AS resolvedAt,expired_at AS expiredAt,created_at AS createdAt`;
 
 function decodeJson(value, fallback) {
   try { return typeof value === "string" ? JSON.parse(value) : fallback; } catch { return fallback; }
@@ -193,6 +194,75 @@ export class Database {
       else if (rate !== null && segment.wilson95.upper < rate) status = "UNDERPERFORMING";
       return { ...segment, status, minSample };
     }));
+  }
+  decodeManualResearchSignal(row) {
+    if (!row) return null;
+    const { reasonsJson, detailsJson, timeframeWatermarksJson, invalidationJson, entrySourceJson, candleSourcesJson, resolutionSourceJson, ...signal } = row;
+    return {
+      ...signal,
+      reasons: decodeJson(reasonsJson, []),
+      details: decodeJson(detailsJson, {}),
+      timeframeCloseWatermarks: decodeJson(timeframeWatermarksJson, {}),
+      invalidation: decodeJson(invalidationJson, {}),
+      entrySource: decodeJson(entrySourceJson, null),
+      candleSources: decodeJson(candleSourcesJson, {}),
+      resolutionSource: decodeJson(resolutionSourceJson, null),
+    };
+  }
+  createManualResearchSignal(signal) {
+    const result = this.db.prepare(`INSERT INTO manual_research_signals(id,candidate_key,symbol,horizon_minutes,direction,lifecycle_status,quality_score,quality_band,reasons_json,details_json,timeframe_watermarks_json,invalidation_json,invalidation_price,strategy_name,strategy_version,generated_at,entry_price,entry_at,entry_valid_until,resolves_at,entry_source_json,candle_sources_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(candidate_key) DO NOTHING`).run(
+      signal.id, signal.candidateKey, signal.symbol, signal.horizonMinutes, signal.direction, signal.status,
+      signal.qualityScore, signal.qualityBand, JSON.stringify(signal.reasons ?? []), JSON.stringify(signal.details ?? {}),
+      JSON.stringify(signal.timeframeCloseWatermarks ?? {}), JSON.stringify(signal.invalidation ?? {}), signal.invalidationPrice ?? null,
+      signal.strategyName, signal.strategyVersion, signal.generatedAt, signal.entryPrice ?? null, signal.entryAt ?? null,
+      signal.entryValidUntil ?? null, signal.resolvesAt ?? null, signal.entrySource ? JSON.stringify(signal.entrySource) : null,
+      JSON.stringify(signal.candleSources ?? {}), signal.createdAt,
+    );
+    return result.changes === 1;
+  }
+  manualResearchSignalById(id) {
+    return this.decodeManualResearchSignal(this.db.prepare(`SELECT ${manualSignalColumns} FROM manual_research_signals WHERE id=?`).get(id));
+  }
+  manualResearchSignalByCandidateKey(candidateKey) {
+    return this.decodeManualResearchSignal(this.db.prepare(`SELECT ${manualSignalColumns} FROM manual_research_signals WHERE candidate_key=?`).get(candidateKey));
+  }
+  currentManualResearchSignals(symbol = null) {
+    const rows = symbol
+      ? this.db.prepare(`SELECT ${manualSignalColumns} FROM manual_research_signals WHERE lifecycle_status='READY' AND symbol=? ORDER BY resolves_at,generated_at`).all(symbol)
+      : this.db.prepare(`SELECT ${manualSignalColumns} FROM manual_research_signals WHERE lifecycle_status='READY' ORDER BY resolves_at,generated_at`).all();
+    return rows.map((row) => this.decodeManualResearchSignal(row));
+  }
+  recentManualResearchSignals(limit = 50, symbol = null) {
+    const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50;
+    const rows = symbol
+      ? this.db.prepare(`SELECT ${manualSignalColumns} FROM manual_research_signals WHERE symbol=? ORDER BY generated_at DESC,created_at DESC LIMIT ?`).all(symbol, safeLimit)
+      : this.db.prepare(`SELECT ${manualSignalColumns} FROM manual_research_signals ORDER BY generated_at DESC,created_at DESC LIMIT ?`).all(safeLimit);
+    return rows.map((row) => this.decodeManualResearchSignal(row));
+  }
+  resolveManualResearchSignal(id, resolution) {
+    const result = this.db.prepare(`UPDATE manual_research_signals SET lifecycle_status='EXPIRED',proxy_outcome=?,resolution_price=?,resolution_source_json=?,resolved_at=?,expired_at=? WHERE id=? AND lifecycle_status='READY'`).run(
+      resolution.proxyOutcome, resolution.resolutionPrice ?? null, JSON.stringify(resolution.resolutionSource ?? {}), resolution.resolvedAt, resolution.expiredAt, id,
+    );
+    return result.changes === 1;
+  }
+  manualSignalEmpiricalConfidence({ minDecisiveSample = 20, payoutRate, symbol = null } = {}) {
+    if (!Number.isInteger(minDecisiveSample) || minDecisiveSample < 1 || !Number.isFinite(payoutRate) || payoutRate <= 0) throw new Error("Invalid manual signal confidence settings.");
+    const sql = `SELECT strategy_version AS strategyVersion,symbol,horizon_minutes AS horizonMinutes,COUNT(CASE WHEN lifecycle_status='EXPIRED' THEN 1 END) AS resolved,SUM(CASE WHEN proxy_outcome='PROXY_CORRECT' THEN 1 ELSE 0 END) AS correct,SUM(CASE WHEN proxy_outcome='PROXY_INCORRECT' THEN 1 ELSE 0 END) AS incorrect,SUM(CASE WHEN proxy_outcome='PROXY_TIE' THEN 1 ELSE 0 END) AS ties,SUM(CASE WHEN proxy_outcome='NO_TIMELY_OBSERVATION' THEN 1 ELSE 0 END) AS unavailable FROM manual_research_signals${symbol ? " WHERE symbol=?" : ""} GROUP BY strategy_version,symbol,horizon_minutes ORDER BY strategy_version,symbol,horizon_minutes`;
+    const rows = symbol ? this.db.prepare(sql).all(symbol) : this.db.prepare(sql).all();
+    const breakEvenRate = 1 / (1 + payoutRate);
+    return rows.map((row) => {
+      const decisiveSample = row.correct + row.incorrect;
+      const sufficient = decisiveSample >= minDecisiveSample;
+      const interval = sufficient ? wilson95(row.correct, decisiveSample) : { lower: null, upper: null };
+      return {
+        classification: "SPOT_PROXY_PROSPECTIVE_OUTCOMES_NOT_EVENT_FUTURES_CALIBRATION",
+        strategyVersion: row.strategyVersion, symbol: row.symbol, horizonMinutes: row.horizonMinutes,
+        resolved: row.resolved, decisiveSample, correct: row.correct, incorrect: row.incorrect, ties: row.ties, unavailable: row.unavailable,
+        minDecisiveSample, status: !sufficient ? "WARMUP" : interval.lower > breakEvenRate ? "VALIDATED" : interval.upper < breakEvenRate ? "UNDERPERFORMING" : "MONITOR",
+        measuredRate: sufficient ? row.correct / decisiveSample : null, wilson95: interval,
+        breakEvenReference: { rate: breakEvenRate, payoutRate, source: "USER_CONFIGURED_PAPER_PAYOUT" },
+      };
+    });
   }
   sourceEvent(event) {
     this.db.prepare("INSERT INTO data_source_events(source_name,symbol,status,source_timestamp,received_at,latency_ms,message) VALUES(?,?,?,?,?,?,?)").run(event.sourceName, event.symbol ?? null, event.status, event.sourceTimestamp ?? null, event.receivedAt, event.latencyMs ?? null, event.message ?? null);
