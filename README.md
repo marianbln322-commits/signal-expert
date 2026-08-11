@@ -75,7 +75,7 @@ Real orders are intentionally absent until the authenticated Event Futures integ
 
 No API key, signing, custody, withdrawal or live-execution code exists. Inputs and provider payloads are validated, requests use timeout and bounded backoff, HTTP responses use restrictive security headers, and local API calls are rate-limited.
 
-The model combines the 1h higher-timeframe regime, 15m/5m structure, and 1m trigger using EMA 9/21, RSI 14, ATR-normalized impulse, relative volume and wick rejection. Only candles whose provider close timestamp has passed are admitted to the model or displayed on the chart; the forming candle is excluded. Its probability is a bounded heuristic explicitly marked `UNCALIBRATED`; adaptive sizing blocks it by default until prospective outcomes support Brier score, log-loss and calibration analysis.
+The model combines the 1h higher-timeframe regime, 15m/5m structure, and 1m trigger using EMA 9/21, RSI 14, ATR-normalized impulse, relative volume and wick rejection. Only candles whose provider close timestamp has passed are admitted to the model or displayed on the chart; the forming candle is excluded. The displayed UP/DOWN technical split is normalized to exactly 100% (for example, 68%/32%), so independent scores can never misleadingly total above 100. It is a deterministic technical estimate explicitly marked `UNCALIBRATED`, not a measured Event Futures win probability; adaptive sizing blocks it by default until prospective outcomes support Brier score, log-loss and calibration analysis.
 
 ```text
 required recovery stake = (cumulative loss + target profit) / payout rate

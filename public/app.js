@@ -62,7 +62,7 @@ function renderMarket() {
   const fields = [["REGIME", timeframe?.regime], ["RSI 14", indicators?.rsi14?.toFixed(1)], ["ATR 14", indicators?.atr14?.toFixed(2)], ["REL. VOLUME", indicators?.relativeVolume20 ? `${indicators.relativeVolume20.toFixed(2)}×` : null], ["SUPPORT", indicators?.support?.toFixed(2)], ["RESISTANCE", indicators?.resistance?.toFixed(2)]];
   $("indicators").innerHTML = fields.map(([label, value]) => `<div><small>${label}</small><b>${value ?? "—"}</b></div>`).join("");
   const verdict = analysis?.direction ?? "WAIT"; $("verdict").textContent = verdict; $("verdict").className = `verdict verdict-${verdict.toLowerCase()}`;
-  $("up-score").textContent = analysis?.upScore ?? 0; $("down-score").textContent = analysis?.downScore ?? 0; $("up-fill").style.width = `${analysis?.upScore ?? 0}%`; $("down-fill").style.width = `${analysis?.downScore ?? 0}%`;
+  $("up-score").textContent = `${analysis?.upScore ?? 50}%`; $("down-score").textContent = `${analysis?.downScore ?? 50}%`; $("up-fill").style.width = `${analysis?.upScore ?? 0}%`; $("down-fill").style.width = `${analysis?.downScore ?? 0}%`;
   $("estimate").textContent = analysis?.heuristicProbability == null ? "Unavailable" : pct(analysis.heuristicProbability); $("break-even").textContent = analysis ? pct(analysis.breakEvenProbability) : "—"; $("confidence").textContent = analysis?.confidence ?? "—"; $("model").textContent = analysis?.modelVersion ?? "—";
   $("reasons").innerHTML = (analysis?.reasons ?? ["Waiting for verified candles."]).slice(0, 5).map((reason) => `<li>${escape(reason)}</li>`).join("");
   renderBook(snapshot.orderBook.data);

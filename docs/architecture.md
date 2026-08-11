@@ -31,7 +31,7 @@ Paper request -> input/cap checks -> immutable entry timestamp
 
 ## Model v0.1
 
-Rules are used because no historical Event Futures labels exist. Inputs are the completed 1h higher-timeframe regime, completed 15m/5m structure, and completed 1m trigger with EMA 9/21, RSI 14, ATR 14, Bollinger 20/2, relative volume and wick rejection. Forming candles are discarded at both the service and model boundaries. `WAIT` is the default. MEXC Spot is only a proxy; polling cannot reproduce tick settlement; the heuristic probability is uncalibrated and excluded from adaptive sizing by default.
+Rules are used because no historical Event Futures labels exist. Inputs are the completed 1h higher-timeframe regime, completed 15m/5m structure, and completed 1m trigger with EMA 9/21, RSI 14, ATR 14, Bollinger 20/2, relative volume and wick rejection. Forming candles are discarded at both the service and model boundaries. The internal directional evidence is transformed into a single complementary UP/DOWN split that always totals 100%; independent values such as 78/44 are never displayed as probabilities. `WAIT` is the default. Binance Spot is treated as a highly relevant underlying-market proxy when MEXC Spot is unavailable, but remains explicitly attributed and is not asserted to be the Event Futures settlement Index. The technical split is uncalibrated and excluded from adaptive sizing by default.
 
 Paper settlement is independent of candle availability: it uses the first fresh ticker at or after expiry and refunds the contract when that observation is more than 30 seconds late. The local server binds to loopback by default; network exposure through Docker is explicit.
 

@@ -70,33 +70,36 @@ export function breakEvenProbability(payoutRate) {
 export function analyzeMarket(candles, payoutRate, now = new Date()) {
   const completedCandles = Object.fromEntries(["1m", "5m", "15m", "1h"].map((timeframe) => [timeframe, (candles[timeframe] ?? []).filter((candle) => candle.closed === true)]));
   const timeframes = Object.fromEntries(["1m", "5m", "15m", "1h"].map((timeframe) => [timeframe, timeframeAnalysis(timeframe, completedCandles[timeframe])]));
-  let upScore = 50; let downScore = 50; const reasons = []; const invalidation = [];
+  let upEvidence = 50; let downEvidence = 50; const reasons = []; const invalidation = [];
   const applyRegime = (analysis, weight) => {
-    if (analysis.regime === "BULLISH") { upScore += weight; downScore -= weight / 2; reasons.push(`${analysis.timeframe}: bullish structure.`); }
-    if (analysis.regime === "BEARISH") { downScore += weight; upScore -= weight / 2; reasons.push(`${analysis.timeframe}: bearish structure.`); }
+    if (analysis.regime === "BULLISH") { upEvidence += weight; downEvidence -= weight / 2; reasons.push(`${analysis.timeframe}: bullish structure.`); }
+    if (analysis.regime === "BEARISH") { downEvidence += weight; upEvidence -= weight / 2; reasons.push(`${analysis.timeframe}: bearish structure.`); }
   };
   applyRegime(timeframes["1h"], 18); applyRegime(timeframes["15m"], 14); applyRegime(timeframes["5m"], 10);
-  const current = candles["1m"].at(-1); const previous = candles["1m"].at(-2); const indicators = timeframes["1m"].indicators;
-  if (indicators.rsi14 !== null && indicators.rsi14 >= 75) { downScore += 10; reasons.push(`1m RSI ${indicators.rsi14.toFixed(1)} shows extension, not a reversal by itself.`); }
-  if (indicators.rsi14 !== null && indicators.rsi14 <= 25) { upScore += 10; reasons.push(`1m RSI ${indicators.rsi14.toFixed(1)} shows extension, not a reversal by itself.`); }
+  const current = completedCandles["1m"].at(-1); const previous = completedCandles["1m"].at(-2); const indicators = timeframes["1m"].indicators;
+  if (indicators.rsi14 !== null && indicators.rsi14 >= 75) { downEvidence += 10; reasons.push(`1m RSI ${indicators.rsi14.toFixed(1)} shows extension, not a reversal by itself.`); }
+  if (indicators.rsi14 !== null && indicators.rsi14 <= 25) { upEvidence += 10; reasons.push(`1m RSI ${indicators.rsi14.toFixed(1)} shows extension, not a reversal by itself.`); }
   if (current && previous && indicators.atr14 !== null && indicators.atr14 > 0) {
     const normalized = (current.close - previous.close) / indicators.atr14;
     const strongVolume = (indicators.relativeVolume20 ?? 0) >= 1.3;
-    if (normalized >= 1.2) { upScore += strongVolume ? 12 : 5; reasons.push(`1m upward impulse ${normalized.toFixed(2)} ATR${strongVolume ? " with relative volume" : " without strong volume"}.`); }
-    if (normalized <= -1.2) { downScore += strongVolume ? 12 : 5; reasons.push(`1m downward impulse ${Math.abs(normalized).toFixed(2)} ATR${strongVolume ? " with relative volume" : " without strong volume"}.`); }
+    if (normalized >= 1.2) { upEvidence += strongVolume ? 12 : 5; reasons.push(`1m upward impulse ${normalized.toFixed(2)} ATR${strongVolume ? " with relative volume" : " without strong volume"}.`); }
+    if (normalized <= -1.2) { downEvidence += strongVolume ? 12 : 5; reasons.push(`1m downward impulse ${Math.abs(normalized).toFixed(2)} ATR${strongVolume ? " with relative volume" : " without strong volume"}.`); }
     const body = Math.abs(current.close - current.open);
-    if (body > 0 && (current.high - Math.max(current.open, current.close)) / body >= 1.8 && current.close < current.open) { downScore += 12; reasons.push("1m upper rejection confirmed by a bearish body."); }
-    if (body > 0 && (Math.min(current.open, current.close) - current.low) / body >= 1.8 && current.close > current.open) { upScore += 12; reasons.push("1m lower rejection confirmed by a bullish body."); }
+    if (body > 0 && (current.high - Math.max(current.open, current.close)) / body >= 1.8 && current.close < current.open) { downEvidence += 12; reasons.push("1m upper rejection confirmed by a bearish body."); }
+    if (body > 0 && (Math.min(current.open, current.close) - current.low) / body >= 1.8 && current.close > current.open) { upEvidence += 12; reasons.push("1m lower rejection confirmed by a bullish body."); }
   }
-  upScore = Math.round(clamp(upScore, 0, 100)); downScore = Math.round(clamp(downScore, 0, 100));
-  const difference = upScore - downScore; const breakEven = breakEvenProbability(payoutRate);
-  const heuristicProbability = candles["1m"].length >= 30 ? clamp(0.5 + Math.abs(difference) / 200, 0.5, 0.72) : null;
+  const rawUpScore = Math.round(clamp(upEvidence, 0, 100)); const rawDownScore = Math.round(clamp(downEvidence, 0, 100));
+  const difference = rawUpScore - rawDownScore; const breakEven = breakEvenProbability(payoutRate);
+  const technicalUpProbability = completedCandles["1m"].length >= 30 ? clamp(0.5 + difference / 200, 0.28, 0.72) : 0.5;
+  const technicalDownProbability = 1 - technicalUpProbability;
+  const heuristicProbability = completedCandles["1m"].length >= 30 ? Math.max(technicalUpProbability, technicalDownProbability) : null;
+  const upScore = Math.round(technicalUpProbability * 100); const downScore = 100 - upScore;
   let direction = "WAIT";
-  if (heuristicProbability !== null && heuristicProbability >= breakEven + 0.03 && Math.abs(difference) >= 15) direction = difference > 0 ? "UP" : "DOWN";
+  if (heuristicProbability !== null && heuristicProbability >= breakEven + 0.03 && Math.abs(difference) >= 15) direction = technicalUpProbability > technicalDownProbability ? "UP" : "DOWN";
   if (direction === "WAIT") reasons.push("No sufficient estimated edge over break-even; WAIT.");
   if (indicators.support !== null) invalidation.push(`Bullish scenario invalid below 1m support ${indicators.support.toFixed(2)}.`);
   if (indicators.resistance !== null) invalidation.push(`Bearish scenario invalid above 1m resistance ${indicators.resistance.toFixed(2)}.`);
-  return { direction, upScore, downScore, confidence: Math.abs(difference) >= 30 ? "HIGH" : Math.abs(difference) >= 15 ? "MEDIUM" : "LOW", calibrationStatus: "UNCALIBRATED", breakEvenProbability: breakEven, heuristicProbability, reasons, invalidation, timeframes, classification: "MODEL_ESTIMATE", modelVersion: "rules-v0.1.0", calculatedAt: now.toISOString() };
+  return { direction, upScore, downScore, technicalUpProbability, technicalDownProbability, confidence: Math.abs(difference) >= 30 ? "HIGH" : Math.abs(difference) >= 15 ? "MEDIUM" : "LOW", calibrationStatus: "UNCALIBRATED", breakEvenProbability: breakEven, heuristicProbability, reasons, invalidation, timeframes, classification: "MODEL_ESTIMATE", modelVersion: "rules-v0.1.2", calculatedAt: now.toISOString() };
 }
 export function adaptiveStake(input) {
   const reasons = []; const breakEven = breakEvenProbability(input.payoutRate);
