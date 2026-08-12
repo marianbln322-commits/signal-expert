@@ -223,7 +223,7 @@ function renderManualSignals() {
   $("manual-signal-cards").innerHTML = segments.map(({ symbol, horizonMinutes }) => {
     const signal = bySegment.get(`${symbol}:${horizonMinutes}`);
     const confidence = manualConfidenceFor(symbol, horizonMinutes, signal?.strategyVersion);
-    if (!signal) return `<article class="manual-card manual-wait"><div class="manual-card-head"><strong>${symbol} · ${horizonMinutes}m</strong><span>WAIT</span></div><p>No completed-candle evaluation has been recorded yet.</p><small>Entry and confidence remain unavailable.</small></article>`;
+    if (!signal) return `<article class="manual-card manual-wait"><div class="manual-card-head"><strong>${symbol} · ${horizonMinutes}m</strong><span>WAIT</span></div><div class="manual-direction manual-direction-wait"><small>SIGNAL DIRECTION</small><div><b aria-hidden="true">—</b><strong>WAIT</strong></div><span>No UP or DOWN signal yet.</span></div><div class="manual-instruction manual-action-wait">WAIT · DO NOT ENTER</div><small>Waiting for a completed-candle evaluation. Entry and confidence remain unavailable.</small></article>`;
     const actionState = localManualActionState(signal);
     const actionable = actionState === "ENTER_NOW";
     const tracking = actionState === "TRACKING_DO_NOT_ENTER_LATE";
@@ -231,14 +231,41 @@ function renderManualSignals() {
     const confidenceDetail = confidence?.measuredRate == null
       ? `${confidence?.decisiveSample ?? 0}/${confidence?.minDecisiveSample ?? manual.policy?.minDecisiveSample ?? 20} decisive proxy outcomes`
       : `Wilson 95% ${pct(confidence.wilson95.lower)}–${pct(confidence.wilson95.upper)} · n=${confidence.decisiveSample}`;
-    const instruction = actionable ? `ENTER ${signal.direction} NOW` : tracking ? "TRACKING · DO NOT ENTER LATE" : actionState === "DISABLED" ? "DISABLED · NO ENTRY" : signal.status === "EXPIRED" ? `PROXY RESULT · ${signal.proxyOutcome ?? "EXPIRED"}` : "WAIT · NO ENTRY";
+    const hasDirection = signal.direction === "UP" || signal.direction === "DOWN";
+    const direction = hasDirection ? signal.direction : "WAIT";
+    const directionArrow = direction === "UP" ? "↑" : direction === "DOWN" ? "↓" : "—";
+    const directionMeaning = direction === "UP"
+      ? "Prediction: price will finish ABOVE the recorded entry."
+      : direction === "DOWN"
+        ? "Prediction: price will finish BELOW the recorded entry."
+        : "No UP or DOWN signal right now.";
+    const instruction = actionable
+      ? `ENTER NOW · CHOOSE ${directionArrow} ${direction}`
+      : tracking
+        ? "DO NOT ENTER NOW · WATCH ONLY"
+        : actionState === "DISABLED"
+          ? "DISABLED · DO NOT ENTER"
+          : signal.status === "EXPIRED"
+            ? `RESULT RECORDED · ${signal.proxyOutcome ?? "EXPIRED"}`
+            : "WAIT · DO NOT ENTER";
+    const actionNote = actionable
+      ? "This is the only active entry window. Stop when the countdown reaches zero."
+      : tracking
+        ? `Entry window closed. The ${directionArrow} ${direction} call is shown for outcome tracking only.`
+        : signal.status === "EXPIRED"
+          ? "This call has finished. It is history, not a new entry."
+          : "Wait for an ENTER NOW instruction before choosing UP or DOWN.";
+    const statusLabel = actionable ? "ENTER NOW" : tracking ? "WATCH ONLY" : actionState === "DISABLED" ? "DISABLED" : signal.status === "EXPIRED" ? "FINISHED" : "WAIT";
+    const actionClass = actionable ? "enter-now" : tracking ? "watch-only" : "wait";
     const timer = actionable ? `entry closes ${remaining(signal.entryValidUntil)}` : tracking ? `proxy observation in ${remaining(signal.resolvesAt)}` : signal.status === "EXPIRED" ? `resolved ${time(signal.resolvedAt)}` : "no entry window";
     const sourceName = signal.entrySource?.sourceName ?? signal.entrySource?.source ?? "No entry source";
     const fallback = signal.entrySource?.failover?.active === true;
     const invalidation = signal.invalidation?.text ?? (Number.isFinite(signal.invalidationPrice) ? `Completed-candle invalidation ${money(signal.invalidationPrice)}` : "No finite invalidation");
     return `<article class="manual-card manual-${manualLifecycleClass(actionState)}">
-      <div class="manual-card-head"><strong>${escape(symbol)} · ${horizonMinutes}m</strong><span>${escape(actionState)}</span></div>
-      <div class="manual-instruction ${directionClass(signal.direction)}">${escape(instruction)}</div>
+      <div class="manual-card-head"><strong>${escape(symbol)} · ${horizonMinutes}m</strong><span>${escape(statusLabel)}</span></div>
+      <div class="manual-direction manual-direction-${direction.toLowerCase()}"><small>SIGNAL DIRECTION</small><div><b aria-hidden="true">${directionArrow}</b><strong>${direction}</strong></div><span>${escape(directionMeaning)}</span></div>
+      <div class="manual-instruction manual-action-${actionClass}">${escape(instruction)}</div>
+      <div class="manual-action-note">${escape(actionNote)}</div>
       <div class="manual-price"><small>SPOT-PROXY ENTRY</small><b>${Number.isFinite(signal.entryPrice) ? money(signal.entryPrice) : "—"}</b><span>${escape(timer)}</span></div>
       <div class="manual-stats"><div><small>SETUP QUALITY</small><b>${signal.qualityScore}/100</b><span>${escape(signal.qualityBand)}</span></div><div><small>EMPIRICAL CONFIDENCE</small><b>${confidenceText}</b><span>${escape(confidenceDetail)}</span></div></div>
       <p class="manual-invalidation">${escape(invalidation)}</p>
