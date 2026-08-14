@@ -2,12 +2,28 @@ import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-const positionColumns = `id,symbol,direction,horizon_minutes AS horizonMinutes,stake,payout_rate AS payoutRate,entry_price AS entryPrice,opened_at AS openedAt,resolves_at AS resolvesAt,status,settlement_price AS settlementPrice,settled_at AS settledAt,pnl,signal_version AS signalVersion,source_name AS sourceName,source_timestamp AS sourceTimestamp,settlement_reason AS settlementReason,origin,decision_id AS decisionId,strategy_name AS strategyName,strategy_version AS strategyVersion,quality_score AS qualityScore,stake_profile AS stakeProfile,recovery_stage AS recoveryStage`;
+const positionColumns = `id,symbol,direction,horizon_minutes AS horizonMinutes,stake,payout_rate AS payoutRate,entry_price AS entryPrice,opened_at AS openedAt,resolves_at AS resolvesAt,status,settlement_price AS settlementPrice,settled_at AS settledAt,pnl,signal_version AS signalVersion,source_name AS sourceName,source_timestamp AS sourceTimestamp,settlement_reason AS settlementReason,origin,decision_id AS decisionId,strategy_name AS strategyName,strategy_version AS strategyVersion,quality_score AS qualityScore,stake_profile AS stakeProfile,recovery_stage AS recoveryStage,entry_gate_json AS entryGateJson`;
 const decisionColumns = `id,decision_key AS decisionKey,symbol,horizon_minutes AS horizonMinutes,direction,quality_score AS qualityScore,quality_band AS qualityBand,timeframe_watermarks_json AS timeframeWatermarksJson,strategy_name AS strategyName,strategy_version AS strategyVersion,profile,stage,action,stake,reasons_json AS reasonsJson,details_json AS detailsJson,invalidation_json AS invalidationJson,invalidation_price AS invalidationPrice,paper_position_id AS paperPositionId,created_at AS createdAt,updated_at AS updatedAt`;
 const manualSignalColumns = `id,candidate_key AS candidateKey,symbol,horizon_minutes AS horizonMinutes,direction,lifecycle_status AS status,quality_score AS qualityScore,quality_band AS qualityBand,reasons_json AS reasonsJson,details_json AS detailsJson,timeframe_watermarks_json AS timeframeWatermarksJson,invalidation_json AS invalidationJson,invalidation_price AS invalidationPrice,strategy_name AS strategyName,strategy_version AS strategyVersion,generated_at AS generatedAt,entry_price AS entryPrice,entry_at AS entryAt,entry_valid_until AS entryValidUntil,resolves_at AS resolvesAt,entry_source_json AS entrySourceJson,candle_sources_json AS candleSourcesJson,market_classification AS marketClassification,settlement_classification AS settlementClassification,proxy_outcome AS proxyOutcome,resolution_price AS resolutionPrice,resolution_source_json AS resolutionSourceJson,resolved_at AS resolvedAt,expired_at AS expiredAt,created_at AS createdAt`;
 
 function decodeJson(value, fallback) {
   try { return typeof value === "string" ? JSON.parse(value) : fallback; } catch { return fallback; }
+}
+function decodeEntryGate(value) {
+  if (typeof value !== "string") return { classification: "ENTRY_GATE_AUDIT_MISSING", policyVersion: null, reason: "No entry-gate audit payload was stored." };
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : { classification: "ENTRY_GATE_AUDIT_CORRUPT", policyVersion: null, reason: "Stored entry-gate audit payload is not an object." };
+  } catch {
+    return { classification: "ENTRY_GATE_AUDIT_CORRUPT", policyVersion: null, reason: "Stored entry-gate audit payload is invalid JSON." };
+  }
+}
+function decodePosition(row) {
+  if (!row) return null;
+  const { entryGateJson, ...position } = row;
+  return { ...position, entryGate: decodeEntryGate(entryGateJson) };
 }
 function wilson95(wins, sample) {
   if (!sample) return { lower: null, upper: null };
@@ -41,13 +57,13 @@ export class Database {
     this.db.prepare("INSERT INTO signal_snapshots(symbol,direction,up_score,down_score,model_version,source_timestamp,calculated_at,payload_json) VALUES(?,?,?,?,?,?,?,?)").run(symbol, analysis.direction, analysis.upScore, analysis.downScore, analysis.modelVersion, sourceTimestamp, analysis.calculatedAt, JSON.stringify(analysis));
   }
   upsertPosition(position) {
-    this.db.prepare(`INSERT INTO paper_positions(id,symbol,direction,horizon_minutes,stake,payout_rate,entry_price,opened_at,resolves_at,status,settlement_price,settled_at,pnl,signal_version,source_name,source_timestamp,settlement_reason,origin,decision_id,strategy_name,strategy_version,quality_score,stake_profile,recovery_stage)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,settlement_price=excluded.settlement_price,settled_at=excluded.settled_at,pnl=excluded.pnl,settlement_reason=excluded.settlement_reason`).run(
+    this.db.prepare(`INSERT INTO paper_positions(id,symbol,direction,horizon_minutes,stake,payout_rate,entry_price,opened_at,resolves_at,status,settlement_price,settled_at,pnl,signal_version,source_name,source_timestamp,settlement_reason,origin,decision_id,strategy_name,strategy_version,quality_score,stake_profile,recovery_stage,entry_gate_json)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,settlement_price=excluded.settlement_price,settled_at=excluded.settled_at,pnl=excluded.pnl,settlement_reason=excluded.settlement_reason`).run(
       position.id, position.symbol, position.direction, position.horizonMinutes, position.stake, position.payoutRate, position.entryPrice,
       position.openedAt, position.resolvesAt, position.status, position.settlementPrice, position.settledAt, position.pnl,
       position.signalVersion, position.sourceName, position.sourceTimestamp, position.settlementReason ?? null,
       position.origin ?? "MANUAL", position.decisionId ?? null, position.strategyName ?? null, position.strategyVersion ?? null,
-      position.qualityScore ?? null, position.stakeProfile ?? null, position.recoveryStage ?? null,
+      position.qualityScore ?? null, position.stakeProfile ?? null, position.recoveryStage ?? null, JSON.stringify(position.entryGate ?? { classification: "ENTRY_GATE_AUDIT_MISSING_AT_WRITE", policyVersion: null, reason: "Position was written without an entry-gate snapshot." }),
     );
   }
   commitAutonomousOpen(position, { reasons, state, updatedAt }) {
@@ -62,14 +78,15 @@ export class Database {
       throw error;
     }
   }
-  positions() { return this.db.prepare(`SELECT ${positionColumns} FROM paper_positions ORDER BY opened_at DESC`).all(); }
-  openAutonomousPosition() { return this.db.prepare(`SELECT ${positionColumns} FROM paper_positions WHERE origin='AUTONOMOUS' AND status='OPEN' ORDER BY opened_at LIMIT 1`).get() ?? null; }
-  autonomousPositions() { return this.db.prepare(`SELECT ${positionColumns} FROM paper_positions WHERE origin='AUTONOMOUS' ORDER BY opened_at DESC`).all(); }
+  positions() { return this.db.prepare(`SELECT ${positionColumns} FROM paper_positions ORDER BY opened_at DESC`).all().map((row) => decodePosition(row)); }
+  openAutonomousPosition() { return decodePosition(this.db.prepare(`SELECT ${positionColumns} FROM paper_positions WHERE origin='AUTONOMOUS' AND status='OPEN' ORDER BY opened_at LIMIT 1`).get()); }
+  autonomousPositions() { return this.db.prepare(`SELECT ${positionColumns} FROM paper_positions WHERE origin='AUTONOMOUS' ORDER BY opened_at DESC`).all().map((row) => decodePosition(row)); }
   createAutonomousDecision(decision) {
     const details = decision.details ?? {
       volatilityRegime: decision.volatilityRegime ?? null,
       confluenceComponents: decision.confluenceComponents ?? [],
       structureFeatures: decision.structureFeatures ?? {},
+      technicalFeatures: decision.technicalFeatures ?? {},
       qualityDefinition: decision.qualityDefinition ?? null,
     };
     const invalidation = typeof decision.invalidationDetails === "object" && decision.invalidationDetails !== null
@@ -217,6 +234,18 @@ export class Database {
       signal.strategyName, signal.strategyVersion, signal.generatedAt, signal.entryPrice ?? null, signal.entryAt ?? null,
       signal.entryValidUntil ?? null, signal.resolvesAt ?? null, signal.entrySource ? JSON.stringify(signal.entrySource) : null,
       JSON.stringify(signal.candleSources ?? {}), signal.createdAt,
+    );
+    return result.changes === 1;
+  }
+  updateWaitingManualResearchSignal(id, { reasons, details }) {
+    const result = this.db.prepare("UPDATE manual_research_signals SET reasons_json=?,details_json=? WHERE id=? AND lifecycle_status='WAIT'").run(JSON.stringify(reasons ?? []), JSON.stringify(details ?? {}), id);
+    return result.changes === 1;
+  }
+  promoteManualResearchSignal(id, signal) {
+    const result = this.db.prepare(`UPDATE manual_research_signals SET direction=?,lifecycle_status='READY',quality_score=?,quality_band=?,reasons_json=?,details_json=?,invalidation_json=?,invalidation_price=?,entry_price=?,entry_at=?,entry_valid_until=?,resolves_at=?,entry_source_json=?,candle_sources_json=? WHERE id=? AND lifecycle_status='WAIT'`).run(
+      signal.direction, signal.qualityScore, signal.qualityBand, JSON.stringify(signal.reasons ?? []), JSON.stringify(signal.details ?? {}),
+      JSON.stringify(signal.invalidation ?? {}), signal.invalidationPrice ?? null, signal.entryPrice, signal.entryAt, signal.entryValidUntil,
+      signal.resolvesAt, JSON.stringify(signal.entrySource), JSON.stringify(signal.candleSources ?? {}), id,
     );
     return result.changes === 1;
   }

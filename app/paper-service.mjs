@@ -30,12 +30,19 @@ export class PaperService {
     if (input.stake > account.available) throw new Error("Insufficient paper balance.");
     if ((account.locked + input.stake) / Math.max(account.equity, 1) > 0.35) throw new Error("Correlated paper exposure would exceed 35% of equity.");
   }
-  createPosition(input, metadata) {
+  executeTrade(input, metadata) {
     const account = this.account(); this.validateOpen(input, account);
     if (metadata.origin === "AUTONOMOUS" && this.database.openAutonomousPosition()) throw new Error("An autonomous paper position is already open.");
     const snapshot = this.market.snapshot(input.symbol);
     if (!snapshot || !snapshot.health.dataUsable || !snapshot.market.data) throw new Error("Required market/timeframe data is unavailable or stale.");
+    const candidate = metadata.candidate ?? snapshot.analysis?.candidates?.find((item) => item.horizonMinutes === input.horizonMinutes && item.direction === input.direction);
+    if (!candidate) throw new Error("Entry blocked: no current completed-candle candidate matches this direction and horizon.");
     const now = new Date();
+    const entryGate = this.market.evaluateEntry(candidate, now);
+    if (!entryGate.allowed) {
+      const blocked = entryGate.checks.filter((check) => check.status === "BLOCKED").map((check) => `${check.code}: ${check.reason}`);
+      throw new Error(`Entry blocked by current risk policy — ${blocked.join("; ")}`);
+    }
     const position = {
       id: randomUUID(), symbol: input.symbol, direction: input.direction, horizonMinutes: input.horizonMinutes, stake: input.stake,
       payoutRate: this.settings.payoutRate, entryPrice: snapshot.market.data.lastPrice, openedAt: now.toISOString(), resolvesAt: new Date(now.getTime() + input.horizonMinutes * 60000).toISOString(),
@@ -44,6 +51,7 @@ export class PaperService {
       origin: metadata.origin, decisionId: metadata.decisionId ?? null, strategyName: metadata.strategyName ?? null,
       strategyVersion: metadata.strategyVersion ?? null, qualityScore: metadata.qualityScore ?? null,
       stakeProfile: metadata.stakeProfile ?? null, recoveryStage: metadata.recoveryStage ?? null,
+      entryGate,
     };
     if (metadata.origin === "AUTONOMOUS") {
       this.database.commitAutonomousOpen(position, { reasons: metadata.decisionReasons, state: metadata.state, updatedAt: now.toISOString() });
@@ -51,10 +59,10 @@ export class PaperService {
     this.positions.set(position.id, position);
     return position;
   }
-  open(input) { return this.createPosition(input, { origin: "MANUAL" }); }
+  open(input) { return this.executeTrade(input, { origin: "MANUAL" }); }
   openAutonomous(input, metadata) {
-    if (!metadata || typeof metadata.decisionId !== "string" || !metadata.decisionId || !Number.isInteger(metadata.qualityScore) || !metadata.strategyName || !metadata.strategyVersion || !metadata.stakeProfile || !Number.isInteger(metadata.recoveryStage) || !metadata.state || !Array.isArray(metadata.decisionReasons)) throw new Error("Invalid trusted autonomous position metadata.");
-    return this.createPosition(input, { ...metadata, origin: "AUTONOMOUS" });
+    if (!metadata || typeof metadata.decisionId !== "string" || !metadata.decisionId || !Number.isInteger(metadata.qualityScore) || !metadata.strategyName || !metadata.strategyVersion || !metadata.stakeProfile || !Number.isInteger(metadata.recoveryStage) || !metadata.state || !Array.isArray(metadata.decisionReasons) || !metadata.candidate) throw new Error("Invalid trusted autonomous position metadata.");
+    return this.executeTrade(input, { ...metadata, origin: "AUTONOMOUS" });
   }
   riskQuote(input) {
     const account = this.account(); const snapshot = this.market.snapshot(input.symbol); const analysis = snapshot?.analysis;

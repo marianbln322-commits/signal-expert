@@ -13,18 +13,28 @@ MEXC Spot REST v3 (primary)
   -> timeout, retry, runtime schema checks
   -> in-memory market cache and freshness state
   -> deterministic quantitative + completed-candle structure engine
+  -> completed 1m trigger + explicitly aligned completed 5m confirmation
   -> EMA20/50, FVG/IFVG, sweep, CHoCH/MSS and finite invalidation audit
   -> completed-candle 10m/30m setup ranking
+  -> one shared auditable entry policy:
+       fresh ticker/candles + trigger deadline
+       -> validated Spot spread + best-side top liquidity
+       -> ticker/book provider and timestamp coherence
+       -> macro PASS / BLOCKED, or SKIPPED when disabled (not filtered)
   -> strict manual signal entry window + immutable Spot-proxy provenance
   -> prospective symbol+horizon confidence hidden until minimum sample
   -> Wilson safeguard against configured-payout break-even
   -> bankroll-aware autonomous PAPER shadow state machine
-  -> SQLite signal/decision/state/position audit trail
+  -> immediate shared-policy recheck before every local PAPER open
+  -> SQLite signal/decision/state/position and entry-gate audit trail
   -> dependency-free Node HTTP API
   -> static responsive dashboard
 
 Manual signal scan -> unique four-timeframe candidate key
-  -> require fresh usable attributed Spot ticker + finite structural invalidation
+  -> require fresh completed 1m trigger aligned with completed 5m structure
+  -> require quality + finite invalidation + fresh usable attributed Spot ticker/candles
+  -> require validated Spot spread/top liquidity + source coherence
+  -> require macro CLEAR when enabled; disabled records SKIPPED, not filtered
   -> READY and ENTER_NOW for configured short entry window
   -> TRACKING_DO_NOT_ENTER_LATE until target horizon
   -> first timely post-horizon Spot-proxy observation
@@ -33,15 +43,20 @@ Manual signal scan -> unique four-timeframe candidate key
   -> Wilson VALIDATED / MONITOR / UNDERPERFORMING gate
 
 Autonomous PAPER scan -> same unique completed-candle candidate key
+  -> same shared 1m/5m/freshness/spread/liquidity/source/macro entry policy
   -> quality/alignment/structure/volatility/invalidation gate
   -> BTC/ETH × 10m/30m sample-aware segment safeguard
   -> exact hard-capped stake plan
-  -> at most one autonomous position -> wait for settlement
+  -> immediate shared-policy recheck (TOCTOU protection)
+  -> at most one local PAPER position -> wait for Spot-proxy settlement
   -> WON reset / LOST capped recovery stage / REFUNDED retain stage
 
-Manual paper request -> input/cap checks -> immutable entry timestamp
-  -> SQLite ledger -> first fresh ticker after resolution
-  -> WON / LOST / REFUNDED and realized P&L
+Manual PAPER request -> input/cap checks -> find matching current candidate
+  -> immediate shared-policy recheck; no bypass for stale or newly blocked entries
+  -> immutable entry timestamp + migration-007 gate evidence
+  -> SQLite local PAPER ledger -> first fresh Spot ticker after resolution
+  -> WON / LOST / REFUNDED and realized simulated P&L
+  -> no live Event Futures order adapter or exchange request
 ```
 
 ## Classifications
@@ -54,9 +69,11 @@ Manual paper request -> input/cap checks -> immutable entry timestamp
 - `NOT_EVENT_FUTURES_SETTLEMENT`: explicit classification for proxy resolution observations.
 - `UNAVAILABLE`: no verified source, insufficient sample, or no data.
 
-## Model v0.3
+## Strategy and entry policy v0.5
 
-Rules are used because no historical Event Futures labels exist. The directional display uses completed 1h regime, completed 15m/5m structure, and completed 1m trigger with EMA 9/21, RSI 14, ATR 14, Bollinger 20/2, relative volume and wick rejection. The autonomous engine additionally builds objective structure on completed 5m/15m/1h candles: two-sided confirmed pivots, three-candle FVGs and later retests, completed-close FVG inversion, confirmed-level liquidity sweeps, completed-close CHoCH/MSS, and EMA20/50 trend/dynamic context. Its confluence components expose objective definitions, direction, activity, timeframe and weight. Every candidate requires a finite completed-candle structural invalidation before it can become eligible.
+Rules are used because no historical Event Futures labels exist. The directional display uses completed 1h regime, completed 15m/5m structure, and completed 1m trigger with EMA 9/21, RSI 14, ATR 14, Bollinger 20/2, relative volume and wick rejection. Strategy v0.5 records objective 1m engulfing, rejection, ATR/volume impulse, and trend-continuation-close evidence; the trigger remains ineligible unless consolidated completed 5m structure confirms the same direction. The autonomous engine additionally builds objective structure on completed 5m/15m/1h candles: two-sided confirmed pivots, three-candle FVGs and later retests, completed-close FVG inversion, confirmed-level liquidity sweeps, completed-close CHoCH/MSS, and EMA20/50 trend/dynamic context. Its confluence components expose objective definitions, direction, activity, timeframe and weight. Every candidate requires a finite completed-candle structural invalidation before it can become eligible.
+
+The shared entry-policy v0.5 is applied when a manual signal is created, during autonomous selection, and again immediately before a manual or autonomous PAPER position is persisted. Its immutable checks cover direction, quality, invalidation, completed 1m/5m confirmation, trigger deadline, market freshness, validated Spot order book, configured spread, minimum best-side top-of-book notional, provider identity and receipt-time coherence, and macro/news state. An enabled but stale, unavailable, or blacked-out macro source blocks. A disabled macro source is `SKIPPED` and means not filtered; it is never represented as `CLEAR` or `PASS`. Manual READY responses also carry a current non-mutating gate overlay, and both manual WAIT and autonomous BLOCKED decisions are reevaluated while the same trigger is still current so transient market gates are not frozen at their first observation.
 
 The 10m evaluator emphasizes the completed 1m trigger and aligned 5m/15m context. The 30m evaluator emphasizes aligned 1h/15m structure with 5m confirmation. Forming candles are discarded at both service and model boundaries, swing points are not usable until their right-side confirmation candles close, and a deterministic key containing all four close timestamps prevents duplicate decisions.
 
@@ -64,7 +81,7 @@ The internal directional evidence becomes a complementary UP/DOWN split that alw
 
 The default 500 USDT `ADAPTIVE_CAPPED` simulation uses a 0.5% equity base, 1×/1.5×/2× quality multipliers, a 2% per-position equity cap, 25 USDT absolute cap, and at most one calculated recovery. `FLAT` and exact `OBSERVED_10_30_90_270` profiles are available for comparison, but all profiles obey cash, exposure, daily, and stake caps. Unaffordable exact stages are blocked, never clamped. A loss can advance a stake stage but can never create a setup.
 
-SQLite migration 004 adds durable decision/state metadata and a partial unique index that permits at most one open autonomous position. Migration 005 adds structured decision details and explicit invalidation persistence. Migration 006 adds durable manual signal lifecycle, entry deadline, immutable ticker/candle provenance, fixed non-settlement classifications, proxy outcomes, and one unresolved READY signal per symbol+horizon. Manual confidence is grouped prospectively by strategy version, symbol, and horizon. Its percentage and Wilson bounds remain null before the configured minimum. Afterward the same conservative bound logic marks VALIDATED/MONITOR/UNDERPERFORMING; the enabled confidence gate holds only an UNDERPERFORMING segment at WAIT. The scheduler is busy-locked, persists `WAIT`/`BLOCKED`/`OPEN`, waits for settlement before scanning for another entry, and reconciles state on restart. Binance Spot is treated as a highly relevant underlying-market proxy when MEXC Spot is unavailable, but remains explicitly attributed and is not asserted to be the Event Futures settlement Index.
+SQLite migration 004 adds durable decision/state metadata and a partial unique index that permits at most one open autonomous position. Migration 005 adds structured decision details and explicit invalidation persistence. Migration 006 adds durable manual signal lifecycle, entry deadline, immutable ticker/candle provenance, fixed non-settlement classifications, proxy outcomes, and one unresolved READY signal per symbol+horizon. Migration 007 stores the exact shared-policy version, evaluation timestamp, checks, order-book evidence, and macro/news evidence used immediately before a PAPER position is persisted; upgraded pre-v0.5 rows receive the explicit `NOT_EVALUATED_PRE_V0_5` classification rather than an ambiguous empty object. Manual confidence is grouped prospectively by strategy version, symbol, and horizon. Its percentage and Wilson bounds remain null before the configured minimum. Afterward the same conservative bound logic marks VALIDATED/MONITOR/UNDERPERFORMING; the enabled confidence gate holds only an UNDERPERFORMING segment at WAIT. The scheduler is busy-locked, persists `WAIT`/`BLOCKED`/`OPEN`, waits for settlement before scanning for another entry, and reconciles state on restart. Binance Spot is treated as a highly relevant underlying-market proxy when MEXC Spot is unavailable, but remains explicitly attributed and is not asserted to be the Event Futures settlement Index.
 
 The manual signal service consumes only MarketService snapshots and contains no provider call, credential, account, or order method. A READY signal stays stable until its proxy observation, while ENTER_NOW expires independently after the short entry deadline. PAPER settlement and manual proxy observation are both independent of candle availability: they require a fresh source timestamp at/after the horizon and reject observations more than 30 seconds late. Neither is labeled as Event Futures settlement. The local launcher binds to loopback, Docker publishes port 4100 on host loopback only, and autonomous pause/resume additionally requires a same-origin browser request.
 

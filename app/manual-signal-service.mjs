@@ -24,12 +24,14 @@ function tickerProvenance(market, observedAt) {
     observedAt,
   };
 }
-function candidateDetails(candidate) {
+function candidateDetails(candidate, entryGate = null) {
   return {
     volatilityRegime: candidate.volatilityRegime ?? null,
     confluenceComponents: candidate.confluenceComponents ?? [],
     structureFeatures: candidate.structureFeatures ?? {},
+    technicalFeatures: candidate.technicalFeatures ?? {},
     qualityDefinition: candidate.qualityDefinition ?? null,
+    entryGate,
   };
 }
 
@@ -61,13 +63,29 @@ export class ManualSignalService {
     if (this.resolutionTimer) clearInterval(this.resolutionTimer);
     this.timer = null; this.resolutionTimer = null; this.nextScanAt = null;
   }
+  currentEntryGate(signal, now = new Date()) {
+    const snapshot = this.market.snapshot(signal.symbol);
+    const candidate = snapshot?.analysis?.candidates?.find((item) => item.decisionKey === signal.candidateKey && item.horizonMinutes === signal.horizonMinutes && item.direction === signal.direction);
+    if (candidate) return this.market.evaluateEntry(candidate, now);
+    return {
+      allowed: false,
+      classification: "CURRENT_ENTRY_RECHECK_UNAVAILABLE",
+      policyVersion: "entry-gates-v0.5.0",
+      evaluatedAt: now.toISOString(),
+      checks: [{ code: "CURRENT_ENTRY_RECHECK", status: "BLOCKED", reason: "The original candidate is no longer present in the current completed-candle analysis.", evidence: { candidateKey: signal.candidateKey } }],
+    };
+  }
   present(signal, now = new Date()) {
     if (!signal) return null;
+    const deadline = timestamp(signal.entryValidUntil) ?? 0;
+    const insideEntryWindow = signal.status === "READY" && this.settings.enabled && now.getTime() < deadline;
+    const currentEntryGate = insideEntryWindow ? this.currentEntryGate(signal, now) : null;
     const actionState = signal.status !== "READY"
       ? signal.status
       : !this.settings.enabled ? "DISABLED"
-        : now.getTime() < (timestamp(signal.entryValidUntil) ?? 0) ? "ENTER_NOW" : "TRACKING_DO_NOT_ENTER_LATE";
-    return { ...signal, actionState };
+        : now.getTime() >= deadline ? "TRACKING_DO_NOT_ENTER_LATE"
+          : currentEntryGate?.allowed ? "ENTER_NOW" : "BLOCKED_CURRENT_GATES";
+    return { ...signal, actionState, currentEntryGate };
   }
   ready(symbol = null) { return this.database.currentManualResearchSignals(symbol).map((signal) => this.present(signal)); }
   recent(limit = 50, symbol = null) { return this.database.recentManualResearchSignals(limit, symbol).map((signal) => this.present(signal)); }
@@ -199,7 +217,9 @@ export class ManualSignalService {
   }
   captureCandidate(candidate, snapshot, now) {
     const candidateKey = typeof candidate?.decisionKey === "string" && candidate.decisionKey ? candidate.decisionKey : null;
-    if (!candidateKey || this.database.manualResearchSignalByCandidateKey(candidateKey)) return;
+    if (!candidateKey) return;
+    const existing = this.database.manualResearchSignalByCandidateKey(candidateKey);
+    if (existing && existing.status !== "WAIT") return;
     const market = snapshot.market ?? {};
     const freshTicker = snapshot.health?.dataUsable === true && market.status === "LIVE" && Number.isFinite(market.data?.lastPrice) && market.data.lastPrice > 0 && timestamp(market.sourceTimestamp) !== null && timestamp(market.receivedAt) !== null;
     const directional = candidate.direction === "UP" || candidate.direction === "DOWN";
@@ -207,7 +227,8 @@ export class ManualSignalService {
     const activeSignal = directional ? this.database.currentManualResearchSignals(candidate.symbol).find((signal) => signal.horizonMinutes === candidate.horizonMinutes) : null;
     const confidence = this.confidence(candidate.symbol).find((item) => item.strategyVersion === candidate.strategyVersion && item.horizonMinutes === candidate.horizonMinutes);
     const underperforming = this.settings.confidenceGateEnabled && confidence?.status === "UNDERPERFORMING";
-    const ready = directional && finiteInvalidation && freshTicker && !activeSignal && !underperforming;
+    const entryGate = this.market.evaluateEntry(candidate, now);
+    const ready = directional && finiteInvalidation && freshTicker && entryGate.allowed && !activeSignal && !underperforming;
     const entryAt = ready ? now.toISOString() : null;
     const reasons = [...(candidate.reasons ?? [])];
     if (!snapshot.health?.dataUsable) reasons.push("Manual signal remains WAIT because snapshot health.dataUsable is false.");
@@ -215,8 +236,9 @@ export class ManualSignalService {
     if (directional && !finiteInvalidation) reasons.push("Manual signal remains WAIT because finite invalidation is required.");
     if (activeSignal) reasons.push(`Manual signal remains WAIT because READY signal ${activeSignal.id} is stable until resolution.`);
     if (underperforming) reasons.push("Manual signal remains WAIT because this segment's Wilson 95% upper bound is below the configured payout break-even reference.");
+    for (const check of entryGate.checks.filter((item) => item.status === "BLOCKED")) reasons.push(`Entry gate ${check.code}: ${check.reason}`);
     const generatedAt = timestamp(snapshot.analysis?.calculatedAt) === null ? now.toISOString() : new Date(snapshot.analysis.calculatedAt).toISOString();
-    this.database.createManualResearchSignal({
+    const record = {
       id: deterministicId(candidateKey),
       candidateKey,
       symbol: candidate.symbol,
@@ -226,7 +248,7 @@ export class ManualSignalService {
       qualityScore: candidate.qualityScore,
       qualityBand: candidate.qualityBand,
       reasons,
-      details: candidateDetails(candidate),
+      details: candidateDetails(candidate, entryGate),
       timeframeCloseWatermarks: candidate.timeframeCloseWatermarks ?? {},
       invalidation: typeof candidate.invalidationDetails === "object" && candidate.invalidationDetails !== null ? candidate.invalidationDetails : { price: candidate.invalidationPrice ?? null, text: candidate.invalidation ?? null },
       invalidationPrice: candidate.invalidationPrice ?? null,
@@ -235,11 +257,14 @@ export class ManualSignalService {
       generatedAt,
       entryPrice: ready ? market.data.lastPrice : null,
       entryAt,
-      entryValidUntil: ready ? new Date(now.getTime() + this.settings.entryWindowMs).toISOString() : null,
+      entryValidUntil: ready ? new Date(Math.min(now.getTime() + this.settings.entryWindowMs, timestamp(candidate.triggerValidUntil))).toISOString() : null,
       resolvesAt: ready ? new Date(now.getTime() + candidate.horizonMinutes * 60_000).toISOString() : null,
-      entrySource: ready ? { ...tickerProvenance(market, now.toISOString()), settlementClassification: SETTLEMENT_CLASSIFICATION } : null,
+      entrySource: ready ? { ...tickerProvenance(market, now.toISOString()), settlementClassification: SETTLEMENT_CLASSIFICATION, entryGate, orderBook: entryGate.orderBook, eventRisk: entryGate.eventRisk } : null,
       candleSources: snapshot.analysis?.sources ?? {},
-      createdAt: now.toISOString(),
-    });
+      createdAt: existing?.createdAt ?? now.toISOString(),
+    };
+    if (!existing) this.database.createManualResearchSignal(record);
+    else if (ready) this.database.promoteManualResearchSignal(existing.id, record);
+    else this.database.updateWaitingManualResearchSignal(existing.id, { reasons: record.reasons, details: record.details });
   }
 }

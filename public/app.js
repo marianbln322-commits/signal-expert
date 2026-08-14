@@ -6,6 +6,11 @@ const time = (value) => value ? new Date(value).toLocaleTimeString("ro-RO", { ho
 const escape = (value) => String(value).replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
 const safeStatus = (value) => ["LIVE", "STALE", "DEGRADED", "ERROR", "OFFLINE", "UNAVAILABLE"].includes(value) ? value.toLowerCase() : "unavailable";
 const directionClass = (value) => value === "UP" ? "positive" : value === "DOWN" ? "negative" : "";
+const directionMeta = (value) => value === "UP"
+  ? { label: "↑ UP", meaning: "Price is expected to finish ABOVE the recorded entry." }
+  : value === "DOWN"
+    ? { label: "↓ DOWN", meaning: "Price is expected to finish BELOW the recorded entry." }
+    : { label: "— WAIT", meaning: "No actionable UP or DOWN direction is available." };
 const actionClass = (value) => value === "OPEN" ? "verdict-up" : value === "BLOCKED" ? "verdict-down" : "verdict-wait";
 const segmentClass = (value) => ["WARMUP", "MONITOR", "VALIDATED", "UNDERPERFORMING"].includes(value) ? value.toLowerCase() : "warmup";
 
@@ -61,14 +66,16 @@ function remaining(value) {
 }
 
 function manualLifecycleClass(value) {
-  return ["ENTER_NOW", "TRACKING_DO_NOT_ENTER_LATE", "WAIT", "EXPIRED", "DISABLED"].includes(value) ? value.toLowerCase().replaceAll("_", "-") : "wait";
+  return ["ENTER_NOW", "BLOCKED_CURRENT_GATES", "TRACKING_DO_NOT_ENTER_LATE", "WAIT", "EXPIRED", "DISABLED"].includes(value) ? value.toLowerCase().replaceAll("_", "-") : "wait";
 }
 
 function localManualActionState(signal, now = Date.now(), enabled = state.manualSignals?.enabled === true) {
   if (signal?.status !== "READY") return signal?.status ?? "WAIT";
   if (!enabled) return "DISABLED";
   const deadline = new Date(signal.entryValidUntil).getTime();
-  return Number.isFinite(deadline) && now < deadline ? "ENTER_NOW" : "TRACKING_DO_NOT_ENTER_LATE";
+  if (!Number.isFinite(deadline) || now >= deadline) return "TRACKING_DO_NOT_ENTER_LATE";
+  if (signal.actionState === "BLOCKED_CURRENT_GATES") return "BLOCKED_CURRENT_GATES";
+  return "ENTER_NOW";
 }
 
 function latestStructureItem(group, indexKey = "index") {
@@ -150,6 +157,46 @@ function renderProviderDiagnostic(snapshot) {
   element.querySelector("span").textContent = provider.message;
 }
 
+function renderEntryGates(snapshot) {
+  const candidate = currentCandidate();
+  const checks = candidate?.entryGate?.checks ?? [];
+  const check = (code) => checks.find((item) => item.code === code);
+  const allPass = (codes) => codes.every((code) => check(code)?.status === "PASS");
+
+  const mtfCodes = ["COMPLETED_1M_TRIGGER", "FIVE_MINUTE_CONFIRMATION", "TRIGGER_FRESHNESS"];
+  const mtfPassed = candidate && allPass(mtfCodes);
+  const direction = directionMeta(candidate?.direction);
+  $("mtf-gate-status").textContent = mtfPassed ? `PASS · ${direction.label}` : "BLOCKED / WAIT";
+  $("mtf-gate-status").className = mtfPassed ? "gate-pass" : "gate-blocked";
+  const mtfBlocked = mtfCodes.map(check).find((item) => item?.status === "BLOCKED");
+  $("mtf-gate-detail").textContent = mtfPassed
+    ? `Completed 1m trigger and completed 5m structure agree · valid until ${time(candidate.triggerValidUntil)}`
+    : mtfBlocked?.reason ?? "A fresh completed 1m trigger must match completed 5m structure.";
+
+  const orderBookCodes = ["ORDER_BOOK_VALID", "SPREAD_LIMIT", "TOP_LIQUIDITY", "SOURCE_COHERENCE"];
+  const bookPassed = candidate && allPass(orderBookCodes);
+  const metrics = snapshot.orderBook?.metrics;
+  const maximum = snapshot.entryPolicy?.maxSpreadBps;
+  const minimum = snapshot.entryPolicy?.minTopNotional;
+  $("spread-gate-status").textContent = bookPassed ? "PASS" : "BLOCKED / WAIT";
+  $("spread-gate-status").className = bookPassed ? "gate-pass" : "gate-blocked";
+  const bookBlocked = orderBookCodes.map(check).find((item) => item?.status === "BLOCKED");
+  $("spread-gate-detail").textContent = metrics?.valid
+    ? `${metrics.spreadBps.toFixed(3)} / max ${maximum?.toFixed(3) ?? "—"} bps · best-side minimum ${money(metrics.topNotional)} / min ${money(minimum)} USDT${bookBlocked ? ` · ${bookBlocked.reason}` : ""}`
+    : bookBlocked?.reason ?? metrics?.reason ?? "No validated LIVE Spot top of book.";
+
+  const macroCheck = check("MACRO_NEWS");
+  const macro = snapshot.eventRisk ?? { status: "UNAVAILABLE" };
+  const macroStatus = macroCheck?.status ?? (macro.status === "DISABLED" ? "SKIPPED" : macro.status === "CLEAR" ? "PASS" : "BLOCKED");
+  const macroSkipped = macroStatus === "SKIPPED" || macro.status === "DISABLED";
+  const macroPassed = macroStatus === "PASS" && macro.status === "CLEAR";
+  $("macro-gate-status").textContent = macroSkipped ? "SKIPPED · DISABLED" : macroPassed ? "PASS · CLEAR" : `BLOCKED · ${macro.status}`;
+  $("macro-gate-status").className = macroSkipped ? "gate-skipped" : macroPassed ? "gate-pass" : "gate-blocked";
+  $("macro-gate-detail").textContent = macroSkipped
+    ? "Macro/news filtering was not run. This entry was not news-filtered; SKIPPED is not CLEAR or PASS."
+    : macroCheck?.reason ?? macro.reason ?? "No attributed macro status.";
+}
+
 function clearTicker() {
   $("price").textContent = "—"; $("change").textContent = "—"; $("change").className = "";
   $("source-name").textContent = "Unavailable"; $("source-time").textContent = "No verified market response";
@@ -162,7 +209,7 @@ function renderMarket() {
   status($("health"), snapshot.health.overall);
   status($("book-health"), snapshot.orderBook.status);
   renderProviderDiagnostic(snapshot);
-  $("event-warning").querySelector("span").textContent = snapshot.eventFutures.reason;
+  $("event-warning").querySelector("span").textContent = `${snapshot.eventFutures.reason} The app can show manual research signals and create local PAPER positions only; it cannot submit a live MEXC Event Futures order.`;
   const ticker = snapshot.market.data;
   $("chart-title").textContent = `${state.symbol} price action`;
   if (ticker) {
@@ -172,10 +219,10 @@ function renderMarket() {
     $("source-name").textContent = snapshot.market.sourceName ?? snapshot.market.source ?? "Unavailable";
     $("source-time").textContent = `Source ${time(snapshot.market.sourceTimestamp)} · Received ${time(snapshot.market.receivedAt)}`;
     $("high-low").textContent = `${money(ticker.high24h)} / ${money(ticker.low24h)}`;
-    const spread = ticker.askPrice && ticker.bidPrice ? ticker.askPrice - ticker.bidPrice : null;
-    $("spread").textContent = spread === null ? "—" : money(spread, 4);
+    const bookMetrics = snapshot.orderBook?.metrics;
+    $("spread").textContent = bookMetrics?.valid ? `${bookMetrics.spreadBps.toFixed(3)} bps · ${money(bookMetrics.topNotional)} USDT top` : "—";
     $("volume").textContent = `${money(ticker.quoteVolume24h / 1e6, 1)}M USDT`;
-    $("book-spread").textContent = `Spread ${spread === null ? "—" : money(spread, 4)}`;
+    $("book-spread").textContent = bookMetrics?.valid ? `Best bid ${money(bookMetrics.bestBid, 4)} · ask ${money(bookMetrics.bestAsk, 4)} · ${bookMetrics.spreadBps.toFixed(3)} bps` : `Spread unavailable`;
   } else clearTicker();
   const candleEnvelope = snapshot.candles[state.timeframe];
   const completedCandles = (candleEnvelope.data ?? []).filter((candle) => candle.closed === true);
@@ -188,7 +235,9 @@ function renderMarket() {
   const fields = [["REGIME", timeframe?.regime], ["RSI 14", indicators?.rsi14?.toFixed(1)], ["EMA 20", indicators?.ema20?.toFixed(2)], ["EMA 50", indicators?.ema50?.toFixed(2)], ["REL. VOLUME", indicators?.relativeVolume20 ? `${indicators.relativeVolume20.toFixed(2)}×` : null], ["ATR 14", indicators?.atr14?.toFixed(2)]];
   $("indicators").innerHTML = fields.map(([label, value]) => `<div><small>${label}</small><b>${escape(value ?? "—")}</b></div>`).join("");
   const verdict = analysis?.direction ?? "WAIT";
-  $("verdict").textContent = verdict;
+  const verdictDirection = directionMeta(verdict);
+  $("verdict").textContent = verdictDirection.label;
+  $("verdict").title = verdictDirection.meaning;
   $("verdict").className = `verdict ${verdict === "UP" ? "verdict-up" : verdict === "DOWN" ? "verdict-down" : "verdict-wait"}`;
   $("up-score").textContent = `${analysis?.upScore ?? 50}%`; $("down-score").textContent = `${analysis?.downScore ?? 50}%`;
   $("up-fill").style.width = `${analysis?.upScore ?? 0}%`; $("down-fill").style.width = `${analysis?.downScore ?? 0}%`;
@@ -196,6 +245,7 @@ function renderMarket() {
   $("break-even").textContent = analysis ? pct(analysis.breakEvenProbability) : "—";
   $("confidence").textContent = analysis?.confidence ?? "—"; $("model").textContent = analysis?.modelVersion ?? "—";
   $("reasons").innerHTML = (analysis?.reasons ?? ["Waiting for verified candles."]).slice(0, 5).map((reason) => `<li>${escape(reason)}</li>`).join("");
+  renderEntryGates(snapshot);
   renderBook(snapshot.orderBook.data);
 }
 
@@ -207,7 +257,7 @@ function renderBook(book) {
   $("bids").innerHTML = rows((book?.bids ?? []).slice(0, 6), "bid");
 }
 
-function manualConfidenceFor(symbol, horizonMinutes, strategyVersion = "0.3.0") {
+function manualConfidenceFor(symbol, horizonMinutes, strategyVersion = "0.5.0") {
   return state.manualSignals?.empiricalConfidence?.find((item) => item.symbol === symbol && item.horizonMinutes === horizonMinutes && item.strategyVersion === strategyVersion) ?? null;
 }
 
@@ -227,6 +277,7 @@ function renderManualSignals() {
     const actionState = localManualActionState(signal);
     const actionable = actionState === "ENTER_NOW";
     const tracking = actionState === "TRACKING_DO_NOT_ENTER_LATE";
+    const currentlyBlocked = actionState === "BLOCKED_CURRENT_GATES";
     const confidenceText = confidence?.measuredRate == null ? "N/A" : pct(confidence.measuredRate);
     const confidenceDetail = confidence?.measuredRate == null
       ? `${confidence?.decisiveSample ?? 0}/${confidence?.minDecisiveSample ?? manual.policy?.minDecisiveSample ?? 20} decisive proxy outcomes`
@@ -239,33 +290,45 @@ function renderManualSignals() {
       : direction === "DOWN"
         ? "Prediction: price will finish BELOW the recorded entry."
         : "No UP or DOWN signal right now.";
+    const currentBlockReason = signal.currentEntryGate?.checks?.find((check) => check.status === "BLOCKED")?.reason;
     const instruction = actionable
       ? `ENTER NOW · CHOOSE ${directionArrow} ${direction}`
       : tracking
         ? "DO NOT ENTER NOW · WATCH ONLY"
-        : actionState === "DISABLED"
-          ? "DISABLED · DO NOT ENTER"
-          : signal.status === "EXPIRED"
-            ? `RESULT RECORDED · ${signal.proxyOutcome ?? "EXPIRED"}`
-            : "WAIT · DO NOT ENTER";
+        : currentlyBlocked
+          ? "CURRENT GATES BLOCKED · DO NOT ENTER"
+          : actionState === "DISABLED"
+            ? "DISABLED · DO NOT ENTER"
+            : signal.status === "EXPIRED"
+              ? `RESULT RECORDED · ${signal.proxyOutcome ?? "EXPIRED"}`
+              : "WAIT · DO NOT ENTER";
     const actionNote = actionable
       ? "This is the only active entry window. Stop when the countdown reaches zero."
       : tracking
         ? `Entry window closed. The ${directionArrow} ${direction} call is shown for outcome tracking only.`
-        : signal.status === "EXPIRED"
-          ? "This call has finished. It is history, not a new entry."
-          : "Wait for an ENTER NOW instruction before choosing UP or DOWN.";
-    const statusLabel = actionable ? "ENTER NOW" : tracking ? "WATCH ONLY" : actionState === "DISABLED" ? "DISABLED" : signal.status === "EXPIRED" ? "FINISHED" : "WAIT";
+        : currentlyBlocked
+          ? `The creation-time call remains in the audit, but live entry checks now block action. ${currentBlockReason ?? "Waiting for the next live recheck."}`
+          : signal.status === "EXPIRED"
+            ? "This call has finished. It is history, not a new entry."
+            : "Wait for an ENTER NOW instruction before choosing UP or DOWN.";
+    const statusLabel = actionable ? "ENTER NOW" : tracking ? "WATCH ONLY" : currentlyBlocked ? "GATES BLOCKED" : actionState === "DISABLED" ? "DISABLED" : signal.status === "EXPIRED" ? "FINISHED" : "WAIT";
     const actionClass = actionable ? "enter-now" : tracking ? "watch-only" : "wait";
-    const timer = actionable ? `entry closes ${remaining(signal.entryValidUntil)}` : tracking ? `proxy observation in ${remaining(signal.resolvesAt)}` : signal.status === "EXPIRED" ? `resolved ${time(signal.resolvedAt)}` : "no entry window";
+    const timer = actionable ? `entry closes ${remaining(signal.entryValidUntil)}` : tracking ? `proxy observation in ${remaining(signal.resolvesAt)}` : currentlyBlocked ? `entry window ${remaining(signal.entryValidUntil)} · live recheck pending` : signal.status === "EXPIRED" ? `resolved ${time(signal.resolvedAt)}` : "no entry window";
     const sourceName = signal.entrySource?.sourceName ?? signal.entrySource?.source ?? "No entry source";
     const fallback = signal.entrySource?.failover?.active === true;
     const invalidation = signal.invalidation?.text ?? (Number.isFinite(signal.invalidationPrice) ? `Completed-candle invalidation ${money(signal.invalidationPrice)}` : "No finite invalidation");
+    const gateChecks = signal.currentEntryGate?.checks ?? signal.details?.entryGate?.checks ?? [];
+    const importantChecks = ["CURRENT_ENTRY_RECHECK", "COMPLETED_1M_TRIGGER", "FIVE_MINUTE_CONFIRMATION", "TRIGGER_FRESHNESS", "SPREAD_LIMIT", "TOP_LIQUIDITY", "SOURCE_COHERENCE", "MACRO_NEWS"].map((code) => gateChecks.find((check) => check.code === code)).filter(Boolean);
+    const gateMarkup = importantChecks.length ? importantChecks.map((check) => {
+      const statusText = check.code === "MACRO_NEWS" && check.status === "SKIPPED" ? "SKIPPED (FILTER DISABLED)" : check.status;
+      return `<span class="manual-gate gate-${check.status.toLowerCase()}">${escape(check.code.replaceAll("_", " "))}: ${escape(statusText)}</span>`;
+    }).join("") : '<span class="manual-gate gate-blocked">ENTRY GATES: WAITING</span>';
     return `<article class="manual-card manual-${manualLifecycleClass(actionState)}">
       <div class="manual-card-head"><strong>${escape(symbol)} · ${horizonMinutes}m</strong><span>${escape(statusLabel)}</span></div>
       <div class="manual-direction manual-direction-${direction.toLowerCase()}"><small>SIGNAL DIRECTION</small><div><b aria-hidden="true">${directionArrow}</b><strong>${direction}</strong></div><span>${escape(directionMeaning)}</span></div>
       <div class="manual-instruction manual-action-${actionClass}">${escape(instruction)}</div>
       <div class="manual-action-note">${escape(actionNote)}</div>
+      <div class="manual-gates">${gateMarkup}</div>
       <div class="manual-price"><small>SPOT-PROXY ENTRY</small><b>${Number.isFinite(signal.entryPrice) ? money(signal.entryPrice) : "—"}</b><span>${escape(timer)}</span></div>
       <div class="manual-stats"><div><small>SETUP QUALITY</small><b>${signal.qualityScore}/100</b><span>${escape(signal.qualityBand)}</span></div><div><small>EMPIRICAL CONFIDENCE</small><b>${confidenceText}</b><span>${escape(confidenceDetail)}</span></div></div>
       <p class="manual-invalidation">${escape(invalidation)}</p>
@@ -278,7 +341,7 @@ function renderManualSignals() {
     <b>${confidence.measuredRate == null ? "Not available" : pct(confidence.measuredRate)}</b><small>${confidence.decisiveSample}/${confidence.minDecisiveSample} decisive · ${confidence.correct} correct / ${confidence.incorrect} incorrect · Spot proxy only</small>
   </div>`).join("") || '<div class="empty-card">No prospective proxy outcomes yet.</div>';
   $("manual-history").innerHTML = (manual.recent ?? []).slice(0, 12).map((signal) => `<div class="manual-history-row">
-    <span>${time(signal.generatedAt)}</span><strong>${escape(signal.symbol)} · ${signal.horizonMinutes}m</strong><b class="${directionClass(signal.direction)}">${escape(signal.direction)}</b><span>${escape(localManualActionState(signal))}</span><span>${signal.qualityScore}/100</span><small>${escape(signal.proxyOutcome ?? signal.reasons?.at(-1) ?? "Recorded")}</small>
+    <span>${time(signal.generatedAt)}</span><strong>${escape(signal.symbol)} · ${signal.horizonMinutes}m</strong><b class="${directionClass(signal.direction)}">${escape(directionMeta(signal.direction).label)}</b><span>${escape(localManualActionState(signal))}</span><span>${signal.qualityScore}/100</span><small>${escape(signal.proxyOutcome ?? signal.reasons?.at(-1) ?? "Recorded")}</small>
   </div>`).join("") || '<div class="empty-card">No manual research signal history yet.</div>';
   notifyNewManualSignal(manual.ready ?? []);
   if (manualDeadlineTimer) clearTimeout(manualDeadlineTimer);
@@ -295,8 +358,10 @@ function renderLiveSetups() {
     const segment = safeguardMap.get(`${candidate.symbol}:${candidate.horizonMinutes}`);
     const score = candidate.qualityScore == null ? "—" : `${candidate.qualityScore}/100`;
     const components = (candidate.confluenceComponents ?? []).filter((item) => item.active && item.direction === candidate.direction).slice(0, 3);
+    const direction = directionMeta(candidate.direction);
     return `<article class="live-setup ${candidate.direction === "UP" ? "setup-up" : candidate.direction === "DOWN" ? "setup-down" : "setup-wait"}">
-      <div class="setup-card-head"><strong>${escape(candidate.symbol)} · ${candidate.horizonMinutes}m</strong><span class="${directionClass(candidate.direction)}">${escape(candidate.direction ?? "WAIT")}</span></div>
+      <div class="setup-card-head"><strong>${escape(candidate.symbol)} · ${candidate.horizonMinutes}m</strong><span class="${directionClass(candidate.direction)}">${escape(direction.label)}</span></div>
+      <div class="setup-direction-note">${escape(direction.meaning)}</div>
       <div class="setup-card-score"><b>${score}</b><span>${escape(candidate.qualityBand ?? candidate.qualityClassification ?? "UNAVAILABLE")}</span></div>
       <small>${components.length ? components.map((item) => escape(`${item.timeframe} ${item.label}`)).join(" · ") : escape(candidate.reason ?? "No aligned completed-candle structure.")}</small>
       <div class="setup-card-meta"><span>Invalidation ${Number.isFinite(candidate.invalidationPrice) ? money(candidate.invalidationPrice) : "required"}</span><span class="segment-${segmentClass(segment?.status)}">${escape(segment?.status ?? "WARMUP")}</span></div>
@@ -308,7 +373,7 @@ function renderRecentAlerts() {
   const decisions = state.autonomous?.recentDecisions ?? [];
   $("recent-alerts").innerHTML = decisions.length ? decisions.slice(0, 10).map((decision) => `<div class="alert-row">
     <span>${time(decision.updatedAt)}</span><strong>${escape(decision.symbol)} · ${decision.horizonMinutes}m</strong>
-    <b class="${directionClass(decision.direction)}">${escape(decision.direction)}</b><span class="decision-action ${actionClass(decision.action)}">${escape(decision.action)}</span>
+    <b class="${directionClass(decision.direction)}" title="${escape(directionMeta(decision.direction).meaning)}">${escape(directionMeta(decision.direction).label)}</b><span class="decision-action ${actionClass(decision.action)}">${escape(decision.action)}</span>
     <span>${decision.qualityScore}/100</span><small>${escape(decision.reasons?.at(-1) ?? decision.invalidation ?? "Completed-candle decision recorded.")}</small>
   </div>`).join("") : '<div class="empty-card">No autonomous decisions recorded yet.</div>';
 }
@@ -369,15 +434,17 @@ function renderAutonomous() {
   $("auto-profile").textContent = policy.profile ?? "—";
   $("auto-stage").textContent = `${runtime.recoveryStage ?? 0}${runtime.previousLoss ? ` · loss ${money(runtime.previousLoss)}` : ""}`;
   $("auto-next-scan").textContent = autonomous.nextScanAt ? time(autonomous.nextScanAt) : "—";
+  const positionDirection = directionMeta(position?.direction);
   $("auto-position").innerHTML = position
-    ? `<strong>OPEN PAPER</strong><span>${escape(position.symbol)} · ${escape(position.direction)} · ${position.horizonMinutes}m · ${money(position.stake)} USDT</span><small>Quality ${position.qualityScore}/100 · resolves ${time(position.resolvesAt)}</small>`
-    : `<strong>${runtime.status === "PAUSED" ? "PAUSED" : "SCANNING"}</strong><span>${escape(runtime.pauseReason ?? "No autonomous position is open.")}</span><small>One-position lock is active.</small>`;
+    ? `<strong>OPEN LOCAL PAPER POSITION</strong><span>${escape(position.symbol)} · ${escape(positionDirection.label)} · ${position.horizonMinutes}m · ${money(position.stake)} USDT</span><small>${escape(positionDirection.meaning)} Quality ${position.qualityScore}/100 · resolves ${time(position.resolvesAt)} · no exchange order.</small>`
+    : `<strong>${runtime.status === "PAUSED" ? "PAUSED" : "SCANNING"}</strong><span>${escape(runtime.pauseReason ?? "No autonomous PAPER position is open.")}</span><small>One-position PAPER lock is active; no exchange order path exists.</small>`;
   const action = decision?.action ?? "WAIT";
   $("auto-action").textContent = action; $("auto-action").className = `verdict ${actionClass(action)}`;
   $("auto-quality").textContent = decision ? `${decision.qualityScore}/100` : "—";
   $("auto-band").textContent = decision ? `${decision.qualityBand} setup quality · not probability` : "No completed setup yet";
   $("auto-market").textContent = decision ? `${decision.symbol} / ${decision.horizonMinutes}m` : "—";
-  $("auto-direction").textContent = decision?.direction ?? "—";
+  const decisionDirection = directionMeta(decision?.direction);
+  $("auto-direction").textContent = decision ? `${decisionDirection.label} · ${decisionDirection.meaning}` : "— WAIT · No actionable direction.";
   $("auto-cap").textContent = policy.absoluteStakeCap == null ? "—" : `${money(policy.absoluteStakeCap)} USDT · ${(policy.maxStakeFraction * 100).toFixed(1)}% equity`;
   const stopAtProfit = policy.dailyStopAtProfit ?? performance.targets?.dailyStopAtProfit;
   $("auto-limits").textContent = stopAtProfit == null ? "—" : `stop after +${money(stopAtProfit)} / loss stop −${money(policy.dailyLossLimit)} USDT`;
@@ -403,7 +470,7 @@ function renderAccount() {
   $("available").textContent = money(account.available); $("pnl").textContent = money(account.realizedPnl);
   $("pnl").className = account.realizedPnl >= 0 ? "positive" : "negative";
   $("database").textContent = `Database: ${account.persistence.mode}`; $("record-count").textContent = `${account.positions.length} records`;
-  $("positions").innerHTML = account.positions.length ? account.positions.slice(0, 10).map((position) => `<tr><td>${time(position.openedAt)}</td><td><span class="origin origin-${position.origin === "AUTONOMOUS" ? "autonomous" : "manual"}">${escape(position.origin ?? "MANUAL")}</span></td><td>${escape(position.symbol)}</td><td class="${directionClass(position.direction)}">${escape(position.direction)}</td><td>${position.horizonMinutes}m</td><td>${money(position.entryPrice)}</td><td>${money(position.stake)}</td><td><span class="position-status">${escape(position.status)}</span></td><td>${position.pnl == null ? "—" : money(position.pnl)}</td></tr>`).join("") : '<tr><td colspan="9" class="empty">No paper positions yet.</td></tr>';
+  $("positions").innerHTML = account.positions.length ? account.positions.slice(0, 10).map((position) => `<tr><td>${time(position.openedAt)}</td><td><span class="origin origin-${position.origin === "AUTONOMOUS" ? "autonomous" : "manual"}">${escape(position.origin ?? "MANUAL")}</span></td><td>${escape(position.symbol)}</td><td class="${directionClass(position.direction)}" title="${escape(directionMeta(position.direction).meaning)}">${escape(directionMeta(position.direction).label)}</td><td>${position.horizonMinutes}m</td><td>${money(position.entryPrice)}</td><td>${money(position.stake)}</td><td><span class="position-status">${escape(position.status)}</span></td><td>${position.pnl == null ? "—" : money(position.pnl)}</td></tr>`).join("") : '<tr><td colspan="9" class="empty">No paper positions yet.</td></tr>';
 }
 
 async function refresh() {
@@ -420,7 +487,7 @@ async function openPaper(direction) {
   const notice = $("notice");
   try {
     await request("/api/v1/paper/positions", { method: "POST", body: JSON.stringify({ symbol: state.symbol, direction, horizonMinutes: Number($("horizon").value), stake: Number($("stake").value) }) });
-    notice.textContent = `PAPER ${direction} opened. No MEXC order was sent.`; notice.classList.remove("hidden"); await refresh();
+    notice.textContent = `Local PAPER ${directionMeta(direction).label} position opened. No MEXC Event Futures order was sent.`; notice.classList.remove("hidden"); await refresh();
   } catch (error) { notice.textContent = error.message; notice.classList.remove("hidden"); }
 }
 

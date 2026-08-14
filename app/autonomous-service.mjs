@@ -77,12 +77,14 @@ export class AutonomousService {
       profile: this.state?.profile ?? this.settings.profile, strategyVersion: AUTONOMOUS_STRATEGY_VERSION, payoutRate: this.settings.payoutRate,
     });
   }
-  candidateDetails(candidate, safeguard = null) {
+  candidateDetails(candidate, safeguard = null, entryGate = null) {
     return {
       volatilityRegime: candidate.volatilityRegime ?? null,
       confluenceComponents: candidate.confluenceComponents ?? [],
       structureFeatures: candidate.structureFeatures ?? {},
+      technicalFeatures: candidate.technicalFeatures ?? {},
       qualityDefinition: candidate.qualityDefinition ?? { classification: "DETERMINISTIC_SETUP_QUALITY_NOT_PROBABILITY" },
+      entryGate,
       segmentSafeguard: safeguard ? { ...safeguard, gateEnabled: this.settings.segmentGateEnabled } : null,
     };
   }
@@ -91,7 +93,8 @@ export class AutonomousService {
       const snapshot = this.market.snapshot(symbol); const candidates = snapshot?.analysis?.candidates ?? [];
       return this.settings.horizons.map((horizonMinutes) => {
         const candidate = candidates.find((item) => item.horizonMinutes === horizonMinutes);
-        return candidate ? { ...candidate, available: snapshot?.health?.dataUsable === true } : { symbol, horizonMinutes, available: false, direction: "WAIT", qualityScore: null, qualityClassification: "UNAVAILABLE_NOT_A_PROBABILITY", reason: "Completed market data or analysis is unavailable." };
+        const entryGate = candidate ? this.market.evaluateEntry(candidate) : null;
+        return candidate ? { ...candidate, entryGate, available: snapshot?.health?.dataUsable === true } : { symbol, horizonMinutes, available: false, direction: "WAIT", qualityScore: null, qualityClassification: "UNAVAILABLE_NOT_A_PROBABILITY", reason: "Completed market data or analysis is unavailable." };
       });
     });
   }
@@ -140,13 +143,18 @@ export class AutonomousService {
         for (const candidate of snapshot.analysis.candidates) if (this.settings.horizons.includes(candidate.horizonMinutes)) candidates.push(candidate);
       }
       candidates.sort((left, right) => right.qualityScore - left.qualityScore || this.settings.symbols.indexOf(left.symbol) - this.settings.symbols.indexOf(right.symbol) || this.settings.horizons.indexOf(left.horizonMinutes) - this.settings.horizons.indexOf(right.horizonMinutes) || left.decisionKey.localeCompare(right.decisionKey));
-      const fresh = [];
+      const considered = [];
       for (const candidate of candidates) {
+        const existing = this.database.autonomousDecisionByKey(candidate.decisionKey);
+        if (existing) {
+          if (existing.action !== "OPEN" && !existing.paperPositionId) considered.push({ ...candidate, id: existing.id });
+          continue;
+        }
         const now = new Date().toISOString(); const id = randomUUID();
         const created = this.database.createAutonomousDecision({ ...candidate, id, profile: this.state.profile, stage: this.state.recoveryStage, action: "WAIT", stake: null, reasons: candidate.reasons, createdAt: now, updatedAt: now });
-        if (created) fresh.push({ ...candidate, id });
+        if (created) considered.push({ ...candidate, id });
       }
-      const eligible = fresh.filter((item) => item.direction === "UP" || item.direction === "DOWN");
+      const eligible = considered.filter((item) => item.direction === "UP" || item.direction === "DOWN");
       if (!eligible.length) return;
       const account = this.paper.account(); const exposureHeadroom = Math.max(0, account.equity * 0.35 - account.locked);
       const dailyLossHeadroom = Math.max(0, this.settings.dailyLossLimit - performance.combinedDaily.grossLoss);
@@ -161,9 +169,14 @@ export class AutonomousService {
         const candidate = eligible[index];
         const safeguard = safeguardBySegment.get(`${candidate.symbol}:${candidate.horizonMinutes}`);
         const segmentReason = safeguardReason(safeguard);
-        const activeReasons = [...candidate.reasons, segmentReason];
-        const details = this.candidateDetails(candidate, safeguard);
+        const entryGate = this.market.evaluateEntry(candidate);
+        const activeReasons = [...candidate.reasons, segmentReason, ...entryGate.checks.filter((check) => check.status === "BLOCKED").map((check) => `${check.code}: ${check.reason}`)];
+        const details = this.candidateDetails(candidate, safeguard, entryGate);
         this.database.updateAutonomousDecision(candidate.id, { action: "WAIT", reasons: activeReasons, details, updatedAt: new Date().toISOString() });
+        if (!entryGate.allowed) {
+          this.database.updateAutonomousDecision(candidate.id, { action: "BLOCKED", reasons: activeReasons, details, updatedAt: new Date().toISOString() });
+          continue;
+        }
         if (this.settings.segmentGateEnabled && safeguard.status === "UNDERPERFORMING") {
           this.database.updateAutonomousDecision(candidate.id, { action: "BLOCKED", reasons: [...activeReasons, "Candidate blocked because this symbol+horizon segment's Wilson upper bound is below break-even."], details, updatedAt: new Date().toISOString() });
           continue;
@@ -183,7 +196,7 @@ export class AutonomousService {
           const position = this.paper.openAutonomous({ symbol: candidate.symbol, direction: candidate.direction, horizonMinutes: candidate.horizonMinutes, stake: plan.stake }, {
             decisionId: candidate.id, strategyName: candidate.strategyName, strategyVersion: candidate.strategyVersion,
             qualityScore: candidate.qualityScore, stakeProfile: this.state.profile, recoveryStage: this.state.recoveryStage,
-            decisionReasons, state: this.state,
+            decisionReasons, state: this.state, candidate,
           });
           this.state = { ...this.state, currentPositionId: position.id, updatedAt: position.openedAt };
           const skippedAt = new Date().toISOString();

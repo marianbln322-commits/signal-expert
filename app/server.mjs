@@ -9,6 +9,7 @@ import { MarketService } from "./market-service.mjs";
 import { PaperService } from "./paper-service.mjs";
 import { AutonomousService } from "./autonomous-service.mjs";
 import { ManualSignalService } from "./manual-signal-service.mjs";
+import { EventRiskService, TradingEconomicsCalendarProvider } from "./event-risk-service.mjs";
 
 const jsonHeaders = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer", "x-frame-options": "DENY" };
 const types = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml" };
@@ -40,7 +41,17 @@ export async function createApplication(options = {}) {
     new MexcSpotProvider(config.mexcBaseUrl, { timeoutMs: config.providerTimeoutMs, attempts: config.providerAttempts }),
     config.marketFailoverEnabled ? new MexcSpotProvider(config.fallbackMarketBaseUrl, { timeoutMs: config.providerTimeoutMs, attempts: config.providerAttempts }) : null,
   );
-  const market = new MarketService({ provider, symbols: config.symbols, staleAfterMs: config.staleAfterMs, payoutRate: config.payoutRate, database, candidateThresholds: config.qualityThresholds });
+  const eventRiskProvider = options.eventRiskProvider ?? (config.eventRiskApiKey ? new TradingEconomicsCalendarProvider(config.eventRiskBaseUrl, config.eventRiskApiKey, { timeoutMs: config.providerTimeoutMs }) : null);
+  const eventRisk = options.eventRisk ?? new EventRiskService({ provider: eventRiskProvider, enabled: config.eventRiskEnabled, pollMs: config.eventRiskPollMs, staleAfterMs: config.eventRiskStaleAfterMs, preWindowMs: config.eventRiskPreWindowMs, postWindowMs: config.eventRiskPostWindowMs, minImportance: config.eventRiskMinImportance });
+  const entryPolicy = {
+    eventRiskEnabled: config.eventRiskEnabled,
+    triggerGraceMs: config.triggerGraceMs,
+    qualityThreshold: config.qualityThresholds.standard,
+    maxSpreadBpsBySymbol: { BTCUSDT: config.btcMaxSpreadBps, ETHUSDT: config.ethMaxSpreadBps },
+    minTopNotional: config.minTopNotional,
+    maxSourceSkewMs: config.maxSourceSkewMs,
+  };
+  const market = new MarketService({ provider, symbols: config.symbols, staleAfterMs: config.staleAfterMs, payoutRate: config.payoutRate, database, candidateThresholds: config.qualityThresholds, eventRisk, entryPolicy });
   const paper = new PaperService({ market, database, settings: { payoutRate: config.payoutRate, initialBankroll: config.initialBankroll, dailyLossLimit: config.dailyLossLimit, maxOpenPositions: config.maxOpenPositions, btcMaxStake: config.btcMaxStake, ethMaxStake: config.ethMaxStake } });
   const autonomous = new AutonomousService({ market, paper, database, settings: {
     enabled: config.autonomousEnabled && config.tradingMode === "paper", profile: config.autonomousProfile, scanMs: config.autonomousScanMs,
@@ -80,7 +91,8 @@ export async function createApplication(options = {}) {
       catch { return sendJson(response, 403, { error: "ORIGIN_REJECTED", message: "Invalid origin" }); }
     }
     try {
-      if (request.method === "GET" && url.pathname === "/health") return sendJson(response, 200, { status: "ok", timestamp: new Date().toISOString(), mode: config.tradingMode, database: database.health(), autonomousExecution: { mode: "PAPER_ONLY", enabled: config.autonomousEnabled && config.tradingMode === "paper", liveAvailable: false }, manualSignals: { mode: "MANUAL_SIGNALS_ONLY", enabled: config.manualSignalsEnabled && config.tradingMode === "paper", marketClassification: "SPOT_PROXY", settlementClassification: "NOT_EVENT_FUTURES_SETTLEMENT", liveExecutionAvailable: false }, liveExecution: { available: false, reason: "No verified MEXC Event Futures execution API is connected; the application supplies manual research signals and PAPER shadow outcomes only." } });
+      if (request.method === "GET" && url.pathname === "/health") return sendJson(response, 200, { status: "ok", timestamp: new Date().toISOString(), mode: config.tradingMode, database: database.health(), eventRisk: eventRisk.status(), entryPolicy: { version: "entry-gates-v0.5.0", liveExecutionAvailable: false }, autonomousExecution: { mode: "PAPER_ONLY", enabled: config.autonomousEnabled && config.tradingMode === "paper", liveAvailable: false }, manualSignals: { mode: "MANUAL_SIGNALS_ONLY", enabled: config.manualSignalsEnabled && config.tradingMode === "paper", marketClassification: "SPOT_PROXY", settlementClassification: "NOT_EVENT_FUTURES_SETTLEMENT", liveExecutionAvailable: false }, liveExecution: { available: false, reason: "No verified MEXC Event Futures execution API is connected; the application supplies manual research signals and PAPER shadow outcomes only." } });
+      if (request.method === "GET" && url.pathname === "/api/v1/event-risk") return sendJson(response, 200, eventRisk.status());
       if (request.method === "GET" && url.pathname === "/api/v1/sources") return sendJson(response, 200, { timestamp: new Date().toISOString(), sources: market.sources() });
       if (request.method === "GET" && url.pathname.startsWith("/api/v1/market/")) { const symbol = url.pathname.split("/").at(-1).toUpperCase(); const snapshot = market.snapshot(symbol); return snapshot ? sendJson(response, 200, snapshot) : sendJson(response, 404, { error: "NOT_FOUND", message: "Symbol not configured" }); }
       if (request.method === "GET" && url.pathname === "/api/v1/paper/account") return sendJson(response, 200, paper.account());
@@ -108,8 +120,8 @@ export async function createApplication(options = {}) {
     } catch (error) { sendJson(response, error.message?.includes("Invalid") ? 400 : 409, { error: "REQUEST_REJECTED", message: error instanceof Error ? error.message : "Request failed" }); }
     finally { if (Date.now() - started > 1000) console.warn(JSON.stringify({ level: "warn", event: "slow_request", path: url.pathname, durationMs: Date.now() - started })); }
   });
-  await market.start(config.tickerPollMs, config.candlePollMs); paper.initialize(); autonomous.start(); manualSignals.start();
-  return { server, market, paper, autonomous, manualSignals, database, async close() { manualSignals.stop(); market.stop(); autonomous.stop(); paper.stop(); if (server.listening) await new Promise((done) => server.close(done)); database.close(); } };
+  await eventRisk.start(); await market.start(config.tickerPollMs, config.candlePollMs); paper.initialize(); autonomous.start(); manualSignals.start();
+  return { server, market, paper, autonomous, manualSignals, eventRisk, database, async close() { manualSignals.stop(); market.stop(); autonomous.stop(); paper.stop(); eventRisk.stop(); if (server.listening) await new Promise((done) => server.close(done)); database.close(); } };
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;

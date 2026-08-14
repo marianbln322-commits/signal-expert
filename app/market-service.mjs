@@ -1,4 +1,5 @@
 import { analyzeMarket } from "./quant.mjs";
+import { deriveOrderBookMetrics, evaluateEntryGates } from "./entry-gates.mjs";
 const timeframes = ["1m", "5m", "15m", "1h"];
 const emptyState = () => ({
   ticker: null, depth: null, candles: { "1m": null, "5m": null, "15m": null, "1h": null }, analysis: null,
@@ -6,8 +7,9 @@ const emptyState = () => ({
 });
 
 export class MarketService {
-  constructor({ provider, symbols, staleAfterMs, payoutRate, database, candidateThresholds }) {
+  constructor({ provider, symbols, staleAfterMs, payoutRate, database, candidateThresholds, eventRisk, entryPolicy }) {
     this.provider = provider; this.symbols = symbols; this.staleAfterMs = staleAfterMs; this.payoutRate = payoutRate; this.database = database; this.candidateThresholds = candidateThresholds;
+    this.eventRisk = eventRisk; this.entryPolicy = entryPolicy;
     this.states = new Map(symbols.map((symbol) => [symbol, emptyState()])); this.timers = []; this.tickerBusy = false; this.candleBusy = false;
   }
   async start(tickerPollMs, candlePollMs) {
@@ -47,7 +49,7 @@ export class MarketService {
         });
         if (complete && timeframes.every((timeframe) => this.status(state.candles[timeframe]) === "LIVE")) {
           const closed = Object.fromEntries(timeframes.map((timeframe) => [timeframe, state.candles[timeframe].data.filter((candle) => candle.closed)]));
-          state.analysis = analyzeMarket(closed, this.payoutRate, new Date(), { symbol, thresholds: this.candidateThresholds });
+          state.analysis = analyzeMarket(closed, this.payoutRate, new Date(), { symbol, thresholds: this.candidateThresholds, triggerGraceMs: this.entryPolicy.triggerGraceMs });
           state.analysis.sources = Object.fromEntries(timeframes.map((timeframe) => [timeframe, { source: state.candles[timeframe].source, sourceName: state.candles[timeframe].sourceName, sourceUrl: state.candles[timeframe].sourceUrl, sourceTimestamp: state.candles[timeframe].sourceTimestamp, receivedAt: state.candles[timeframe].receivedAt, failover: state.candles[timeframe].failover }]));
           this.database.insertSignal(symbol, state.analysis, state.candles["1m"].sourceTimestamp);
         } else state.analysis = null;
@@ -82,22 +84,43 @@ export class MarketService {
     const baseLive = marketStatus === "LIVE" && candlesLive;
     const dataUsable = baseLive && !state.errors.ticker && Object.keys(state.errors.candles).length === 0;
     const provider = this.diagnostics(state);
+    const orderBookMetrics = deriveOrderBookMetrics(state.depth);
+    const eventRisk = this.eventRisk.status();
+    const entryPolicy = this.entryPolicyFor(symbol);
+    const receiptTimes = [state.ticker?.receivedAt, state.depth?.receivedAt].map((value) => new Date(value).getTime());
+    const sourceSkewMs = receiptTimes.every(Number.isFinite) ? Math.abs(receiptTimes[0] - receiptTimes[1]) : null;
+    const sameEntrySource = Boolean(state.ticker?.source && state.ticker.source === state.depth?.source);
+    const entryMarketReady = dataUsable && depthStatus === "LIVE" && orderBookMetrics.valid && orderBookMetrics.spreadBps <= entryPolicy.maxSpreadBps && orderBookMetrics.topNotional >= entryPolicy.minTopNotional && sameEntrySource && sourceSkewMs !== null && sourceSkewMs <= entryPolicy.maxSourceSkewMs && (!entryPolicy.eventRiskEnabled || eventRisk.allowed === true);
     const overall = dataUsable ? (provider.fallbackActive || provider.errors.length ? "DEGRADED" : "LIVE") : provider.errors.length ? "ERROR" : "DEGRADED";
     return {
       symbol,
       market: state.ticker ? { ...state.ticker, classification: "RAW", status: marketStatus } : { classification: "UNAVAILABLE", status: "UNAVAILABLE" },
-      orderBook: state.depth ? { ...state.depth, classification: "RAW", status: depthStatus } : { classification: "UNAVAILABLE", status: "UNAVAILABLE" },
+      orderBook: state.depth ? { ...state.depth, metrics: orderBookMetrics, classification: "RAW", status: depthStatus } : { metrics: orderBookMetrics, classification: "UNAVAILABLE", status: "UNAVAILABLE" },
       candles: Object.fromEntries(timeframes.map((timeframe) => { const envelope = state.candles[timeframe]; return [timeframe, envelope ? { ...envelope, classification: "RAW", status: candleStatuses[timeframe] } : { classification: "UNAVAILABLE", status: "UNAVAILABLE" }]; })),
       analysis: candlesLive ? state.analysis : null,
+      eventRisk,
+      entryPolicy: { ...entryPolicy, classification: "CONFIGURED_ENTRY_GATE_NOT_EVENT_FUTURES_LIQUIDITY" },
       eventFutures: { classification: "UNAVAILABLE", status: "UNAVAILABLE", reason: "No official MEXC Event Futures API has been verified for live payout, contracts or execution. The active underlying Spot source is identified next to every value.", paperPayout: { value: this.payoutRate, classification: "CALCULATED", source: "USER_CONFIGURATION", live: false } },
-      health: { overall, dataUsable, market: marketStatus, orderBook: depthStatus, candles: candleStatuses, provider, lastAttemptAt: state.lastAttemptAt, error: provider.errors.join("; ") || null },
+      health: { overall, dataUsable, entryMarketReady, market: marketStatus, orderBook: depthStatus, candles: candleStatuses, provider, sourceSkewMs, sameEntrySource, lastAttemptAt: state.lastAttemptAt, error: provider.errors.join("; ") || null },
     };
+  }
+  entryPolicyFor(symbol) {
+    return {
+      ...this.entryPolicy,
+      maxSpreadBps: this.entryPolicy.maxSpreadBpsBySymbol[symbol],
+    };
+  }
+  evaluateEntry(candidate, now = new Date()) {
+    const snapshot = this.snapshot(candidate?.symbol);
+    if (!snapshot) return { allowed: false, classification: "AUDITABLE_ENTRY_POLICY_PAPER_AND_MANUAL_ONLY", policyVersion: "entry-gates-v0.5.0", evaluatedAt: now.toISOString(), checks: [{ code: "SYMBOL", status: "BLOCKED", reason: "Symbol is not configured.", evidence: null }] };
+    return evaluateEntryGates({ snapshot, candidate, policy: this.entryPolicyFor(candidate.symbol), now });
   }
   sources() {
     const providers = this.provider.providers ?? [this.provider];
     return [
       ...providers.map((provider, index) => ({ id: provider.sourceId ?? `provider-${index}`, name: provider.name, role: index === 0 ? "PRIMARY" : "FALLBACK", type: provider.official ? "OFFICIAL_PUBLIC_API" : "CONFIGURED_PROVIDER", updateFrequency: "Ticker/depth default 3s; klines default 15s", limitations: index === 0 ? "MEXC Spot underlying data, not Event Futures payout or contracts." : "Independent Spot fallback; prices may differ from the MEXC Event Futures settlement index.", symbols: this.symbols })),
       { id: "mexc-event-futures", name: "MEXC Event Futures", role: "UNAVAILABLE", type: "UNVERIFIED", updateFrequency: null, limitations: "Official integration endpoint not verified; live execution disabled.", symbols: this.symbols },
+      this.eventRisk.source(),
     ];
   }
 }

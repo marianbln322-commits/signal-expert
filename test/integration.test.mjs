@@ -11,7 +11,9 @@ function candles(intervalMinutes) {
   return Array.from({ length: 80 }, (_, index) => {
     const openTime = now - (80 - index) * intervalMinutes * 60_000;
     const open = 65000 + index * 2;
-    return { openTime, closeTime: openTime + intervalMinutes * 60_000 - 1, open, high: open + 5, low: open - 3, close: open + 2, volume: 100 + index, quoteVolume: (100 + index) * open, trades: 20 + index, closed: true };
+    const close = index === 79 ? open + 7 : open + 2;
+    const volume = index === 79 ? 500 : 100 + index;
+    return { openTime, closeTime: openTime + intervalMinutes * 60_000 - 1, open, high: Math.max(open, close) + 1, low: Math.min(open, close) - 1, close, volume, quoteVolume: volume * close, trades: 20 + index, closed: true };
   });
 }
 function envelope(data, sourceTimestamp = new Date()) {
