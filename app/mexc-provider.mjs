@@ -28,7 +28,7 @@ export class MexcSpotProvider {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
       try {
-        const response = await this.fetchImpl(url, { signal: controller.signal, headers: { accept: "application/json", "user-agent": "signal-expert/0.7.0" } });
+        const response = await this.fetchImpl(url, { signal: controller.signal, headers: { accept: "application/json", "user-agent": "signal-expert/0.8.0" } });
         if (!response.ok) { const error = new Error(`${this.name} HTTP ${response.status}`); error.status = response.status; throw error; }
         return { payload: await response.json(), receivedAt: new Date(), url };
       } catch (error) { finalError = error; if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, 300 * 2 ** attempt)); }

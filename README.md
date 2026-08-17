@@ -4,8 +4,8 @@ Local-first, auditable BTCUSDT/ETHUSDT market analytics and event-futures resear
 
 ## Functional scope
 
-- Official public MEXC Spot REST ticker, depth and completed 1m/5m/15m/1h candles with source/receive timestamps.
-- Explicit Binance public market-data fallback when MEXC is unreachable; ticker+depth and all candle timeframes switch as coherent provider bundles, while the active source and original MEXC error remain visible.
+- Official Binance Spot REST is the primary coherent market source; official MEXC Spot remains the atomically attributed REST fallback.
+- Optional Binance combined WebSocket (`aggTrade`, `bookTicker`, closed/forming 1m and 5m kline events) drives the isolated phase-2 instance, while REST keeps depth authoritative and reconciles all candles including 15m/1h.
 - RSI, EMA 9/20/21/50, ATR, Bollinger Bands, relative volume and local support/resistance.
 - Objective completed-candle market structure: confirmed swings, FVG/IFVG zones and retests, liquidity sweeps, CHoCH/MSS, explicit structural invalidation, and auditable confluence components.
 - Completed 1m candlestick trigger (engulfing, rejection, ATR/volume impulse or trend-continuation close) must be explicitly confirmed by completed 5m structure and aligned completed 15m trend before any entry can become actionable.
@@ -24,9 +24,15 @@ Local-first, auditable BTCUSDT/ETHUSDT market analytics and event-futures resear
 - Zero third-party runtime dependencies; Node.js standard library only.
 - Cross-platform launcher with a single-instance lock, automatic free-port selection, health-gated browser opening and clean shutdown.
 
+## Isolated phase-2 instance on port 4020
+
+Run `npm run start:4020`, `START-SIGNAL-EXPERT-4020.cmd`, or `./start-signal-expert-4020.sh`. This uses strict port `4020`, instance name `phase2`, a separate lock/state directory, and SQLite at `data/instances/phase2/signal-expert.db`. If 4020 is occupied, startup fails visibly instead of moving to another port. The existing default 4100 launcher and `data/signal-expert.db` remain unchanged and REST-only unless explicitly configured.
+
+The phase-2 instance enables Binance event streaming with exponential reconnect, stale/gap/reconnect observability, deduplicated operational alerts, and periodic REST reconciliation with atomic Binance→MEXC fallback. Entry gates fail closed when required stream channels are unhealthy. Correction and support/resistance transitions persist across restarts. Every 10m/30m forecast—including WAIT—is stored prospectively for later calibration; accuracy and Brier metrics remain unavailable until `FORECAST_CALIBRATION_MIN_SAMPLE` is reached. Composite `TREND`, `RANGE`, or `TRANSITION` regimes select distinct horizon weights, and each terminal card lists the exact missing conditions for READY.
+
 ## Manual Event Futures signal terminal
 
-Version 0.7.0 makes official Binance Spot market data the primary attributed analysis feed and retains official MEXC Spot as an atomic bundle fallback. Ticker and order-book snapshots refresh every 3 seconds; 1m/5m/15m/1h kline bundles refresh every 5 seconds. Forming candles remain visible in raw chart data but are excluded from signal decisions until the provider close timestamp has passed. Freshness has two independent checks: provider transport/source receipt must remain inside the configured 30-second default, and each timeframe must expose a completed close no older than one full timeframe interval plus that grace. The dashboard shows the latest completed 1m/5m timestamps and their LIVE/STALE status separately from the analysis calculation time.
+Version 0.8.0 makes official Binance Spot market data the primary attributed analysis feed and retains official MEXC Spot as an atomic bundle fallback. Ticker and order-book snapshots refresh every 3 seconds; 1m/5m/15m/1h kline bundles refresh every 5 seconds. Forming candles remain visible in raw chart data but are excluded from signal decisions until the provider close timestamp has passed. Freshness has two independent checks: provider transport/source receipt must remain inside the configured 30-second default, and each timeframe must expose a completed close no older than one full timeframe interval plus that grace. The dashboard shows the latest completed 1m/5m timestamps and their LIVE/STALE status separately from the analysis calculation time.
 
 Each 10m/30m terminal card now starts with a large **technical UP/DOWN percentage split**. This is a deterministic, uncalibrated directional estimate assembled from the completed 1m flow, completed 5m trend/outlook, 15m/1h context, objective market-structure confluence, and correction state. The normalized signed evidence is mapped with `UP = round(clamp(50 + evidence × 42, 8, 92))`; `DOWN = 100 - UP`, so the split always totals exactly 100%. It is deliberately not labeled win probability. Setup quality remains a separate 0–100 rules score, while prospective measured confidence remains unavailable until its minimum real sample is reached.
 
@@ -34,7 +40,7 @@ The 1m engine evaluates an eight-candle completed flow: net movement normalized 
 
 Correction handling is explicit. Against the established 5m trend, the engine measures completed 1m pullback depth in ATR/bps, duration and counter-trend bars. It classifies `CORRECTION_STARTING`, `CORRECTION_ACTIVE`, `CORRECTION_END_CONFIRMED`, or `LOCAL_LEVEL_BREAK_CONFIRMED`. The local-break state requires two completed 1m closes beyond the relevant level and blocks entry without falsely declaring the higher-timeframe trend invalid; formal invalidation still requires the declared 5m/15m completed close. Support/resistance interactions are independently classified as approaching, testing, rejected, break pending confirmation, or break confirmed. An active/starting correction or confirmed local level break keeps the setup at WAIT; a correction end requires a completed 1m trigger back in the trend direction.
 
-The v0.7 signal workflow keeps the durable manual lifecycle and applies one auditable gate shared by manual signals and PAPER execution. It does **not** place an order. `READY` means the Spot-proxy research checks passed; it is not an exchange acknowledgement, a verified Event Futures quote, or evidence that an order was accepted. A candidate can become `READY` only when a completed directional 1m pattern is still inside its timestamped grace period, completed 5m structure and completed 15m trend confirm the same direction, no active correction blocks timing, quality and finite invalidation pass, ticker/candles are fresh, and the attributed Spot top of book passes spread, liquidity, provider, and timestamp-coherence limits. Candles, ticker, and order book must come from the same provider before a setup is actionable.
+The v0.8 signal workflow keeps the durable manual lifecycle and applies one auditable gate shared by manual signals and PAPER execution. It does **not** place an order. `READY` means the Spot-proxy research checks passed; it is not an exchange acknowledgement, a verified Event Futures quote, or evidence that an order was accepted. A candidate can become `READY` only when a completed directional 1m pattern is still inside its timestamped grace period, completed 5m structure and completed 15m trend confirm the same direction, no active correction blocks timing, quality and finite invalidation pass, ticker/candles are fresh, and the attributed Spot top of book passes spread, liquidity, provider, and timestamp-coherence limits. Candles, ticker, and order book must come from the same provider before a setup is actionable.
 
 Version 0.6.1's HTTP 429 fix remains in place: each three-second browser refresh reads one aggregate local endpoint, overlapping refreshes are coalesced, and hidden tabs pause polling. Normal browser traffic remains 20 local requests per minute per visible tab while the 180-request safety limit stays active.
 
@@ -48,7 +54,7 @@ Signal sound is browser opt-in, defaults off, ignores READY signals already pres
 
 ## Signal generation and PAPER execution
 
-Strategy version 0.7.0 exports the enhanced `generateSignals` engine while retaining the prior compatibility name. It evaluates deterministic candidates once per unique set of completed 1m/5m/15m/1h close timestamps. The 10m setup gives maximum weight to the multi-candle 1m flow and 5m trend; the 30m setup gives more weight to 15m/1h context while still requiring a current 1m trigger and 5m confirmation. EMA20/50, FVG/retest, IFVG, confirmed swing sweeps, CHoCH/MSS, Bollinger position, RSI, ATR, relative volume, correction state, level interaction and finite dynamic/structural invalidation remain auditable inputs.
+Strategy version 0.8.0 exports the enhanced `generateSignals` engine while retaining the prior compatibility name. It evaluates deterministic candidates once per unique set of completed 1m/5m/15m/1h close timestamps. The 10m setup gives maximum weight to the multi-candle 1m flow and 5m trend; the 30m setup gives more weight to 15m/1h context while still requiring a current 1m trigger and 5m confirmation. EMA20/50, FVG/retest, IFVG, confirmed swing sweeps, CHoCH/MSS, Bollinger position, RSI, ATR, relative volume, correction state, level interaction and finite dynamic/structural invalidation remain auditable inputs.
 
 `PaperService.executeTrade` is still PAPER-only. It reruns the complete entry policy immediately before persistence rather than trusting an earlier scan. This blocks stale triggers, changed spread/liquidity, mixed ticker/order-book providers, excessive timestamp skew, a new macro blackout, or any other failed gate between signal generation and the simulated open. Migration 007 stores that exact gate snapshot with the PAPER position. No branch can send an exchange order.
 
@@ -84,7 +90,14 @@ The release archive is self-contained and does not need `npm install`. Install [
 
 The launcher validates Node, creates local SQLite storage, finds the first free port starting at `4100`, starts the server on `127.0.0.1`, waits for the health check, and opens the browser. If another Signal Expert instance is already running, it opens that instance instead of starting a conflicting server. Keep the launcher window open and press `Ctrl+C` to stop cleanly. Manual signal scanning and autonomous PAPER shadow tracking are enabled by default and visibly labeled; set `MANUAL_SIGNALS_ENABLED=false` and/or `AUTONOMOUS_ENABLED=false` before startup to disable either workflow.
 
-To choose a preferred port, set `SIGNAL_EXPERT_PORT`; if occupied, the launcher automatically tries the next ports. Set `NO_BROWSER=1` for headless startup.
+To start the isolated phase-2 instance with strict port and dedicated storage:
+
+```bash
+npm run start:4020
+# http://127.0.0.1:4020
+```
+
+To choose a preferred port for the backward-compatible default instance, set `SIGNAL_EXPERT_PORT`; if occupied, the launcher automatically tries the next ports. Set `NO_BROWSER=1` for headless startup.
 
 ## Developer startup
 
@@ -117,8 +130,8 @@ npm run build
 
 ## Sources
 
-- [MEXC Spot API v3 documentation](https://mexcdevelop.github.io/apidocs/spot_v3_en/) — primary public ticker, depth and kline source; default polling is 3s/15s.
-- [Binance Market Data Only documentation](https://developers.binance.com/docs/binance-spot-api-docs/faqs/market_data_only) — independent public fallback at `data-api.binance.vision`, used only when the primary source fails and always attributed in the interface.
+- [Binance Market Data Only documentation](https://developers.binance.com/docs/binance-spot-api-docs/faqs/market_data_only) — primary public REST source at `data-api.binance.vision`; the isolated 4020 runtime also uses the official combined WebSocket stream.
+- [MEXC Spot API v3 documentation](https://mexcdevelop.github.io/apidocs/spot_v3_en/) — atomic REST fallback, always explicitly attributed.
 - [MEXC Event Futures overview](https://www.mexc.com/es/learn/article/17827791522522) — product description only, not proof of an integration API.
 
 Responses are runtime-validated. Failed, stale or malformed data is surfaced, never silently simulated. When fallback is active, the header changes to `DEGRADED`, the exact MEXC failure is shown, and every raw value identifies Binance as its source. Disable fallback with `MARKET_FAILOVER_ENABLED=false`. External-source descriptions were rephrased for licensing compliance.

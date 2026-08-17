@@ -293,6 +293,105 @@ export class Database {
       };
     });
   }
+  strategyState(symbol, horizonMinutes, machineType, machineKey) {
+    const row = this.db.prepare("SELECT symbol,horizon_minutes AS horizonMinutes,machine_type AS machineType,machine_key AS machineKey,state,payload_json AS payloadJson,last_event_key AS lastEventKey,version,updated_at AS updatedAt FROM strategy_states WHERE symbol=? AND horizon_minutes=? AND machine_type=? AND machine_key=?").get(symbol, horizonMinutes, machineType, machineKey);
+    return row ? { ...row, payload: decodeJson(row.payloadJson, {}) } : null;
+  }
+  applyStrategyTransition(transition) {
+    const previous = this.strategyState(transition.symbol, transition.horizonMinutes, transition.machineType, transition.machineKey);
+    if (previous?.lastEventKey === transition.eventKey) return previous;
+    if (previous?.state === transition.state) {
+      this.db.prepare("UPDATE strategy_states SET payload_json=?,last_event_key=?,updated_at=? WHERE symbol=? AND horizon_minutes=? AND machine_type=? AND machine_key=?").run(
+        JSON.stringify(transition.payload ?? {}), transition.eventKey, transition.observedAt,
+        transition.symbol, transition.horizonMinutes, transition.machineType, transition.machineKey,
+      );
+      return this.strategyState(transition.symbol, transition.horizonMinutes, transition.machineType, transition.machineKey);
+    }
+    const existingEvent = this.db.prepare("SELECT event_key AS eventKey FROM strategy_state_transitions WHERE event_key=?").get(transition.eventKey);
+    if (!existingEvent) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db.prepare(`INSERT INTO strategy_state_transitions(symbol,horizon_minutes,machine_type,machine_key,from_state,to_state,event_key,evidence_json,transitioned_at) VALUES(?,?,?,?,?,?,?,?,?)`).run(
+          transition.symbol, transition.horizonMinutes, transition.machineType, transition.machineKey, previous?.state ?? null,
+          transition.state, transition.eventKey, JSON.stringify(transition.payload ?? {}), transition.observedAt,
+        );
+        const version = (previous?.version ?? 0) + 1;
+        this.db.prepare(`INSERT INTO strategy_states(symbol,horizon_minutes,machine_type,machine_key,state,payload_json,last_event_key,version,updated_at) VALUES(?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(symbol,horizon_minutes,machine_type,machine_key) DO UPDATE SET state=excluded.state,payload_json=excluded.payload_json,last_event_key=excluded.last_event_key,version=excluded.version,updated_at=excluded.updated_at`).run(
+          transition.symbol, transition.horizonMinutes, transition.machineType, transition.machineKey, transition.state,
+          JSON.stringify(transition.payload ?? {}), transition.eventKey, version, transition.observedAt,
+        );
+        this.db.exec("COMMIT");
+      } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    }
+    return this.strategyState(transition.symbol, transition.horizonMinutes, transition.machineType, transition.machineKey);
+  }
+  upsertFeedChannelState(state) {
+    this.db.prepare(`INSERT INTO feed_channel_state(provider,symbol,channel,status,session_id,connected_at,last_message_at,last_event_at,last_sequence,lag_ms,gap_count,reconnect_count,last_error,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(provider,symbol,channel) DO UPDATE SET status=excluded.status,session_id=excluded.session_id,connected_at=excluded.connected_at,last_message_at=excluded.last_message_at,last_event_at=excluded.last_event_at,last_sequence=excluded.last_sequence,lag_ms=excluded.lag_ms,gap_count=excluded.gap_count,reconnect_count=excluded.reconnect_count,last_error=excluded.last_error,updated_at=excluded.updated_at`).run(
+      state.provider, state.symbol, state.channel, state.status, state.sessionId ?? null, state.connectedAt ?? null, state.lastMessageAt ?? null,
+      state.lastEventAt ?? null, state.lastSequence ?? null, state.lagMs ?? null, state.gapCount ?? 0, state.reconnectCount ?? 0,
+      state.lastError ?? null, state.updatedAt,
+    );
+  }
+  recordFeedEvent(event) {
+    this.db.prepare("INSERT OR IGNORE INTO feed_events(event_key,provider,symbol,channel,event_type,severity,payload_json,occurred_at) VALUES(?,?,?,?,?,?,?,?)").run(
+      event.eventKey, event.provider, event.symbol, event.channel, event.eventType, event.severity,
+      JSON.stringify(event.payload ?? { status: event.status ?? null, error: event.lastError ?? null }), event.occurredAt,
+    );
+  }
+  upsertOperationalAlert(alert) {
+    this.db.prepare(`INSERT INTO operational_alerts(fingerprint,alert_type,provider,symbol,channel,severity,status,first_seen_at,last_seen_at,occurrence_count,payload_json,resolved_at) VALUES(?,?,?,?,?,?,?,?,?,1,?,NULL)
+      ON CONFLICT(fingerprint) DO UPDATE SET severity=excluded.severity,status='OPEN',last_seen_at=excluded.last_seen_at,occurrence_count=operational_alerts.occurrence_count+1,payload_json=excluded.payload_json,resolved_at=NULL`).run(
+      alert.fingerprint, alert.alertType, alert.provider, alert.symbol, alert.channel, alert.severity, alert.status ?? "OPEN",
+      alert.observedAt, alert.observedAt, JSON.stringify(alert.payload ?? {}),
+    );
+    return this.db.prepare("SELECT fingerprint,alert_type AS alertType,provider,symbol,channel,severity,status,first_seen_at AS firstSeenAt,last_seen_at AS lastSeenAt,occurrence_count AS occurrenceCount,payload_json AS payloadJson,resolved_at AS resolvedAt FROM operational_alerts WHERE fingerprint=?").get(alert.fingerprint);
+  }
+  resolveOperationalAlert(fingerprint, resolvedAt, payload = {}) {
+    const result = this.db.prepare("UPDATE operational_alerts SET status='RESOLVED',last_seen_at=?,resolved_at=?,payload_json=? WHERE fingerprint=? AND status='OPEN'").run(resolvedAt, resolvedAt, JSON.stringify(payload), fingerprint);
+    return result.changes === 1;
+  }
+  operationalAlerts({ status = null, limit = 100 } = {}) {
+    const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 500) : 100;
+    const rows = status
+      ? this.db.prepare("SELECT fingerprint,alert_type AS alertType,provider,symbol,channel,severity,status,first_seen_at AS firstSeenAt,last_seen_at AS lastSeenAt,occurrence_count AS occurrenceCount,payload_json AS payloadJson,resolved_at AS resolvedAt FROM operational_alerts WHERE status=? ORDER BY last_seen_at DESC LIMIT ?").all(status, safeLimit)
+      : this.db.prepare("SELECT fingerprint,alert_type AS alertType,provider,symbol,channel,severity,status,first_seen_at AS firstSeenAt,last_seen_at AS lastSeenAt,occurrence_count AS occurrenceCount,payload_json AS payloadJson,resolved_at AS resolvedAt FROM operational_alerts ORDER BY last_seen_at DESC LIMIT ?").all(safeLimit);
+    return rows.map(({ payloadJson, ...row }) => ({ ...row, payload: decodeJson(payloadJson, {}) }));
+  }
+  createForecastObservation(observation) {
+    const result = this.db.prepare(`INSERT OR IGNORE INTO forecast_observations(id,observation_key,strategy_name,strategy_version,symbol,horizon_minutes,generated_at,resolves_at,entry_price,predicted_direction,up_score,down_score,quality_score,readiness_json,regime_json,features_json,source_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      observation.id, observation.observationKey, observation.strategyName, observation.strategyVersion, observation.symbol,
+      observation.horizonMinutes, observation.generatedAt, observation.resolvesAt, observation.entryPrice, observation.predictedDirection,
+      observation.upScore, observation.downScore, observation.qualityScore, JSON.stringify(observation.readiness ?? {}),
+      JSON.stringify(observation.regime ?? {}), JSON.stringify(observation.features ?? {}), JSON.stringify(observation.source ?? {}),
+    );
+    return result.changes === 1;
+  }
+  pendingForecastObservations(resolvesBefore, limit = 500) {
+    const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 2000) : 500;
+    return this.db.prepare("SELECT id,symbol,horizon_minutes AS horizonMinutes,generated_at AS generatedAt,resolves_at AS resolvesAt,entry_price AS entryPrice,predicted_direction AS predictedDirection,up_score AS upScore,down_score AS downScore FROM forecast_observations WHERE outcome IS NULL AND resolves_at<=? ORDER BY resolves_at LIMIT ?").all(resolvesBefore, safeLimit);
+  }
+  resolveForecastObservation(id, resolution) {
+    const result = this.db.prepare("UPDATE forecast_observations SET outcome=?,actual_direction=?,resolution_price=?,resolution_source_json=?,resolved_at=? WHERE id=? AND outcome IS NULL").run(
+      resolution.outcome, resolution.actualDirection, resolution.resolutionPrice ?? null, JSON.stringify(resolution.resolutionSource ?? {}), resolution.resolvedAt, id,
+    );
+    return result.changes === 1;
+  }
+  forecastCalibration({ minSample = 50, symbol = null } = {}) {
+    const rows = symbol
+      ? this.db.prepare("SELECT strategy_version AS strategyVersion,symbol,horizon_minutes AS horizonMinutes,predicted_direction AS predictedDirection,up_score AS upScore,actual_direction AS actualDirection,outcome FROM forecast_observations WHERE outcome IS NOT NULL AND symbol=?").all(symbol)
+      : this.db.prepare("SELECT strategy_version AS strategyVersion,symbol,horizon_minutes AS horizonMinutes,predicted_direction AS predictedDirection,up_score AS upScore,actual_direction AS actualDirection,outcome FROM forecast_observations WHERE outcome IS NOT NULL").all();
+    const groups = new Map();
+    for (const row of rows) { const key = `${row.strategyVersion}:${row.symbol}:${row.horizonMinutes}`; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(row); }
+    return [...groups.values()].map((items) => {
+      const first = items[0]; const brierSample = items.filter((item) => ["UP", "DOWN"].includes(item.actualDirection));
+      const directional = brierSample.filter((item) => ["UP", "DOWN"].includes(item.predictedDirection));
+      const correct = directional.filter((item) => item.predictedDirection === item.actualDirection).length;
+      const brierScore = brierSample.length ? brierSample.reduce((sum, item) => { const probabilityUp = item.upScore / 100; const actualUp = item.actualDirection === "UP" ? 1 : 0; return sum + (probabilityUp - actualUp) ** 2; }, 0) / brierSample.length : null;
+      return { classification: "PROSPECTIVE_UNSELECTED_SPOT_PROXY_CALIBRATION", strategyVersion: first.strategyVersion, symbol: first.symbol, horizonMinutes: first.horizonMinutes, resolved: items.length, decisiveSample: brierSample.length, directionalSample: directional.length, brierSample: brierSample.length, correct, measuredAccuracy: directional.length >= minSample ? correct / directional.length : null, brierScore: brierSample.length >= minSample ? brierScore : null, status: brierSample.length >= minSample ? "CALIBRATING" : "WARMUP", minSample };
+    }).sort((left, right) => left.symbol.localeCompare(right.symbol) || left.horizonMinutes - right.horizonMinutes);
+  }
   sourceEvent(event) {
     this.db.prepare("INSERT INTO data_source_events(source_name,symbol,status,source_timestamp,received_at,latency_ms,message) VALUES(?,?,?,?,?,?,?)").run(event.sourceName, event.symbol ?? null, event.status, event.sourceTimestamp ?? null, event.receivedAt, event.latencyMs ?? null, event.message ?? null);
   }

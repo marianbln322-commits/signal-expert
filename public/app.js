@@ -260,7 +260,7 @@ function renderBook(book) {
   $("bids").innerHTML = rows((book?.bids ?? []).slice(0, 6), "bid");
 }
 
-function manualConfidenceFor(symbol, horizonMinutes, strategyVersion = "0.7.0") {
+function manualConfidenceFor(symbol, horizonMinutes, strategyVersion = "0.8.0") {
   return state.manualSignals?.empiricalConfidence?.find((item) => item.symbol === symbol && item.horizonMinutes === horizonMinutes && item.strategyVersion === strategyVersion) ?? null;
 }
 
@@ -567,13 +567,15 @@ function renderManualSignals() {
   $("manual-signal-state").className = `mode ${manual.enabled ? "auto-running" : "auto-paused"}`;
   $("manual-signal-scan").textContent = manual.nextScanAt ? time(manual.nextScanAt) : "—";
   const terminalSource = terminal?.source;
+  const feed = terminalSource?.feed;
+  const streamDetail = feed?.enabled ? ` · STREAM ${feed.status} · reconectări ${feed.channels?.reduce((sum, channel) => sum + (channel.reconnectCount ?? 0), 0) ?? 0} · gap-uri ${feed.channels?.reduce((sum, channel) => sum + (channel.gapCount ?? 0), 0) ?? 0}` : " · STREAM DEZACTIVAT";
   $("manual-signal-source").textContent = terminalSource?.status === "LIVE"
-    ? `${terminalSource.sourceName ?? terminalSource.source} · tick ${time(terminalSource.sourceTimestamp)}${terminalSource.fallback?.active ? ` · FALLBACK ${terminalSource.fallback.fallbackName ?? terminalSource.sourceName ?? terminalSource.source}` : " · PRIMARY"}${terminalSource.actionSourceCoherent === false ? " · SURSE DIFERITE — BLOCAT" : ""}`
-    : "Fără preț Spot proaspăt";
+    ? `${terminalSource.sourceName ?? terminalSource.source} · tick ${time(terminalSource.sourceTimestamp)}${terminalSource.fallback?.active ? ` · FALLBACK ${terminalSource.fallback.fallbackName ?? terminalSource.sourceName ?? terminalSource.source}` : " · PRIMARY"}${terminalSource.actionSourceCoherent === false ? " · SURSE DIFERITE — BLOCAT" : ""}${streamDetail}`
+    : `Fără preț Spot proaspăt${streamDetail}`;
   $("manual-candle-freshness").textContent = `1m ${time(terminalSource?.completedOneMinuteAt)} (${terminalSource?.candleStatuses?.["1m"] ?? "—"}) · 5m ${time(terminalSource?.completedFiveMinuteAt)} (${terminalSource?.candleStatuses?.["5m"] ?? "—"}) · analiză ${time(terminalSource?.analysisCalculatedAt)}`;
 
   const checkLabel = (code) => ({
-    CURRENT_ENTRY_RECHECK: "Revalidare setup", SIGNAL_DESK_DISABLED: "Scanner dezactivat",
+    CURRENT_ENTRY_RECHECK: "Revalidare setup", SIGNAL_DESK_DISABLED: "Scanner dezactivat", FEED_HEALTH: "Feed WebSocket", CORRECTION_STATE: "Stare corecție", LEVEL_STATE: "Stare nivel",
     COMPLETED_1M_TRIGGER: "Trigger 1m", FIVE_MINUTE_CONFIRMATION: "Trend 5m", FIFTEEN_MINUTE_ALIGNMENT: "Trend 15m",
     TRIGGER_FRESHNESS: "Fereastră intrare", QUALITY: "Calitate", FINITE_INVALIDATION: "Invalidare",
     CANDLE_SOURCE_COHERENCE: "Sursă lumânări", MARKET_FRESHNESS: "Date proaspete", ORDER_BOOK_VALID: "Order book",
@@ -602,6 +604,9 @@ function renderManualSignals() {
     if (["CORRECTION_ACTIVE", "CORRECTION_STARTING"].includes(correction?.status)) return `Trendul 5m rămâne ${correction.trendDirection}, dar corecția 1m este încă activă; așteaptă confirmarea finalului ei.`;
     if (correction?.status === "LOCAL_LEVEL_BREAK_CONFIRMED") return `Două lumânări 1m închise au străpuns nivelul local de ${correction.levelInteraction?.kind === "SUPPORT" ? "suport" : "rezistență"}${Number.isFinite(correction.levelInteraction?.confirmedBreakLevel) ? ` la ${money(correction.levelInteraction.confirmedBreakLevel)}` : ""}. Intrarea rămâne blocată până la reconfirmare; trendul 5m nu este declarat invalid fără închiderea sa structurală.`;
     return ({
+      FEED_HEALTH: "Canalele Binance WebSocket necesare nu sunt toate LIVE; intrarea rămâne blocată până la refacerea feedului.",
+      CORRECTION_STATE: "Corecția persistentă nu a ajuns încă într-o stare care permite intrarea.",
+      LEVEL_STATE: "Nivelul relevant este indisponibil sau are o străpungere în confirmare/confirmată.",
       COMPLETED_1M_TRIGGER: "Așteaptă o lumânare 1m închisă cu impuls sau respingere clară în direcția trendului.",
       FIVE_MINUTE_CONFIRMATION: "Triggerul 1m nu este încă susținut de structura trendului 5m.",
       FIFTEEN_MINUTE_ALIGNMENT: "Contextul 15m este opus sau neutru; direcția nu are încă aliniere completă.",
@@ -641,6 +646,13 @@ function renderManualSignals() {
       : invalidation?.condition === "COMPLETED_CLOSE_ABOVE" ? "închidere completă peste nivel" : "regulă indisponibilă";
     const invalidationContext = [invalidation?.timeframe, invalidationCondition, invalidation?.source?.replaceAll("_", " ")].filter(Boolean).join(" · ");
     const checks = round.details?.checks ?? [];
+    const readiness = round.readiness ?? { ready: false, requirements: [] };
+    const readinessMarkup = readiness.ready
+      ? '<div class="terminal-readiness readiness-ready"><strong>READY</strong><span>Nu lipsește nicio condiție auditată.</span></div>'
+      : `<div class="terminal-readiness"><strong>CE LIPSEȘTE PENTRU READY · ${readiness.blockedCount ?? readiness.requirements?.length ?? 0}</strong><ol>${(readiness.requirements ?? []).map((item) => `<li><b>${escape(checkLabel(item.code))}</b><span>${escape(item.reason ?? item.condition ?? "Condiție neîndeplinită")}${item.nextObservableAt ? ` · următoarea observație ${time(item.nextObservableAt)}` : ""}</span></li>`).join("") || "<li><span>Se așteaptă evaluarea contrafactuală.</span></li>"}</ol></div>`;
+    const regime = round.marketRegime;
+    const persistent = round.persistentState;
+    const stateMarkup = `<div class="terminal-state-line"><span>REGIM ${escape(regime?.phase ?? "NECUNOSCUT")} · VOLATILITATE ${escape(regime?.volatility ?? "NECUNOSCUTĂ")}</span><span>CORECȚIE PERSISTATĂ ${escape(persistent?.correction?.state ?? "—")} · v${escape(persistent?.correction?.version ?? "—")}</span></div>`;
     const checksMarkup = checks.map((check) => `<div class="terminal-check"><span>${escape(checkLabel(check.code))}</span><b class="gate-${check.status.toLowerCase()}">${escape(check.status)}</b><small>${escape(check.reason)}</small></div>`).join("");
     const reasons = (round.details?.reasons ?? []).slice(-5).map((reason) => `<li>${escape(reason)}</li>`).join("");
     return `<article class="event-round-card event-round-${round.state.toLowerCase()}">
@@ -663,13 +675,15 @@ function renderManualSignals() {
       <div class="terminal-confirmations">${confirmation("TRIGGER 1m", round.confirmations?.oneMinute)}${confirmation("TREND 5m", round.confirmations?.fiveMinute)}${confirmation("TREND 15m", round.confirmations?.fifteenMinute)}</div>
       <div class="terminal-levels">${level("SUPORT", round.levels?.support, "support")}${level("REZISTENȚĂ", round.levels?.resistance, "resistance")}<div class="terminal-level invalidation"><small>INVALIDARE</small><b>${Number.isFinite(invalidation?.price) ? money(invalidation.price) : "—"}</b><span title="${escape(invalidation?.text ?? invalidationContext)}">${escape(invalidationContext || "nivel necesar")}</span></div></div>
       <div class="terminal-quality"><div><small>CALITATE SETUP · MINIM ${quality.minimum}</small><b>${quality.score}/100 · ${escape(quality.band)}</b></div><i><span style="width:${Math.max(0, Math.min(100, quality.score))}%"></span></i></div>
+      ${stateMarkup}
+      ${readinessMarkup}
       <div class="terminal-primary-reason ${round.state === "ENTER_NOW" ? "reason-ready" : "reason-wait"}"><strong>${round.state === "ENTER_NOW" ? "TOATE FILTRELE SPOT PROXY AU TRECUT" : escape(checkLabel(round.actionable?.primaryBlocker?.code ?? "WAIT_FOR_SETUP"))}</strong><span>${escape(round.state === "ENTER_NOW" ? action.note : decisionExplanation(round))}</span></div>
       <details class="terminal-details"><summary>Vezi analiza completă și toate filtrele</summary><div class="terminal-checks">${checksMarkup || '<div class="terminal-check"><small>Se așteaptă evaluarea.</small></div>'}</div>${reasons ? `<ul>${reasons}</ul>` : ""}<p>Calitatea este un scor determinist, nu probabilitate garantată. Setupul folosește doar proxy Spot; contractul, payout-ul, lichiditatea și decontarea Event Futures trebuie verificate separat. Aplicația nu trimite ordine.</p></details>
     </article>`;
   };
   $("manual-signal-cards").innerHTML = terminal?.rounds?.length ? terminal.rounds.map(roundMarkup).join("") : '<div class="empty-card">Terminalul așteaptă date coerente pentru simbolul selectat.</div>';
 
-  $("manual-confidence").innerHTML = (manual.empiricalConfidence ?? []).map((item) => `<div class="confidence-row"><strong>${escape(item.symbol)} · ${item.horizonMinutes}m</strong><span class="segment-${segmentClass(item.status)}">${escape(item.status)}</span><b>${item.measuredRate == null ? "Indisponibil" : pct(item.measuredRate)}</b><small>${item.decisiveSample}/${item.minDecisiveSample} rezultate decisive · proxy Spot</small></div>`).join("") || '<div class="empty-card">Încrederea rămâne indisponibilă până la eșantionul minim.</div>';
+  $("manual-confidence").innerHTML = (manual.forecastCalibration ?? []).map((item) => `<div class="confidence-row"><strong>${escape(item.symbol)} · ${item.horizonMinutes}m</strong><span class="segment-${segmentClass(item.status)}">${escape(item.status)}</span><b>${item.measuredAccuracy == null ? "ACCURACY WARMUP" : pct(item.measuredAccuracy)}</b><small>${item.directionalSample ?? item.decisiveSample}/${item.minSample} apeluri direcționale · ${item.brierSample ?? item.decisiveSample}/${item.minSample} rezultate pentru Brier ${item.brierScore == null ? "—" : item.brierScore.toFixed(4)} · READY + WAIT · proxy Spot</small></div>`).join("") || '<div class="empty-card">Calibrarea rămâne WARMUP până la eșantionul minim prospectiv.</div>';
   $("manual-history").innerHTML = (manual.recent ?? []).slice(0, 12).map((signal) => `<div class="manual-history-row"><span>${time(signal.generatedAt)}</span><strong>${escape(signal.symbol)} · ${signal.horizonMinutes}m</strong><b class="${directionClass(signal.direction)}">${escape(directionMeta(signal.direction).label)}</b><span>${escape(localManualActionState(signal))}</span><span>${signal.qualityScore}/100</span><small>${escape(signal.proxyOutcome ?? signal.reasons?.at(-1) ?? "Înregistrat")}</small></div>`).join("") || '<div class="empty-card">Nu există încă istoric.</div>';
   notifyNewManualSignal(manual.ready ?? []);
   if (manualDeadlineTimer) clearTimeout(manualDeadlineTimer);

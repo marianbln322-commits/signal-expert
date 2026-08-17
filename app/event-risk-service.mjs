@@ -32,7 +32,7 @@ export class TradingEconomicsCalendarProvider {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const response = await this.fetchImpl(url, { signal: controller.signal, headers: { accept: "application/json", "user-agent": "signal-expert/0.7.0" } });
+      const response = await this.fetchImpl(url, { signal: controller.signal, headers: { accept: "application/json", "user-agent": "signal-expert/0.8.0" } });
       if (!response.ok) throw new Error(`${this.name} HTTP ${response.status}`);
       const payload = await response.json();
       if (!Array.isArray(payload)) throw new Error("Economic calendar response is not an array.");

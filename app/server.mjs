@@ -10,6 +10,9 @@ import { PaperService } from "./paper-service.mjs";
 import { AutonomousService } from "./autonomous-service.mjs";
 import { ManualSignalService } from "./manual-signal-service.mjs";
 import { EventRiskService, TradingEconomicsCalendarProvider } from "./event-risk-service.mjs";
+import { BinanceSpotStream } from "./binance-stream-provider.mjs";
+import { FeedObservabilityService } from "./feed-observability-service.mjs";
+import { StructureStateService } from "./structure-state-service.mjs";
 
 const jsonHeaders = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer", "x-frame-options": "DENY" };
 const types = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml" };
@@ -50,8 +53,12 @@ export async function createApplication(options = {}) {
     maxSpreadBpsBySymbol: { BTCUSDT: config.btcMaxSpreadBps, ETHUSDT: config.ethMaxSpreadBps },
     minTopNotional: config.minTopNotional,
     maxSourceSkewMs: config.maxSourceSkewMs,
+    feedRequired: config.marketStreamEnabled,
   };
-  const market = new MarketService({ provider, symbols: config.symbols, staleAfterMs: config.staleAfterMs, payoutRate: config.payoutRate, database, candidateThresholds: config.qualityThresholds, eventRisk, entryPolicy });
+  const observability = options.observability ?? new FeedObservabilityService({ database, staleAfterMs: config.streamStaleAfterMs });
+  const structureState = options.structureState ?? new StructureStateService({ database });
+  const stream = options.stream ?? (config.marketStreamEnabled ? new BinanceSpotStream({ baseUrl: config.binanceWsUrl, symbols: config.symbols, reconnectMinMs: config.streamReconnectMinMs, reconnectMaxMs: config.streamReconnectMaxMs, observability }) : null);
+  const market = new MarketService({ provider, symbols: config.symbols, staleAfterMs: config.staleAfterMs, payoutRate: config.payoutRate, database, candidateThresholds: config.qualityThresholds, eventRisk, entryPolicy, stream, streamEnabled: config.marketStreamEnabled, observability, structureState, reconcileMs: config.streamReconcileMs });
   const paper = new PaperService({ market, database, settings: { payoutRate: config.payoutRate, initialBankroll: config.initialBankroll, dailyLossLimit: config.dailyLossLimit, maxOpenPositions: config.maxOpenPositions, btcMaxStake: config.btcMaxStake, ethMaxStake: config.ethMaxStake } });
   const autonomous = new AutonomousService({ market, paper, database, settings: {
     enabled: config.autonomousEnabled && config.tradingMode === "paper", profile: config.autonomousProfile, scanMs: config.autonomousScanMs,
@@ -66,6 +73,7 @@ export async function createApplication(options = {}) {
     entryWindowMs: config.manualSignalEntryWindowMs,
     maxResolutionLagMs: config.manualSignalMaxResolutionLagMs,
     minDecisiveSample: config.manualSignalMinDecisiveSample,
+    forecastCalibrationMinSample: config.forecastCalibrationMinSample,
     confidenceGateEnabled: config.manualSignalConfidenceGateEnabled,
     qualityThreshold: config.qualityThresholds.standard,
     payoutRate: config.payoutRate,
@@ -92,7 +100,7 @@ export async function createApplication(options = {}) {
       catch { return sendJson(response, 403, { error: "ORIGIN_REJECTED", message: "Invalid origin" }); }
     }
     try {
-      if (request.method === "GET" && url.pathname === "/health") return sendJson(response, 200, { status: "ok", timestamp: new Date().toISOString(), mode: config.tradingMode, database: database.health(), eventRisk: eventRisk.status(), entryPolicy: { version: "entry-gates-v0.7.0", liveExecutionAvailable: false }, autonomousExecution: { mode: "PAPER_ONLY", enabled: config.autonomousEnabled && config.tradingMode === "paper", liveAvailable: false }, manualSignals: { mode: "MANUAL_SIGNALS_ONLY", enabled: config.manualSignalsEnabled && config.tradingMode === "paper", marketClassification: "SPOT_PROXY", settlementClassification: "NOT_EVENT_FUTURES_SETTLEMENT", liveExecutionAvailable: false }, liveExecution: { available: false, reason: "No verified MEXC Event Futures execution API is connected; the application supplies manual research signals and PAPER shadow outcomes only." } });
+      if (request.method === "GET" && url.pathname === "/health") return sendJson(response, 200, { status: "ok", timestamp: new Date().toISOString(), instance: config.instance, host: config.host, port: config.port, mode: config.tradingMode, database: database.health(), feed: market.feeds(), eventRisk: eventRisk.status(), entryPolicy: { version: "entry-gates-v0.8.0", liveExecutionAvailable: false }, autonomousExecution: { mode: "PAPER_ONLY", enabled: config.autonomousEnabled && config.tradingMode === "paper", liveAvailable: false }, manualSignals: { mode: "MANUAL_SIGNALS_ONLY", enabled: config.manualSignalsEnabled && config.tradingMode === "paper", marketClassification: "SPOT_PROXY", settlementClassification: "NOT_EVENT_FUTURES_SETTLEMENT", liveExecutionAvailable: false }, liveExecution: { available: false, reason: "No verified MEXC Event Futures execution API is connected; the application supplies manual research signals and PAPER shadow outcomes only." } });
       if (request.method === "GET" && url.pathname === "/api/v1/dashboard") {
         if (url.searchParams.getAll("symbol").length !== 1) throw new Error("Invalid symbol query");
         const requestedSymbol = url.searchParams.get("symbol"); const symbol = requestedSymbol?.toUpperCase();
@@ -103,6 +111,8 @@ export async function createApplication(options = {}) {
       }
       if (request.method === "GET" && url.pathname === "/api/v1/event-risk") return sendJson(response, 200, eventRisk.status());
       if (request.method === "GET" && url.pathname === "/api/v1/sources") return sendJson(response, 200, { timestamp: new Date().toISOString(), sources: market.sources() });
+      if (request.method === "GET" && url.pathname === "/api/v1/feeds") return sendJson(response, 200, { timestamp: new Date().toISOString(), instance: config.instance, feed: market.feeds() });
+      if (request.method === "GET" && url.pathname === "/api/v1/alerts") return sendJson(response, 200, { timestamp: new Date().toISOString(), instance: config.instance, alerts: database.operationalAlerts({ status: url.searchParams.get("status") || null, limit: 100 }) });
       if (request.method === "GET" && url.pathname.startsWith("/api/v1/market/")) { const symbol = url.pathname.split("/").at(-1).toUpperCase(); const snapshot = market.snapshot(symbol); return snapshot ? sendJson(response, 200, snapshot) : sendJson(response, 404, { error: "NOT_FOUND", message: "Symbol not configured" }); }
       if (request.method === "GET" && url.pathname === "/api/v1/paper/account") return sendJson(response, 200, paper.account());
       if (request.method === "GET" && url.pathname === "/api/v1/autonomous/status") return sendJson(response, 200, autonomous.status());
@@ -130,13 +140,13 @@ export async function createApplication(options = {}) {
     finally { if (Date.now() - started > 1000) console.warn(JSON.stringify({ level: "warn", event: "slow_request", path: url.pathname, durationMs: Date.now() - started })); }
   });
   await eventRisk.start(); await market.start(config.tickerPollMs, config.candlePollMs); paper.initialize(); autonomous.start(); manualSignals.start();
-  return { server, market, paper, autonomous, manualSignals, eventRisk, database, async close() { manualSignals.stop(); market.stop(); autonomous.stop(); paper.stop(); eventRisk.stop(); if (server.listening) await new Promise((done) => server.close(done)); database.close(); } };
+  return { server, market, paper, autonomous, manualSignals, eventRisk, observability, database, async close() { manualSignals.stop(); await market.stop(); autonomous.stop(); paper.stop(); eventRisk.stop(); if (server.listening) await new Promise((done) => server.close(done)); database.close(); } };
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 if (isMain) {
   const application = await createApplication();
-  application.server.listen(config.port, config.host, () => console.log(JSON.stringify({ level: "info", event: "server_started", url: `http://localhost:${config.port}`, mode: config.tradingMode })));
+  application.server.listen(config.port, config.host, () => console.log(JSON.stringify({ level: "info", event: "server_started", url: `http://localhost:${config.port}`, instance: config.instance, streamEnabled: config.marketStreamEnabled, mode: config.tradingMode })));
   const shutdown = async () => { await application.close(); process.exit(0); };
   process.on("SIGINT", shutdown); process.on("SIGTERM", shutdown);
 }

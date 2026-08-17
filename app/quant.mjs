@@ -5,7 +5,7 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 export const QUALITY_THRESHOLDS = Object.freeze({ standard: 68, high: 78, exceptional: 88 });
 export const STAKE_PROFILES = Object.freeze({ FLAT: "FLAT", ADAPTIVE_CAPPED: "ADAPTIVE_CAPPED", OBSERVED_10_30_90_270: "OBSERVED_10_30_90_270" });
 const AUTONOMOUS_STRATEGY = "completed-candle-mtf-entry-gates";
-export const AUTONOMOUS_STRATEGY_VERSION = "0.7.0";
+export const AUTONOMOUS_STRATEGY_VERSION = "0.8.0";
 const analysisTimeframes = ["1m", "5m", "15m", "1h"];
 
 export function sma(values, period) {
@@ -362,6 +362,38 @@ export function detectCorrectionState(candles, trendDirection, atrValue, support
   return { status, trendDirection, correctionDirection: trendDirection === "UP" ? "DOWN" : "UP", depthAtr: reportedDepthAtr, depthBps: reportedDepthBps, durationBars, counterMoves, historicalCorrectionObserved: historicalCorrection.observed, severity, targetLevel, levelInteraction, confirmedAt: new Date(current.closeTime).toISOString(), text, classification: "COMPLETED_CANDLE_CORRECTION_STATE_NOT_FORECAST_CERTAINTY" };
 }
 
+export function detectMarketRegime(completed, analyses, structureFeatures) {
+  const votes = ["5m", "15m", "1h"].map((timeframe) => {
+    const structure = structureFeatures[timeframe]?.structureDirection;
+    if (structure === "UP") return 1;
+    if (structure === "DOWN") return -1;
+    return regimeDirection(analyses[timeframe]);
+  });
+  const directionalVotes = votes.filter((vote) => vote !== 0);
+  const agreement = Math.abs(votes.reduce((sum, vote) => sum + vote, 0));
+  const latestShifts = ["5m", "15m"].map((timeframe) => structureFeatures[timeframe]?.structureEvidence?.latestShift?.direction).filter(Boolean);
+  const conflictingShift = latestShifts.length > 1 && new Set(latestShifts).size > 1;
+  const phase = conflictingShift || (directionalVotes.includes(1) && directionalVotes.includes(-1)) ? "TRANSITION" : agreement >= 2 ? "TREND" : "RANGE";
+  const oneMinute = completed["1m"] ?? [];
+  const rangeFractions = oneMinute.slice(-80).map((candle) => candle.close > 0 ? (candle.high - candle.low) / candle.close : null).filter(Number.isFinite);
+  const currentAtr = analyses["1m"]?.indicators?.atr14;
+  const currentPrice = oneMinute.at(-1)?.close;
+  const atrFraction = Number.isFinite(currentAtr) && currentPrice > 0 ? currentAtr / currentPrice : null;
+  const percentile = atrFraction === null || !rangeFractions.length ? null : rangeFractions.filter((value) => value <= atrFraction).length / rangeFractions.length;
+  const sortedRanges = [...rangeFractions].sort((left, right) => left - right);
+  const medianRange = sortedRanges.length ? sortedRanges[Math.floor(sortedRanges.length / 2)] : null;
+  const relativeExpansion = atrFraction !== null && medianRange > 0 ? atrFraction / medianRange : null;
+  const volatility = atrFraction === null ? "UNAVAILABLE"
+    : atrFraction > 0.015 || (percentile >= 0.95 && relativeExpansion >= 2.5) ? "EXTREME"
+      : atrFraction > 0.008 || (percentile >= 0.85 && relativeExpansion >= 1.5) ? "HIGH"
+        : percentile <= 0.25 ? "LOW" : "NORMAL";
+  return {
+    phase, volatility, direction: agreement === 0 ? "NEUTRAL" : votes.reduce((sum, vote) => sum + vote, 0) > 0 ? "UP" : "DOWN",
+    votes: { "5m": votes[0], "15m": votes[1], "1h": votes[2] }, agreement, conflictingShift, atrFraction, volatilityPercentile: percentile, relativeExpansion,
+    classification: "COMPLETED_CANDLE_COMPOSITE_REGIME",
+  };
+}
+
 export function generateSignals(candles, options = {}) {
   const thresholds = { ...QUALITY_THRESHOLDS, ...(options.thresholds ?? {}) };
   const symbol = options.symbol ?? "UNKNOWN";
@@ -380,9 +412,24 @@ export function generateSignals(candles, options = {}) {
   const triggerValidUntil = triggerCloseMs === null ? null : new Date(triggerCloseMs + (options.triggerGraceMs ?? 90000)).toISOString();
   const fiveMinuteDirection = structureFeatures["5m"].structureDirection ?? "NEUTRAL";
   const complete = analysisTimeframes.every((timeframe) => completed[timeframe].length >= 50 && timeframeCloseWatermarks[timeframe]);
+  const marketRegime = detectMarketRegime(completed, analyses, structureFeatures);
+  const weightMatrix = {
+    TREND: {
+      10: { trigger: 0.38, "5m": 0.31, "15m": 0.21, "1h": 0.1 },
+      30: { trigger: 0.12, "5m": 0.2, "15m": 0.31, "1h": 0.37 },
+    },
+    RANGE: {
+      10: { trigger: 0.5, "5m": 0.2, "15m": 0.2, "1h": 0.1 },
+      30: { trigger: 0.22, "5m": 0.23, "15m": 0.3, "1h": 0.25 },
+    },
+    TRANSITION: {
+      10: { trigger: 0.34, "5m": 0.3, "15m": 0.24, "1h": 0.12 },
+      30: { trigger: 0.1, "5m": 0.22, "15m": 0.34, "1h": 0.34 },
+    },
+  };
   const definitions = [
-    { horizonMinutes: 10, weights: { trigger: 0.42, "5m": 0.28, "15m": 0.2, "1h": 0.1 }, emphasis: "1m trigger with 5m/15m context", invalidationTimeframe: "5m" },
-    { horizonMinutes: 30, weights: { trigger: 0.15, "5m": 0.2, "15m": 0.3, "1h": 0.35 }, emphasis: "1h/15m structure with 5m confirmation", invalidationTimeframe: "15m" },
+    { horizonMinutes: 10, weights: weightMatrix[marketRegime.phase][10], emphasis: `${marketRegime.phase.toLowerCase()}-regime 1m trigger with 5m/15m context`, invalidationTimeframe: "5m" },
+    { horizonMinutes: 30, weights: weightMatrix[marketRegime.phase][30], emphasis: `${marketRegime.phase.toLowerCase()}-regime 1h/15m structure with 5m confirmation`, invalidationTimeframe: "15m" },
   ];
   return definitions.map(({ horizonMinutes, weights, emphasis, invalidationTimeframe }) => {
     const directions = Object.fromEntries(analysisTimeframes.map((timeframe) => [timeframe, regimeDirection(analyses[timeframe])]));
@@ -419,8 +466,8 @@ export function generateSignals(candles, options = {}) {
     const opposingStructureWeight = confluenceComponents.filter((item) => item.active && item.direction !== "NEUTRAL" && item.direction !== intendedLabel).reduce((sum, item) => sum + item.weight, 0);
     const structureAdjustment = intendedDirection === 0 ? 0 : Math.round(clamp((alignedStructureWeight - opposingStructureWeight) * 0.4, -8, 8));
     const structureContradicted = confluenceComponents.some((item) => item.active && item.key === "market_structure_shift_15m" && item.direction !== intendedLabel);
-    const price = current?.close ?? 0; const triggerAtr = analyses["1m"].indicators.atr14; const atrFraction = price > 0 && triggerAtr !== null ? triggerAtr / price : Infinity;
-    const volatilityRegime = atrFraction > 0.015 ? "EXTREME" : atrFraction > 0.008 ? "HIGH" : "NORMAL";
+    const price = current?.close ?? 0; const triggerAtr = analyses["1m"].indicators.atr14; const atrFraction = marketRegime.atrFraction ?? Infinity;
+    const volatilityRegime = marketRegime.volatility;
     const relativeVolume = analyses["1m"].indicators.relativeVolume20;
     const volumeBonus = relativeVolume !== null && relativeVolume >= 1.3 ? 4 : relativeVolume !== null && relativeVolume >= 1.05 ? 2 : 0;
     const patternBonus = oneMinuteTrigger.patterns.reduce((sum, pattern) => sum + pattern.weight, 0) >= 4 ? 4 : oneMinuteTrigger.patterns.length ? 2 : 0;
@@ -532,14 +579,14 @@ export function generateSignals(candles, options = {}) {
     const fifteenMinuteDirection = regimeDirection(analyses["15m"]) > 0 ? "UP" : regimeDirection(analyses["15m"]) < 0 ? "DOWN" : "NEUTRAL";
     const fifteenMinuteAligned = intendedLabel !== "NEUTRAL" && fifteenMinuteDirection === intendedLabel && !structureContradicted;
     const reasons = complete
-      ? [`${horizonMinutes}m emphasizes ${emphasis}.`, `Technical direction split is ${forecast.upPercent}% UP / ${forecast.downPercent}% DOWN (${forecast.confidence}); this is an uncalibrated rules estimate, not win probability.`, `Completed 1m flow is ${oneMinuteFlow.direction} at ${oneMinuteFlow.strengthPercent}% strength with ${oneMinuteFlow.momentum.toLowerCase()} momentum across ${oneMinuteFlow.bars} bars.`, `Completed 5m trend is ${fiveMinuteTrend.establishedDirection ?? fiveMinuteTrend.direction}; outlook is ${fiveMinuteTrend.outlook} at ${fiveMinuteTrend.confidencePercent}% agreement.`, `${correction.text} Level interaction: ${correction.levelInteraction?.status ?? "UNAVAILABLE"}.`, `Completed 1m trigger ${oneMinuteTrigger.direction} uses ${oneMinuteTrigger.patterns.map((pattern) => pattern.name).join(", ") || "no qualifying pattern"}; explicit 5m structure is ${fiveMinuteDirection}.`, `Completed-candle confluence produced setup quality ${qualityScore}/100 (${band}); quality is an auditable rules score, NOT a probability.`, `Market-structure adjustment is ${structureAdjustment >= 0 ? "+" : ""}${structureAdjustment} points from ${alignedStructureWeight} aligned versus ${opposingStructureWeight} opposing component weight.`, `1m relative volume is ${relativeVolume === null ? "unavailable" : `${relativeVolume.toFixed(2)}x`} and volatility is ${volatilityRegime}.`, !structuralAlignment ? "Entry blocked: the completed 1m trigger is not explicitly confirmed by aligned 5m structure and higher-timeframe context." : correctionBlocksEntry ? `Entry blocked: ${correction.text}` : structureContradicted ? "A recent opposing 15m CHoCH/market-structure shift blocks entry." : volatilityRegime === "EXTREME" ? "Extreme 1m ATR volatility blocks entry." : invalidationPrice === null ? "A finite, unbreached, direction-appropriate structural invalidation level from the declared timeframe is required before entry." : direction === "WAIT" ? `Quality is below the STANDARD threshold ${thresholds.standard}.` : `${direction} alignment qualifies as ${band}.`, invalidation]
+      ? [`${horizonMinutes}m emphasizes ${emphasis}.`, `Composite market regime is ${marketRegime.phase} / ${marketRegime.volatility} volatility with ${marketRegime.direction} higher-timeframe vote; horizon weights are persisted in the candidate.`, `Technical direction split is ${forecast.upPercent}% UP / ${forecast.downPercent}% DOWN (${forecast.confidence}); this is an uncalibrated rules estimate, not win probability.`, `Completed 1m flow is ${oneMinuteFlow.direction} at ${oneMinuteFlow.strengthPercent}% strength with ${oneMinuteFlow.momentum.toLowerCase()} momentum across ${oneMinuteFlow.bars} bars.`, `Completed 5m trend is ${fiveMinuteTrend.establishedDirection ?? fiveMinuteTrend.direction}; outlook is ${fiveMinuteTrend.outlook} at ${fiveMinuteTrend.confidencePercent}% agreement.`, `${correction.text} Level interaction: ${correction.levelInteraction?.status ?? "UNAVAILABLE"}.`, `Completed 1m trigger ${oneMinuteTrigger.direction} uses ${oneMinuteTrigger.patterns.map((pattern) => pattern.name).join(", ") || "no qualifying pattern"}; explicit 5m structure is ${fiveMinuteDirection}.`, `Completed-candle confluence produced setup quality ${qualityScore}/100 (${band}); quality is an auditable rules score, NOT a probability.`, `Market-structure adjustment is ${structureAdjustment >= 0 ? "+" : ""}${structureAdjustment} points from ${alignedStructureWeight} aligned versus ${opposingStructureWeight} opposing component weight.`, `1m relative volume is ${relativeVolume === null ? "unavailable" : `${relativeVolume.toFixed(2)}x`} and volatility is ${volatilityRegime}.`, !structuralAlignment ? "Entry blocked: the completed 1m trigger is not explicitly confirmed by aligned 5m structure and higher-timeframe context." : correctionBlocksEntry ? `Entry blocked: ${correction.text}` : structureContradicted ? "A recent opposing 15m CHoCH/market-structure shift blocks entry." : volatilityRegime === "EXTREME" ? "Extreme 1m ATR volatility blocks entry." : invalidationPrice === null ? "A finite, unbreached, direction-appropriate structural invalidation level from the declared timeframe is required before entry." : direction === "WAIT" ? `Quality is below the STANDARD threshold ${thresholds.standard}.` : `${direction} alignment qualifies as ${band}.`, invalidation]
       : ["All four timeframes require at least 50 completed candles and a close watermark for EMA50/structure context.", invalidation];
     const watermarkKey = analysisTimeframes.map((timeframe) => `${timeframe}:${timeframeCloseWatermarks[timeframe] ?? "missing"}`).join("|");
     return {
       decisionKey: `${AUTONOMOUS_STRATEGY_VERSION}:${symbol}:${horizonMinutes}:${watermarkKey}`,
       symbol, horizonMinutes, direction, setupDirection: intendedLabel, actionableDirection: qualified ? intendedLabel : null, qualified,
       forecast, correction, levelInteractions: { support: supportInteraction, resistance: resistanceInteraction },
-      qualityScore, qualityBand: band, volatilityRegime, referencePrice: Number.isFinite(price) && price > 0 ? price : null,
+      qualityScore, qualityBand: band, volatilityRegime, marketRegime: { ...marketRegime, horizonWeights: weights }, referencePrice: Number.isFinite(price) && price > 0 ? price : null,
       timeframeCloseWatermarks: { ...timeframeCloseWatermarks }, triggerValidUntil, reasons, confluenceComponents,
       technicalFeatures: {
         oneMinuteTrigger,
@@ -594,7 +641,7 @@ export function analyzeMarket(candles, payoutRate, now = new Date(), options = {
   if (indicators.support !== null) invalidation.push(`Bullish scenario invalid below 1m support ${indicators.support.toFixed(2)}.`);
   if (indicators.resistance !== null) invalidation.push(`Bearish scenario invalid above 1m resistance ${indicators.resistance.toFixed(2)}.`);
   const candidates = generateSignals(completedCandles, options);
-  return { direction, upScore, downScore, technicalUpProbability, technicalDownProbability, confidence: Math.abs(difference) >= 30 ? "HIGH" : Math.abs(difference) >= 15 ? "MEDIUM" : "LOW", calibrationStatus: "UNCALIBRATED", breakEvenProbability: breakEven, heuristicProbability, reasons, invalidation, timeframes, candidates, classification: "MODEL_ESTIMATE", modelVersion: "rules-v0.7.0", calculatedAt: now.toISOString() };
+  return { direction, upScore, downScore, technicalUpProbability, technicalDownProbability, confidence: Math.abs(difference) >= 30 ? "HIGH" : Math.abs(difference) >= 15 ? "MEDIUM" : "LOW", calibrationStatus: "UNCALIBRATED", breakEvenProbability: breakEven, heuristicProbability, reasons, invalidation, timeframes, candidates, classification: "MODEL_ESTIMATE", modelVersion: "rules-v0.8.0", calculatedAt: now.toISOString() };
 }
 export function adaptiveStake(input) {
   const reasons = []; const breakEven = breakEvenProbability(input.payoutRate);

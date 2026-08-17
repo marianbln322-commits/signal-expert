@@ -39,6 +39,20 @@ export function evaluateEntryGates({ snapshot, candidate, policy, now = new Date
   const checks = [];
   const add = (code, passed, reason, evidence = null, skipped = false) => checks.push({ code, status: skipped ? "SKIPPED" : passed ? "PASS" : "BLOCKED", reason, evidence });
   const direction = candidate?.direction;
+  const feed = snapshot?.health?.feed;
+  if (policy.feedRequired) add("FEED_HEALTH", feed?.actionReady === true, feed?.actionReady === true ? "All required Binance event-stream channels are LIVE." : `Required event stream is ${feed?.status ?? "UNAVAILABLE"}; entry fails closed.`, feed ?? null);
+  else add("FEED_HEALTH", true, "Event-stream mode is disabled for this backward-compatible instance.", { status: "DISABLED" }, true);
+  const persistedCorrection = candidate?.persistentState?.correction;
+  const correctionEvidence = persistedCorrection ? { ...(persistedCorrection.payload ?? {}), status: persistedCorrection.state, version: persistedCorrection.version, updatedAt: persistedCorrection.updatedAt } : candidate?.correction;
+  const correctionStatus = correctionEvidence?.status ?? "UNAVAILABLE";
+  const correctionPassed = ["NO_CORRECTION", "CORRECTION_END_CONFIRMED"].includes(correctionStatus);
+  add("CORRECTION_STATE", correctionPassed, correctionPassed ? `Persisted correction state permits entry: ${correctionStatus}.` : `Persisted correction state ${correctionStatus} does not permit entry.`, correctionEvidence ?? null);
+  const setupDirection = candidate?.setupDirection ?? candidate?.technicalFeatures?.oneMinuteTrigger?.direction;
+  const levelKind = setupDirection === "UP" ? "support" : setupDirection === "DOWN" ? "resistance" : null;
+  const persistedLevel = levelKind ? candidate?.persistentState?.levels?.[levelKind] : null;
+  const relevantLevel = persistedLevel ? { ...(persistedLevel.payload?.interaction ?? {}), status: persistedLevel.state, version: persistedLevel.version, updatedAt: persistedLevel.updatedAt } : levelKind ? candidate?.levelInteractions?.[levelKind] : null;
+  const levelPassed = relevantLevel && !["BREAK_PENDING_CONFIRMATION", "BREAK_CONFIRMED"].includes(relevantLevel.status) && relevantLevel.hasConfirmedBreak !== true;
+  add("LEVEL_STATE", Boolean(levelPassed), levelPassed ? `${relevantLevel.kind} persisted state ${relevantLevel.status} permits entry.` : "The direction-relevant persisted level is unavailable, pending break confirmation, or confirmed broken.", relevantLevel ?? null);
   add("DIRECTION", direction === "UP" || direction === "DOWN", direction === "UP" || direction === "DOWN" ? `Directional candidate is ${direction}.` : "Candidate is not directional.", { direction });
   add("QUALITY", Number.isFinite(candidate?.qualityScore) && candidate.qualityScore >= policy.qualityThreshold, Number.isFinite(candidate?.qualityScore) ? `Setup quality ${candidate.qualityScore}/100; minimum ${policy.qualityThreshold}.` : "Setup quality is unavailable.", { qualityScore: candidate?.qualityScore ?? null, minimum: policy.qualityThreshold });
   add("FINITE_INVALIDATION", Number.isFinite(candidate?.invalidationPrice), Number.isFinite(candidate?.invalidationPrice) ? `Finite structural invalidation ${candidate.invalidationPrice}.` : "A finite structural invalidation is required.", { invalidationPrice: candidate?.invalidationPrice ?? null });
@@ -46,12 +60,12 @@ export function evaluateEntryGates({ snapshot, candidate, policy, now = new Date
   const trigger = candidate?.technicalFeatures?.oneMinuteTrigger;
   const confirmation = candidate?.technicalFeatures?.fiveMinuteConfirmation;
   const fifteenMinute = candidate?.technicalFeatures?.fifteenMinuteAlignment;
-  const setupDirection = candidate?.setupDirection ?? trigger?.direction;
+  const triggerSetupDirection = candidate?.setupDirection ?? trigger?.direction;
   const aligned = trigger?.direction && trigger.direction !== "NEUTRAL" && trigger.direction === confirmation?.direction && confirmation?.status === "CONFIRMED";
-  const fifteenAligned = ["UP", "DOWN"].includes(setupDirection) && fifteenMinute?.status === "ALIGNED" && fifteenMinute.direction === setupDirection;
+  const fifteenAligned = ["UP", "DOWN"].includes(triggerSetupDirection) && fifteenMinute?.status === "ALIGNED" && fifteenMinute.direction === triggerSetupDirection;
   add("COMPLETED_1M_TRIGGER", trigger?.closed === true && ["UP", "DOWN"].includes(trigger?.direction), trigger?.closed === true ? `Completed 1m trigger is ${trigger.direction}.` : "No completed directional 1m candlestick trigger is available.", trigger ?? null);
   add("FIVE_MINUTE_CONFIRMATION", aligned, aligned ? `5m structure confirms ${trigger.direction}.` : `1m ${trigger?.direction ?? "NEUTRAL"} trigger is not confirmed by explicit 5m structure ${confirmation?.direction ?? "NEUTRAL"}.`, confirmation ?? null);
-  add("FIFTEEN_MINUTE_ALIGNMENT", fifteenAligned, fifteenAligned ? `Completed 15m trend aligns ${setupDirection}.` : `Completed 15m trend ${fifteenMinute?.direction ?? "NEUTRAL"} does not align the ${setupDirection ?? "NEUTRAL"} setup.`, fifteenMinute ?? null);
+  add("FIFTEEN_MINUTE_ALIGNMENT", fifteenAligned, fifteenAligned ? `Completed 15m trend aligns ${triggerSetupDirection}.` : `Completed 15m trend ${fifteenMinute?.direction ?? "NEUTRAL"} does not align the ${triggerSetupDirection ?? "NEUTRAL"} setup.`, fifteenMinute ?? null);
   const validUntil = timestamp(candidate?.triggerValidUntil);
   add("TRIGGER_FRESHNESS", validUntil !== null && now.getTime() < validUntil, validUntil === null ? "Trigger deadline is unavailable." : now.getTime() < validUntil ? `Trigger remains valid until ${candidate.triggerValidUntil}.` : `Trigger expired at ${candidate.triggerValidUntil}.`, { triggerValidUntil: candidate?.triggerValidUntil ?? null, evaluatedAt: now.toISOString() });
 
@@ -84,7 +98,7 @@ export function evaluateEntryGates({ snapshot, candidate, policy, now = new Date
   return {
     allowed: checks.every((check) => check.status !== "BLOCKED"),
     classification: "AUDITABLE_ENTRY_POLICY_PAPER_AND_MANUAL_ONLY",
-    policyVersion: "entry-gates-v0.7.0",
+    policyVersion: "entry-gates-v0.8.0",
     evaluatedAt: now.toISOString(),
     checks,
     orderBook: metrics,

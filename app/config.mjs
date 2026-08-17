@@ -50,11 +50,18 @@ const primaryMarketBaseUrl = (explicitPrimaryMarketUrl ?? "https://data-api.bina
 const fallbackMarketBaseUrl = (legacyBinanceFallback ? (process.env.MEXC_SPOT_BASE_URL ?? "https://api.mexc.com") : legacyFallbackUrl ?? process.env.MEXC_SPOT_BASE_URL ?? "https://api.mexc.com").replace(/\/$/, "");
 
 export const config = Object.freeze({
+  instance: (process.env.SIGNAL_EXPERT_INSTANCE ?? "default").trim() || "default",
   host: process.env.API_HOST ?? "127.0.0.1",
   port: numberValue("API_PORT", 4100, { min: 1, max: 65535, integer: true }),
   primaryMarketBaseUrl,
   fallbackMarketBaseUrl,
   marketFailoverEnabled: booleanValue("MARKET_FAILOVER_ENABLED", true),
+  marketStreamEnabled: booleanValue("MARKET_STREAM_ENABLED", false),
+  binanceWsUrl: (process.env.BINANCE_WS_URL ?? "wss://stream.binance.com:9443").replace(/\/$/, ""),
+  streamReconnectMinMs: numberValue("STREAM_RECONNECT_MIN_MS", 1000, { min: 250, max: 30000, integer: true }),
+  streamReconnectMaxMs: numberValue("STREAM_RECONNECT_MAX_MS", 30000, { min: 1000, max: 300000, integer: true }),
+  streamStaleAfterMs: numberValue("STREAM_STALE_AFTER_MS", 15000, { min: 3000, max: 300000, integer: true }),
+  streamReconcileMs: numberValue("STREAM_RECONCILE_MS", 60000, { min: 10000, max: 3600000, integer: true }),
   providerTimeoutMs: numberValue("PROVIDER_TIMEOUT_MS", 5000, { min: 1000, max: 30000, integer: true }),
   providerAttempts: numberValue("PROVIDER_ATTEMPTS", 2, { min: 1, max: 5, integer: true }),
   symbols,
@@ -100,6 +107,7 @@ export const config = Object.freeze({
   manualSignalEntryWindowMs: numberValue("MANUAL_SIGNAL_ENTRY_WINDOW_MS", 30000, { min: 5000, max: 120000, integer: true }),
   manualSignalMaxResolutionLagMs: numberValue("MANUAL_SIGNAL_MAX_RESOLUTION_LAG_MS", 30000, { min: 1000, max: 300000, integer: true }),
   manualSignalMinDecisiveSample: numberValue("MANUAL_SIGNAL_MIN_DECISIVE_SAMPLE", 20, { min: 1, max: 10000, integer: true }),
+  forecastCalibrationMinSample: numberValue("FORECAST_CALIBRATION_MIN_SAMPLE", 50, { min: 10, max: 10000, integer: true }),
   manualSignalConfidenceGateEnabled: booleanValue("MANUAL_SIGNAL_CONFIDENCE_GATE_ENABLED", true),
   qualityThresholds,
   observedLadder,
