@@ -1,0 +1,399 @@
+import { mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+const positionColumns = `id,symbol,direction,horizon_minutes AS horizonMinutes,stake,payout_rate AS payoutRate,entry_price AS entryPrice,opened_at AS openedAt,resolves_at AS resolvesAt,status,settlement_price AS settlementPrice,settled_at AS settledAt,pnl,signal_version AS signalVersion,source_name AS sourceName,source_timestamp AS sourceTimestamp,settlement_reason AS settlementReason,origin,decision_id AS decisionId,strategy_name AS strategyName,strategy_version AS strategyVersion,quality_score AS qualityScore,stake_profile AS stakeProfile,recovery_stage AS recoveryStage,entry_gate_json AS entryGateJson`;
+const decisionColumns = `id,decision_key AS decisionKey,symbol,horizon_minutes AS horizonMinutes,direction,quality_score AS qualityScore,quality_band AS qualityBand,timeframe_watermarks_json AS timeframeWatermarksJson,strategy_name AS strategyName,strategy_version AS strategyVersion,profile,stage,action,stake,reasons_json AS reasonsJson,details_json AS detailsJson,invalidation_json AS invalidationJson,invalidation_price AS invalidationPrice,paper_position_id AS paperPositionId,created_at AS createdAt,updated_at AS updatedAt`;
+const manualSignalColumns = `id,candidate_key AS candidateKey,symbol,horizon_minutes AS horizonMinutes,direction,lifecycle_status AS status,quality_score AS qualityScore,quality_band AS qualityBand,reasons_json AS reasonsJson,details_json AS detailsJson,timeframe_watermarks_json AS timeframeWatermarksJson,invalidation_json AS invalidationJson,invalidation_price AS invalidationPrice,strategy_name AS strategyName,strategy_version AS strategyVersion,generated_at AS generatedAt,entry_price AS entryPrice,entry_at AS entryAt,entry_valid_until AS entryValidUntil,resolves_at AS resolvesAt,entry_source_json AS entrySourceJson,candle_sources_json AS candleSourcesJson,market_classification AS marketClassification,settlement_classification AS settlementClassification,proxy_outcome AS proxyOutcome,resolution_price AS resolutionPrice,resolution_source_json AS resolutionSourceJson,resolved_at AS resolvedAt,expired_at AS expiredAt,created_at AS createdAt`;
+
+function decodeJson(value, fallback) {
+  try { return typeof value === "string" ? JSON.parse(value) : fallback; } catch { return fallback; }
+}
+function decodeEntryGate(value) {
+  if (typeof value !== "string") return { classification: "ENTRY_GATE_AUDIT_MISSING", policyVersion: null, reason: "No entry-gate audit payload was stored." };
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : { classification: "ENTRY_GATE_AUDIT_CORRUPT", policyVersion: null, reason: "Stored entry-gate audit payload is not an object." };
+  } catch {
+    return { classification: "ENTRY_GATE_AUDIT_CORRUPT", policyVersion: null, reason: "Stored entry-gate audit payload is invalid JSON." };
+  }
+}
+function decodePosition(row) {
+  if (!row) return null;
+  const { entryGateJson, ...position } = row;
+  return { ...position, entryGate: decodeEntryGate(entryGateJson) };
+}
+function wilson95(wins, sample) {
+  if (!sample) return { lower: null, upper: null };
+  const z = 1.959963984540054; const proportion = wins / sample; const denominator = 1 + z ** 2 / sample;
+  const center = (proportion + z ** 2 / (2 * sample)) / denominator;
+  const margin = z * Math.sqrt((proportion * (1 - proportion) + z ** 2 / (4 * sample)) / sample) / denominator;
+  return { lower: Math.max(0, center - margin), upper: Math.min(1, center + margin) };
+}
+
+export class Database {
+  constructor(path, migrationDirectory) {
+    mkdirSync(dirname(path), { recursive: true });
+    this.path = path; this.migrationDirectory = migrationDirectory;
+    this.db = new DatabaseSync(path, { enableForeignKeyConstraints: true });
+    this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;");
+    this.migrate();
+  }
+  migrate() {
+    this.db.exec("CREATE TABLE IF NOT EXISTS schema_migrations(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)");
+    const applied = this.db.prepare("SELECT 1 FROM schema_migrations WHERE name = ?");
+    const record = this.db.prepare("INSERT INTO schema_migrations(name) VALUES(?)");
+    for (const file of readdirSync(this.migrationDirectory).filter((name) => name.endsWith(".sql")).sort()) {
+      if (applied.get(file)) continue;
+      this.db.exec("BEGIN IMMEDIATE");
+      try { this.db.exec(readFileSync(resolve(this.migrationDirectory, file), "utf8")); record.run(file); this.db.exec("COMMIT"); }
+      catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    }
+  }
+  health() { return { available: true, mode: "sqlite", path: this.path, error: null }; }
+  insertSignal(symbol, analysis, sourceTimestamp) {
+    this.db.prepare("INSERT INTO signal_snapshots(symbol,direction,up_score,down_score,model_version,source_timestamp,calculated_at,payload_json) VALUES(?,?,?,?,?,?,?,?)").run(symbol, analysis.direction, analysis.upScore, analysis.downScore, analysis.modelVersion, sourceTimestamp, analysis.calculatedAt, JSON.stringify(analysis));
+  }
+  upsertPosition(position) {
+    this.db.prepare(`INSERT INTO paper_positions(id,symbol,direction,horizon_minutes,stake,payout_rate,entry_price,opened_at,resolves_at,status,settlement_price,settled_at,pnl,signal_version,source_name,source_timestamp,settlement_reason,origin,decision_id,strategy_name,strategy_version,quality_score,stake_profile,recovery_stage,entry_gate_json)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,settlement_price=excluded.settlement_price,settled_at=excluded.settled_at,pnl=excluded.pnl,settlement_reason=excluded.settlement_reason`).run(
+      position.id, position.symbol, position.direction, position.horizonMinutes, position.stake, position.payoutRate, position.entryPrice,
+      position.openedAt, position.resolvesAt, position.status, position.settlementPrice, position.settledAt, position.pnl,
+      position.signalVersion, position.sourceName, position.sourceTimestamp, position.settlementReason ?? null,
+      position.origin ?? "MANUAL", position.decisionId ?? null, position.strategyName ?? null, position.strategyVersion ?? null,
+      position.qualityScore ?? null, position.stakeProfile ?? null, position.recoveryStage ?? null, JSON.stringify(position.entryGate ?? { classification: "ENTRY_GATE_AUDIT_MISSING_AT_WRITE", policyVersion: null, reason: "Position was written without an entry-gate snapshot." }),
+    );
+  }
+  commitAutonomousOpen(position, { reasons, state, updatedAt }) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.upsertPosition(position);
+      this.updateAutonomousDecision(position.decisionId, { action: "OPEN", stake: position.stake, reasons, paperPositionId: position.id, updatedAt });
+      this.saveAutonomousState({ ...state, currentPositionId: position.id, updatedAt });
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  positions() { return this.db.prepare(`SELECT ${positionColumns} FROM paper_positions ORDER BY opened_at DESC`).all().map((row) => decodePosition(row)); }
+  openAutonomousPosition() { return decodePosition(this.db.prepare(`SELECT ${positionColumns} FROM paper_positions WHERE origin='AUTONOMOUS' AND status='OPEN' ORDER BY opened_at LIMIT 1`).get()); }
+  autonomousPositions() { return this.db.prepare(`SELECT ${positionColumns} FROM paper_positions WHERE origin='AUTONOMOUS' ORDER BY opened_at DESC`).all().map((row) => decodePosition(row)); }
+  createAutonomousDecision(decision) {
+    const details = decision.details ?? {
+      volatilityRegime: decision.volatilityRegime ?? null,
+      confluenceComponents: decision.confluenceComponents ?? [],
+      structureFeatures: decision.structureFeatures ?? {},
+      technicalFeatures: decision.technicalFeatures ?? {},
+      qualityDefinition: decision.qualityDefinition ?? null,
+    };
+    const invalidation = typeof decision.invalidationDetails === "object" && decision.invalidationDetails !== null
+      ? decision.invalidationDetails
+      : typeof decision.invalidation === "object" && decision.invalidation !== null
+        ? decision.invalidation
+        : { price: decision.invalidationPrice ?? null, text: decision.invalidation ?? null };
+    const result = this.db.prepare(`INSERT OR IGNORE INTO autonomous_decisions(id,decision_key,symbol,horizon_minutes,direction,quality_score,quality_band,timeframe_watermarks_json,strategy_name,strategy_version,profile,stage,action,stake,reasons_json,details_json,invalidation_json,invalidation_price,paper_position_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      decision.id, decision.decisionKey, decision.symbol, decision.horizonMinutes, decision.direction, decision.qualityScore, decision.qualityBand,
+      JSON.stringify(decision.timeframeCloseWatermarks), decision.strategyName, decision.strategyVersion, decision.profile, decision.stage,
+      decision.action, decision.stake ?? null, JSON.stringify(decision.reasons ?? []), JSON.stringify(details), JSON.stringify(invalidation),
+      decision.invalidationPrice ?? invalidation.price ?? null, decision.paperPositionId ?? null, decision.createdAt, decision.updatedAt,
+    );
+    return result.changes === 1;
+  }
+  decodeAutonomousDecision(row) {
+    if (!row) return null;
+    const invalidationDetails = decodeJson(row.invalidationJson, {});
+    return {
+      ...row,
+      timeframeCloseWatermarks: decodeJson(row.timeframeWatermarksJson, {}),
+      reasons: decodeJson(row.reasonsJson, []),
+      details: decodeJson(row.detailsJson, {}),
+      invalidationDetails,
+      invalidation: invalidationDetails.text ?? null,
+    };
+  }
+  autonomousDecisionByKey(decisionKey) { return this.decodeAutonomousDecision(this.db.prepare(`SELECT ${decisionColumns} FROM autonomous_decisions WHERE decision_key=?`).get(decisionKey)); }
+  autonomousDecisionById(id) { return this.decodeAutonomousDecision(this.db.prepare(`SELECT ${decisionColumns} FROM autonomous_decisions WHERE id=?`).get(id)); }
+  latestAutonomousDecision() {
+    return this.decodeAutonomousDecision(this.db.prepare(`SELECT ${decisionColumns} FROM autonomous_decisions ORDER BY updated_at DESC, created_at DESC LIMIT 1`).get());
+  }
+  recentAutonomousDecisions(limit = 20) {
+    const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 100) : 20;
+    return this.db.prepare(`SELECT ${decisionColumns} FROM autonomous_decisions ORDER BY updated_at DESC, created_at DESC LIMIT ?`).all(safeLimit).map((row) => this.decodeAutonomousDecision(row));
+  }
+  updateAutonomousDecision(id, changes) {
+    const assignments = ["action=?", "stake=?", "reasons_json=?", "paper_position_id=?", "updated_at=?"];
+    const values = [changes.action, changes.stake ?? null, JSON.stringify(changes.reasons ?? []), changes.paperPositionId ?? null, changes.updatedAt];
+    if (Object.hasOwn(changes, "details")) { assignments.push("details_json=?"); values.push(JSON.stringify(changes.details ?? {})); }
+    if (Object.hasOwn(changes, "invalidation")) { assignments.push("invalidation_json=?"); values.push(JSON.stringify(changes.invalidation ?? {})); }
+    if (Object.hasOwn(changes, "invalidationPrice")) { assignments.push("invalidation_price=?"); values.push(changes.invalidationPrice ?? null); }
+    values.push(id);
+    const result = this.db.prepare(`UPDATE autonomous_decisions SET ${assignments.join(",")} WHERE id=?`).run(...values);
+    if (result.changes !== 1) throw new Error("Autonomous decision does not exist.");
+  }
+  autonomousState(profile = "ADAPTIVE_CAPPED") {
+    const now = new Date().toISOString();
+    this.db.prepare("INSERT OR IGNORE INTO autonomous_state(id,status,profile,recovery_stage,previous_loss,updated_at) VALUES(1,'RUNNING',?,0,0,?)").run(profile, now);
+    return this.db.prepare("SELECT status,profile,recovery_stage AS recoveryStage,previous_loss AS previousLoss,pause_reason AS pauseReason,current_position_id AS currentPositionId,last_settled_position_id AS lastSettledPositionId,updated_at AS updatedAt FROM autonomous_state WHERE id=1").get();
+  }
+  saveAutonomousState(state) {
+    this.db.prepare(`UPDATE autonomous_state SET status=?,profile=?,recovery_stage=?,previous_loss=?,pause_reason=?,current_position_id=?,last_settled_position_id=?,updated_at=? WHERE id=1`).run(
+      state.status, state.profile, state.recoveryStage, state.previousLoss, state.pauseReason ?? null, state.currentPositionId ?? null, state.lastSettledPositionId ?? null, state.updatedAt,
+    );
+    return this.autonomousState(state.profile);
+  }
+  autonomousPerformance({ now = new Date(), profile = null, strategyVersion = null } = {}) {
+    const day = now.toISOString().slice(0, 10);
+    const rows = this.db.prepare("SELECT status,pnl,settled_at AS settledAt,stake,stake_profile AS stakeProfile,strategy_version AS strategyVersion FROM paper_positions WHERE origin='AUTONOMOUS' ORDER BY settled_at").all();
+    const settled = rows.filter((row) => row.status !== "OPEN");
+    const scoped = settled.filter((row) => (!profile || row.stakeProfile === profile) && (!strategyVersion || row.strategyVersion === strategyVersion));
+    const daily = scoped.filter((row) => row.settledAt?.startsWith(day));
+    const summarize = (items) => {
+      const wins = items.filter((row) => row.status === "WON").length; const losses = items.filter((row) => row.status === "LOST").length;
+      const pnl = items.reduce((sum, row) => sum + (row.pnl ?? 0), 0); const totalStake = items.reduce((sum, row) => sum + row.stake, 0);
+      let cumulative = 0; let peak = 0; let maxDrawdown = 0; let consecutiveLosses = 0; let maxConsecutiveLosses = 0;
+      for (const row of items) {
+        cumulative += row.pnl ?? 0; peak = Math.max(peak, cumulative); maxDrawdown = Math.max(maxDrawdown, peak - cumulative);
+        consecutiveLosses = row.status === "LOST" ? consecutiveLosses + 1 : 0; maxConsecutiveLosses = Math.max(maxConsecutiveLosses, consecutiveLosses);
+      }
+      return {
+        positions: items.length, wins, losses, refunds: items.filter((row) => row.status === "REFUNDED").length,
+        winRate: wins + losses ? wins / (wins + losses) : null, pnl, totalStake, roiOnStake: totalStake ? pnl / totalStake : null,
+        grossLoss: items.filter((row) => (row.pnl ?? 0) < 0).reduce((sum, row) => sum - row.pnl, 0), maxDrawdown, maxConsecutiveLosses,
+      };
+    };
+    const combinedDaily = settled.filter((row) => row.settledAt?.startsWith(day));
+    return { mode: "PAPER_ONLY", scope: { profile, strategyVersion }, day, openPositions: rows.filter((row) => row.status === "OPEN" && (!profile || row.stakeProfile === profile) && (!strategyVersion || row.strategyVersion === strategyVersion)).length, daily: summarize(daily), allTime: summarize(scoped), combinedDaily: summarize(combinedDaily), combinedAllProfiles: summarize(settled) };
+  }
+  autonomousSegmentPerformance({ profile = null, strategyVersion = null, breakEvenProbability = null, payoutRate = null } = {}) {
+    const rows = this.db.prepare("SELECT symbol,horizon_minutes AS horizonMinutes,status,pnl,stake,payout_rate AS payoutRate,stake_profile AS stakeProfile,strategy_version AS strategyVersion FROM paper_positions WHERE origin='AUTONOMOUS' AND status!='OPEN' ORDER BY settled_at").all()
+      .filter((row) => (!profile || row.stakeProfile === profile) && (!strategyVersion || row.strategyVersion === strategyVersion));
+    const groups = new Map();
+    for (const row of rows) {
+      const key = `${row.symbol}:${row.horizonMinutes}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(row);
+    }
+    return [...groups.entries()].map(([key, items]) => {
+      const [symbol, horizon] = key.split(":");
+      const wins = items.filter((row) => row.status === "WON").length; const losses = items.filter((row) => row.status === "LOST").length;
+      const refunds = items.filter((row) => row.status === "REFUNDED").length; const decisiveSample = wins + losses;
+      const stake = items.reduce((sum, row) => sum + row.stake, 0); const pnl = items.reduce((sum, row) => sum + (row.pnl ?? 0), 0);
+      const weightedPayout = stake ? items.reduce((sum, row) => sum + row.payoutRate * row.stake, 0) / stake : null;
+      const referencePayout = Number.isFinite(payoutRate) && payoutRate > 0 ? payoutRate : weightedPayout;
+      const referenceRate = Number.isFinite(breakEvenProbability) && breakEvenProbability >= 0 && breakEvenProbability <= 1
+        ? breakEvenProbability
+        : Number.isFinite(referencePayout) && referencePayout > 0 ? 1 / (1 + referencePayout) : null;
+      return {
+        symbol, horizonMinutes: Number(horizon), settled: items.length, decisiveSample, wins, losses, refunds,
+        winRate: decisiveSample ? wins / decisiveSample : null, pnl, stake, roi: stake ? pnl / stake : null,
+        wilson95: wilson95(wins, decisiveSample),
+        breakEvenReference: { rate: referenceRate, payoutRate: referencePayout, source: Number.isFinite(breakEvenProbability) ? "SUPPLIED_RATE" : Number.isFinite(payoutRate) ? "SUPPLIED_PAYOUT" : "DERIVED_WEIGHTED_PAYOUT" },
+      };
+    }).sort((left, right) => left.symbol.localeCompare(right.symbol) || left.horizonMinutes - right.horizonMinutes);
+  }
+  autonomousSegmentSafeguards({ symbols, horizons, minSample = 20, profile = null, strategyVersion = null, breakEvenProbability = null, payoutRate = null } = {}) {
+    if (!Array.isArray(symbols) || !Array.isArray(horizons) || !Number.isInteger(minSample) || minSample < 1) throw new Error("Invalid autonomous segment safeguard settings.");
+    const segments = this.autonomousSegmentPerformance({ profile, strategyVersion, breakEvenProbability, payoutRate });
+    const byKey = new Map(segments.map((segment) => [`${segment.symbol}:${segment.horizonMinutes}`, segment]));
+    const suppliedRate = Number.isFinite(breakEvenProbability) && breakEvenProbability >= 0 && breakEvenProbability <= 1 ? breakEvenProbability : Number.isFinite(payoutRate) && payoutRate > 0 ? 1 / (1 + payoutRate) : null;
+    return symbols.flatMap((symbol) => horizons.map((horizonMinutes) => {
+      const segment = byKey.get(`${symbol}:${horizonMinutes}`) ?? {
+        symbol, horizonMinutes, settled: 0, decisiveSample: 0, wins: 0, losses: 0, refunds: 0, winRate: null, pnl: 0, stake: 0, roi: null,
+        wilson95: { lower: null, upper: null }, breakEvenReference: { rate: suppliedRate, payoutRate: payoutRate ?? null, source: Number.isFinite(breakEvenProbability) ? "SUPPLIED_RATE" : "SUPPLIED_PAYOUT" },
+      };
+      const rate = segment.breakEvenReference.rate;
+      let status = "MONITOR";
+      if (segment.decisiveSample < minSample) status = "WARMUP";
+      else if (rate !== null && segment.wilson95.lower > rate) status = "VALIDATED";
+      else if (rate !== null && segment.wilson95.upper < rate) status = "UNDERPERFORMING";
+      return { ...segment, status, minSample };
+    }));
+  }
+  decodeManualResearchSignal(row) {
+    if (!row) return null;
+    const { reasonsJson, detailsJson, timeframeWatermarksJson, invalidationJson, entrySourceJson, candleSourcesJson, resolutionSourceJson, ...signal } = row;
+    return {
+      ...signal,
+      reasons: decodeJson(reasonsJson, []),
+      details: decodeJson(detailsJson, {}),
+      timeframeCloseWatermarks: decodeJson(timeframeWatermarksJson, {}),
+      invalidation: decodeJson(invalidationJson, {}),
+      entrySource: decodeJson(entrySourceJson, null),
+      candleSources: decodeJson(candleSourcesJson, {}),
+      resolutionSource: decodeJson(resolutionSourceJson, null),
+    };
+  }
+  createManualResearchSignal(signal) {
+    const result = this.db.prepare(`INSERT INTO manual_research_signals(id,candidate_key,symbol,horizon_minutes,direction,lifecycle_status,quality_score,quality_band,reasons_json,details_json,timeframe_watermarks_json,invalidation_json,invalidation_price,strategy_name,strategy_version,generated_at,entry_price,entry_at,entry_valid_until,resolves_at,entry_source_json,candle_sources_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(candidate_key) DO NOTHING`).run(
+      signal.id, signal.candidateKey, signal.symbol, signal.horizonMinutes, signal.direction, signal.status,
+      signal.qualityScore, signal.qualityBand, JSON.stringify(signal.reasons ?? []), JSON.stringify(signal.details ?? {}),
+      JSON.stringify(signal.timeframeCloseWatermarks ?? {}), JSON.stringify(signal.invalidation ?? {}), signal.invalidationPrice ?? null,
+      signal.strategyName, signal.strategyVersion, signal.generatedAt, signal.entryPrice ?? null, signal.entryAt ?? null,
+      signal.entryValidUntil ?? null, signal.resolvesAt ?? null, signal.entrySource ? JSON.stringify(signal.entrySource) : null,
+      JSON.stringify(signal.candleSources ?? {}), signal.createdAt,
+    );
+    return result.changes === 1;
+  }
+  updateWaitingManualResearchSignal(id, { reasons, details }) {
+    const result = this.db.prepare("UPDATE manual_research_signals SET reasons_json=?,details_json=? WHERE id=? AND lifecycle_status='WAIT'").run(JSON.stringify(reasons ?? []), JSON.stringify(details ?? {}), id);
+    return result.changes === 1;
+  }
+  promoteManualResearchSignal(id, signal) {
+    const result = this.db.prepare(`UPDATE manual_research_signals SET direction=?,lifecycle_status='READY',quality_score=?,quality_band=?,reasons_json=?,details_json=?,invalidation_json=?,invalidation_price=?,entry_price=?,entry_at=?,entry_valid_until=?,resolves_at=?,entry_source_json=?,candle_sources_json=? WHERE id=? AND lifecycle_status='WAIT'`).run(
+      signal.direction, signal.qualityScore, signal.qualityBand, JSON.stringify(signal.reasons ?? []), JSON.stringify(signal.details ?? {}),
+      JSON.stringify(signal.invalidation ?? {}), signal.invalidationPrice ?? null, signal.entryPrice, signal.entryAt, signal.entryValidUntil,
+      signal.resolvesAt, JSON.stringify(signal.entrySource), JSON.stringify(signal.candleSources ?? {}), id,
+    );
+    return result.changes === 1;
+  }
+  manualResearchSignalById(id) {
+    return this.decodeManualResearchSignal(this.db.prepare(`SELECT ${manualSignalColumns} FROM manual_research_signals WHERE id=?`).get(id));
+  }
+  manualResearchSignalByCandidateKey(candidateKey) {
+    return this.decodeManualResearchSignal(this.db.prepare(`SELECT ${manualSignalColumns} FROM manual_research_signals WHERE candidate_key=?`).get(candidateKey));
+  }
+  currentManualResearchSignals(symbol = null) {
+    const rows = symbol
+      ? this.db.prepare(`SELECT ${manualSignalColumns} FROM manual_research_signals WHERE lifecycle_status='READY' AND symbol=? ORDER BY resolves_at,generated_at`).all(symbol)
+      : this.db.prepare(`SELECT ${manualSignalColumns} FROM manual_research_signals WHERE lifecycle_status='READY' ORDER BY resolves_at,generated_at`).all();
+    return rows.map((row) => this.decodeManualResearchSignal(row));
+  }
+  recentManualResearchSignals(limit = 50, symbol = null) {
+    const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50;
+    const rows = symbol
+      ? this.db.prepare(`SELECT ${manualSignalColumns} FROM manual_research_signals WHERE symbol=? ORDER BY generated_at DESC,created_at DESC LIMIT ?`).all(symbol, safeLimit)
+      : this.db.prepare(`SELECT ${manualSignalColumns} FROM manual_research_signals ORDER BY generated_at DESC,created_at DESC LIMIT ?`).all(safeLimit);
+    return rows.map((row) => this.decodeManualResearchSignal(row));
+  }
+  resolveManualResearchSignal(id, resolution) {
+    const result = this.db.prepare(`UPDATE manual_research_signals SET lifecycle_status='EXPIRED',proxy_outcome=?,resolution_price=?,resolution_source_json=?,resolved_at=?,expired_at=? WHERE id=? AND lifecycle_status='READY'`).run(
+      resolution.proxyOutcome, resolution.resolutionPrice ?? null, JSON.stringify(resolution.resolutionSource ?? {}), resolution.resolvedAt, resolution.expiredAt, id,
+    );
+    return result.changes === 1;
+  }
+  manualSignalEmpiricalConfidence({ minDecisiveSample = 20, payoutRate, symbol = null } = {}) {
+    if (!Number.isInteger(minDecisiveSample) || minDecisiveSample < 1 || !Number.isFinite(payoutRate) || payoutRate <= 0) throw new Error("Invalid manual signal confidence settings.");
+    const sql = `SELECT strategy_version AS strategyVersion,symbol,horizon_minutes AS horizonMinutes,COUNT(CASE WHEN lifecycle_status='EXPIRED' THEN 1 END) AS resolved,SUM(CASE WHEN proxy_outcome='PROXY_CORRECT' THEN 1 ELSE 0 END) AS correct,SUM(CASE WHEN proxy_outcome='PROXY_INCORRECT' THEN 1 ELSE 0 END) AS incorrect,SUM(CASE WHEN proxy_outcome='PROXY_TIE' THEN 1 ELSE 0 END) AS ties,SUM(CASE WHEN proxy_outcome='NO_TIMELY_OBSERVATION' THEN 1 ELSE 0 END) AS unavailable FROM manual_research_signals${symbol ? " WHERE symbol=?" : ""} GROUP BY strategy_version,symbol,horizon_minutes ORDER BY strategy_version,symbol,horizon_minutes`;
+    const rows = symbol ? this.db.prepare(sql).all(symbol) : this.db.prepare(sql).all();
+    const breakEvenRate = 1 / (1 + payoutRate);
+    return rows.map((row) => {
+      const decisiveSample = row.correct + row.incorrect;
+      const sufficient = decisiveSample >= minDecisiveSample;
+      const interval = sufficient ? wilson95(row.correct, decisiveSample) : { lower: null, upper: null };
+      return {
+        classification: "SPOT_PROXY_PROSPECTIVE_OUTCOMES_NOT_EVENT_FUTURES_CALIBRATION",
+        strategyVersion: row.strategyVersion, symbol: row.symbol, horizonMinutes: row.horizonMinutes,
+        resolved: row.resolved, decisiveSample, correct: row.correct, incorrect: row.incorrect, ties: row.ties, unavailable: row.unavailable,
+        minDecisiveSample, status: !sufficient ? "WARMUP" : interval.lower > breakEvenRate ? "VALIDATED" : interval.upper < breakEvenRate ? "UNDERPERFORMING" : "MONITOR",
+        measuredRate: sufficient ? row.correct / decisiveSample : null, wilson95: interval,
+        breakEvenReference: { rate: breakEvenRate, payoutRate, source: "USER_CONFIGURED_PAPER_PAYOUT" },
+      };
+    });
+  }
+  strategyState(symbol, horizonMinutes, machineType, machineKey) {
+    const row = this.db.prepare("SELECT symbol,horizon_minutes AS horizonMinutes,machine_type AS machineType,machine_key AS machineKey,state,payload_json AS payloadJson,last_event_key AS lastEventKey,version,updated_at AS updatedAt FROM strategy_states WHERE symbol=? AND horizon_minutes=? AND machine_type=? AND machine_key=?").get(symbol, horizonMinutes, machineType, machineKey);
+    return row ? { ...row, payload: decodeJson(row.payloadJson, {}) } : null;
+  }
+  applyStrategyTransition(transition) {
+    const previous = this.strategyState(transition.symbol, transition.horizonMinutes, transition.machineType, transition.machineKey);
+    if (previous?.lastEventKey === transition.eventKey) return previous;
+    if (previous?.state === transition.state) {
+      this.db.prepare("UPDATE strategy_states SET payload_json=?,last_event_key=?,updated_at=? WHERE symbol=? AND horizon_minutes=? AND machine_type=? AND machine_key=?").run(
+        JSON.stringify(transition.payload ?? {}), transition.eventKey, transition.observedAt,
+        transition.symbol, transition.horizonMinutes, transition.machineType, transition.machineKey,
+      );
+      return this.strategyState(transition.symbol, transition.horizonMinutes, transition.machineType, transition.machineKey);
+    }
+    const existingEvent = this.db.prepare("SELECT event_key AS eventKey FROM strategy_state_transitions WHERE event_key=?").get(transition.eventKey);
+    if (!existingEvent) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db.prepare(`INSERT INTO strategy_state_transitions(symbol,horizon_minutes,machine_type,machine_key,from_state,to_state,event_key,evidence_json,transitioned_at) VALUES(?,?,?,?,?,?,?,?,?)`).run(
+          transition.symbol, transition.horizonMinutes, transition.machineType, transition.machineKey, previous?.state ?? null,
+          transition.state, transition.eventKey, JSON.stringify(transition.payload ?? {}), transition.observedAt,
+        );
+        const version = (previous?.version ?? 0) + 1;
+        this.db.prepare(`INSERT INTO strategy_states(symbol,horizon_minutes,machine_type,machine_key,state,payload_json,last_event_key,version,updated_at) VALUES(?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(symbol,horizon_minutes,machine_type,machine_key) DO UPDATE SET state=excluded.state,payload_json=excluded.payload_json,last_event_key=excluded.last_event_key,version=excluded.version,updated_at=excluded.updated_at`).run(
+          transition.symbol, transition.horizonMinutes, transition.machineType, transition.machineKey, transition.state,
+          JSON.stringify(transition.payload ?? {}), transition.eventKey, version, transition.observedAt,
+        );
+        this.db.exec("COMMIT");
+      } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    }
+    return this.strategyState(transition.symbol, transition.horizonMinutes, transition.machineType, transition.machineKey);
+  }
+  upsertFeedChannelState(state) {
+    this.db.prepare(`INSERT INTO feed_channel_state(provider,symbol,channel,status,session_id,connected_at,last_message_at,last_event_at,last_sequence,lag_ms,gap_count,reconnect_count,last_error,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(provider,symbol,channel) DO UPDATE SET status=excluded.status,session_id=excluded.session_id,connected_at=excluded.connected_at,last_message_at=excluded.last_message_at,last_event_at=excluded.last_event_at,last_sequence=excluded.last_sequence,lag_ms=excluded.lag_ms,gap_count=excluded.gap_count,reconnect_count=excluded.reconnect_count,last_error=excluded.last_error,updated_at=excluded.updated_at`).run(
+      state.provider, state.symbol, state.channel, state.status, state.sessionId ?? null, state.connectedAt ?? null, state.lastMessageAt ?? null,
+      state.lastEventAt ?? null, state.lastSequence ?? null, state.lagMs ?? null, state.gapCount ?? 0, state.reconnectCount ?? 0,
+      state.lastError ?? null, state.updatedAt,
+    );
+  }
+  recordFeedEvent(event) {
+    this.db.prepare("INSERT OR IGNORE INTO feed_events(event_key,provider,symbol,channel,event_type,severity,payload_json,occurred_at) VALUES(?,?,?,?,?,?,?,?)").run(
+      event.eventKey, event.provider, event.symbol, event.channel, event.eventType, event.severity,
+      JSON.stringify(event.payload ?? { status: event.status ?? null, error: event.lastError ?? null }), event.occurredAt,
+    );
+  }
+  upsertOperationalAlert(alert) {
+    this.db.prepare(`INSERT INTO operational_alerts(fingerprint,alert_type,provider,symbol,channel,severity,status,first_seen_at,last_seen_at,occurrence_count,payload_json,resolved_at) VALUES(?,?,?,?,?,?,?,?,?,1,?,NULL)
+      ON CONFLICT(fingerprint) DO UPDATE SET severity=excluded.severity,status='OPEN',last_seen_at=excluded.last_seen_at,occurrence_count=operational_alerts.occurrence_count+1,payload_json=excluded.payload_json,resolved_at=NULL`).run(
+      alert.fingerprint, alert.alertType, alert.provider, alert.symbol, alert.channel, alert.severity, alert.status ?? "OPEN",
+      alert.observedAt, alert.observedAt, JSON.stringify(alert.payload ?? {}),
+    );
+    return this.db.prepare("SELECT fingerprint,alert_type AS alertType,provider,symbol,channel,severity,status,first_seen_at AS firstSeenAt,last_seen_at AS lastSeenAt,occurrence_count AS occurrenceCount,payload_json AS payloadJson,resolved_at AS resolvedAt FROM operational_alerts WHERE fingerprint=?").get(alert.fingerprint);
+  }
+  resolveOperationalAlert(fingerprint, resolvedAt, payload = {}) {
+    const result = this.db.prepare("UPDATE operational_alerts SET status='RESOLVED',last_seen_at=?,resolved_at=?,payload_json=? WHERE fingerprint=? AND status='OPEN'").run(resolvedAt, resolvedAt, JSON.stringify(payload), fingerprint);
+    return result.changes === 1;
+  }
+  operationalAlerts({ status = null, limit = 100 } = {}) {
+    const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 500) : 100;
+    const rows = status
+      ? this.db.prepare("SELECT fingerprint,alert_type AS alertType,provider,symbol,channel,severity,status,first_seen_at AS firstSeenAt,last_seen_at AS lastSeenAt,occurrence_count AS occurrenceCount,payload_json AS payloadJson,resolved_at AS resolvedAt FROM operational_alerts WHERE status=? ORDER BY last_seen_at DESC LIMIT ?").all(status, safeLimit)
+      : this.db.prepare("SELECT fingerprint,alert_type AS alertType,provider,symbol,channel,severity,status,first_seen_at AS firstSeenAt,last_seen_at AS lastSeenAt,occurrence_count AS occurrenceCount,payload_json AS payloadJson,resolved_at AS resolvedAt FROM operational_alerts ORDER BY last_seen_at DESC LIMIT ?").all(safeLimit);
+    return rows.map(({ payloadJson, ...row }) => ({ ...row, payload: decodeJson(payloadJson, {}) }));
+  }
+  createForecastObservation(observation) {
+    const result = this.db.prepare(`INSERT OR IGNORE INTO forecast_observations(id,observation_key,strategy_name,strategy_version,symbol,horizon_minutes,generated_at,resolves_at,entry_price,predicted_direction,up_score,down_score,quality_score,readiness_json,regime_json,features_json,source_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      observation.id, observation.observationKey, observation.strategyName, observation.strategyVersion, observation.symbol,
+      observation.horizonMinutes, observation.generatedAt, observation.resolvesAt, observation.entryPrice, observation.predictedDirection,
+      observation.upScore, observation.downScore, observation.qualityScore, JSON.stringify(observation.readiness ?? {}),
+      JSON.stringify(observation.regime ?? {}), JSON.stringify(observation.features ?? {}), JSON.stringify(observation.source ?? {}),
+    );
+    return result.changes === 1;
+  }
+  pendingForecastObservations(resolvesBefore, limit = 500) {
+    const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 2000) : 500;
+    return this.db.prepare("SELECT id,symbol,horizon_minutes AS horizonMinutes,generated_at AS generatedAt,resolves_at AS resolvesAt,entry_price AS entryPrice,predicted_direction AS predictedDirection,up_score AS upScore,down_score AS downScore FROM forecast_observations WHERE outcome IS NULL AND resolves_at<=? ORDER BY resolves_at LIMIT ?").all(resolvesBefore, safeLimit);
+  }
+  resolveForecastObservation(id, resolution) {
+    const result = this.db.prepare("UPDATE forecast_observations SET outcome=?,actual_direction=?,resolution_price=?,resolution_source_json=?,resolved_at=? WHERE id=? AND outcome IS NULL").run(
+      resolution.outcome, resolution.actualDirection, resolution.resolutionPrice ?? null, JSON.stringify(resolution.resolutionSource ?? {}), resolution.resolvedAt, id,
+    );
+    return result.changes === 1;
+  }
+  forecastCalibration({ minSample = 50, symbol = null } = {}) {
+    const rows = symbol
+      ? this.db.prepare("SELECT strategy_version AS strategyVersion,symbol,horizon_minutes AS horizonMinutes,predicted_direction AS predictedDirection,up_score AS upScore,actual_direction AS actualDirection,outcome FROM forecast_observations WHERE outcome IS NOT NULL AND symbol=?").all(symbol)
+      : this.db.prepare("SELECT strategy_version AS strategyVersion,symbol,horizon_minutes AS horizonMinutes,predicted_direction AS predictedDirection,up_score AS upScore,actual_direction AS actualDirection,outcome FROM forecast_observations WHERE outcome IS NOT NULL").all();
+    const groups = new Map();
+    for (const row of rows) { const key = `${row.strategyVersion}:${row.symbol}:${row.horizonMinutes}`; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(row); }
+    return [...groups.values()].map((items) => {
+      const first = items[0]; const brierSample = items.filter((item) => ["UP", "DOWN"].includes(item.actualDirection));
+      const directional = brierSample.filter((item) => ["UP", "DOWN"].includes(item.predictedDirection));
+      const correct = directional.filter((item) => item.predictedDirection === item.actualDirection).length;
+      const brierScore = brierSample.length ? brierSample.reduce((sum, item) => { const probabilityUp = item.upScore / 100; const actualUp = item.actualDirection === "UP" ? 1 : 0; return sum + (probabilityUp - actualUp) ** 2; }, 0) / brierSample.length : null;
+      return { classification: "PROSPECTIVE_UNSELECTED_SPOT_PROXY_CALIBRATION", strategyVersion: first.strategyVersion, symbol: first.symbol, horizonMinutes: first.horizonMinutes, resolved: items.length, decisiveSample: brierSample.length, directionalSample: directional.length, brierSample: brierSample.length, correct, measuredAccuracy: directional.length >= minSample ? correct / directional.length : null, brierScore: brierSample.length >= minSample ? brierScore : null, status: brierSample.length >= minSample ? "CALIBRATING" : "WARMUP", minSample };
+    }).sort((left, right) => left.symbol.localeCompare(right.symbol) || left.horizonMinutes - right.horizonMinutes);
+  }
+  sourceEvent(event) {
+    this.db.prepare("INSERT INTO data_source_events(source_name,symbol,status,source_timestamp,received_at,latency_ms,message) VALUES(?,?,?,?,?,?,?)").run(event.sourceName, event.symbol ?? null, event.status, event.sourceTimestamp ?? null, event.receivedAt, event.latencyMs ?? null, event.message ?? null);
+  }
+  close() { this.db.close(); }
+}
