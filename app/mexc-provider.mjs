@@ -28,7 +28,7 @@ export class MexcSpotProvider {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
       try {
-        const response = await this.fetchImpl(url, { signal: controller.signal, headers: { accept: "application/json", "user-agent": "signal-expert/0.6.1" } });
+        const response = await this.fetchImpl(url, { signal: controller.signal, headers: { accept: "application/json", "user-agent": "signal-expert/0.7.0" } });
         if (!response.ok) { const error = new Error(`${this.name} HTTP ${response.status}`); error.status = response.status; throw error; }
         return { payload: await response.json(), receivedAt: new Date(), url };
       } catch (error) { finalError = error; if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, 300 * 2 ** attempt)); }
@@ -36,9 +36,9 @@ export class MexcSpotProvider {
     }
     throw new Error(`${this.name}: ${describeProviderError(finalError)}`, { cause: finalError });
   }
-  envelope(data, response, sourceTimestamp) {
+  envelope(data, response, sourceTimestamp, metadata = {}) {
     const timestamp = new Date(sourceTimestamp); if (!Number.isFinite(timestamp.getTime())) throw new Error("Invalid source timestamp");
-    return { data, source: this.sourceId, sourceName: this.name, sourceUrl: response.url, sourceTimestamp: timestamp.toISOString(), receivedAt: response.receivedAt.toISOString(), failover: { active: false, primarySource: this.sourceId, primaryError: null } };
+    return { data, source: this.sourceId, sourceName: this.name, sourceUrl: response.url, sourceTimestamp: timestamp.toISOString(), receivedAt: response.receivedAt.toISOString(), ...metadata, failover: { active: false, primarySource: this.sourceId, primaryError: null } };
   }
   async ticker(symbol) {
     const response = await this.request(`/api/v3/ticker/24hr?symbol=${encodeURIComponent(symbol)}`); const raw = object(response.payload, "ticker"); const returned = string(raw.symbol, "symbol");
@@ -82,8 +82,10 @@ export class MexcSpotProvider {
       return { ...candle, closed: candle.closeTime < receivedMs };
     });
     const latest = candles.at(-1); if (!latest) throw new Error("Klines response is empty");
+    const latestCompleted = candles.findLast((candle) => candle.closed === true);
+    if (!latestCompleted) throw new Error("Klines response contains no completed candle");
     const sourceTime = latest.closed ? latest.closeTime : receivedMs;
-    return this.envelope(candles, response, sourceTime);
+    return this.envelope(candles, response, sourceTime, { latestCompletedCloseTime: new Date(latestCompleted.closeTime).toISOString() });
   }
 }
 

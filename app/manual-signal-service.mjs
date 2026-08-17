@@ -29,6 +29,9 @@ function candidateDetails(candidate, entryGate = null) {
     setupDirection: candidate.setupDirection ?? null,
     actionableDirection: candidate.actionableDirection ?? null,
     referencePrice: candidate.referencePrice ?? null,
+    forecast: candidate.forecast ?? null,
+    correction: candidate.correction ?? null,
+    levelInteractions: candidate.levelInteractions ?? null,
     levels: candidate.levels ?? {},
     volatilityRegime: candidate.volatilityRegime ?? null,
     confluenceComponents: candidate.confluenceComponents ?? [],
@@ -74,7 +77,7 @@ export class ManualSignalService {
     return {
       allowed: false,
       classification: "CURRENT_ENTRY_RECHECK_UNAVAILABLE",
-      policyVersion: "entry-gates-v0.6.0",
+      policyVersion: "entry-gates-v0.7.0",
       evaluatedAt: now.toISOString(),
       checks: [{ code: "CURRENT_ENTRY_RECHECK", status: "BLOCKED", reason: "The original candidate is no longer present in the current completed-candle analysis.", evidence: { candidateKey: signal.candidateKey } }],
     };
@@ -153,11 +156,14 @@ export class ManualSignalService {
       const resolved = signal?.status === "EXPIRED";
       const disabled = actionState === "DISABLED";
       const state = actionable ? "ENTER_NOW" : tracking ? "TRACKING" : resolved ? "RESOLVED" : disabled ? "DISABLED" : ["BLOCKED_CURRENT_GATES", "BLOCKED"].includes(actionState) || blocked ? "BLOCKED" : "WAIT";
-      const setupDirection = details.setupDirection ?? (signal?.direction === "WAIT" ? "NEUTRAL" : signal?.direction) ?? "NEUTRAL";
-      const oneMinute = details.technicalFeatures?.oneMinuteTrigger ?? null;
-      const fiveMinute = details.technicalFeatures?.fiveMinuteConfirmation ?? null;
-      const fifteenMinute = details.technicalFeatures?.fifteenMinuteAlignment ?? null;
-      const levels = details.levels ?? {};
+      const displayDetails = tracking || resolved ? details : candidate ?? details;
+      const setupDirection = displayDetails.setupDirection ?? (signal?.direction === "WAIT" ? "NEUTRAL" : signal?.direction) ?? "NEUTRAL";
+      const oneMinute = displayDetails.technicalFeatures?.oneMinuteTrigger ?? null;
+      const oneMinuteFlow = displayDetails.technicalFeatures?.oneMinuteFlow ?? null;
+      const fiveMinuteTrend = displayDetails.technicalFeatures?.fiveMinuteTrend ?? null;
+      const fiveMinute = displayDetails.technicalFeatures?.fiveMinuteConfirmation ?? null;
+      const fifteenMinute = displayDetails.technicalFeatures?.fifteenMinuteAlignment ?? null;
+      const levels = displayDetails.levels ?? {};
       const primaryBlocker = state === "TRACKING"
         ? { code: "ENTRY_WINDOW_CLOSED", text: "Entry window closed. Track the recorded call only; do not enter late." }
         : state === "RESOLVED"
@@ -165,9 +171,9 @@ export class ManualSignalService {
           : state === "DISABLED"
             ? { code: "SIGNAL_DESK_DISABLED", text: "Manual signal scanning is disabled; no current setup can be acted on." }
             : blocked ? { code: blocked.code, text: blocked.reason }
-              : state === "WAIT" ? { code: "WAIT_FOR_SETUP", text: details.reasons?.find((reason) => reason.startsWith("Entry blocked")) ?? details.reasons?.at(-2) ?? "Waiting for completed 1m, 5m and 15m alignment." } : null;
-      const qualityScore = signal?.qualityScore ?? details.qualityScore ?? 0;
-      const watermarks = signal?.timeframeCloseWatermarks ?? details.timeframeCloseWatermarks ?? {};
+              : state === "WAIT" ? { code: "WAIT_FOR_SETUP", text: displayDetails.reasons?.find((reason) => reason.startsWith("Entry blocked")) ?? displayDetails.reasons?.at(-2) ?? "Waiting for completed 1m, 5m and 15m alignment." } : null;
+      const qualityScore = displayDetails.qualityScore ?? signal?.qualityScore ?? 0;
+      const watermarks = displayDetails.timeframeCloseWatermarks ?? signal?.timeframeCloseWatermarks ?? {};
       return {
         roundId: `${symbol}:${horizonMinutes}:${signal?.candidateKey ?? candidate?.decisionKey ?? "waiting"}`,
         classification: "MANUAL_EVENT_FUTURES_SIGNAL_USING_SPOT_PROXY",
@@ -175,10 +181,14 @@ export class ManualSignalService {
         horizonMinutes,
         state,
         setupDirection,
+        forecast: displayDetails.forecast ?? { upPercent: 50, downPercent: 50, leader: "NEUTRAL", edgePercent: 0, confidence: "LOW", available: false, classification: "UNCALIBRATED_TECHNICAL_DIRECTION_ESTIMATE_NOT_WIN_PROBABILITY" },
+        marketFlow: { oneMinute: oneMinuteFlow, fiveMinute: fiveMinuteTrend },
+        correction: displayDetails.correction ?? null,
+        levelInteractions: displayDetails.levelInteractions ?? null,
         actionable: { allowed: actionable, direction: actionable ? signal?.direction ?? null : null, entryValidUntil: signal?.entryValidUntil ?? null, primaryBlocker, blockedCount: checks.filter((check) => check.status === "BLOCKED").length },
         timing: { generatedAt: signal?.generatedAt ?? snapshot?.analysis?.calculatedAt ?? null, entryValidUntil: signal?.entryValidUntil ?? candidate?.triggerValidUntil ?? null, targetAt: signal?.resolvesAt ?? null },
         prices: {
-          reference: { value: details.referencePrice ?? null, basis: "LATEST_COMPLETED_1M_CLOSE", observedAt: watermarks["1m"] ?? null },
+          reference: { value: displayDetails.referencePrice ?? null, basis: "LATEST_COMPLETED_1M_CLOSE", observedAt: watermarks["1m"] ?? null },
           entry: { value: signal?.entryPrice ?? null, observedAt: signal?.entryAt ?? null },
           current: { value: source.data?.lastPrice ?? null, observedAt: source.sourceTimestamp ?? null },
         },
@@ -187,16 +197,16 @@ export class ManualSignalService {
           fiveMinute: { status: checks.find((check) => check.code === "FIVE_MINUTE_CONFIRMATION")?.status ?? "BLOCKED", direction: fiveMinute?.direction ?? "NEUTRAL", completedAt: fiveMinute?.watermark ?? null, evidence: fiveMinute?.evidence ?? null },
           fifteenMinute: { status: checks.find((check) => check.code === "FIFTEEN_MINUTE_ALIGNMENT")?.status ?? "BLOCKED", direction: fifteenMinute?.direction ?? "NEUTRAL", regime: fifteenMinute?.regime ?? "INSUFFICIENT_DATA", completedAt: fifteenMinute?.watermark ?? null, evidence: fifteenMinute?.evidence ?? null },
         },
-        levels: { support: levels.support ?? null, resistance: levels.resistance ?? null, invalidation: levels.invalidation ?? signal?.invalidation ?? details.invalidationDetails ?? null },
-        quality: { score: qualityScore, band: signal?.qualityBand ?? details.qualityBand ?? "BELOW_STANDARD", minimum: this.settings.qualityThreshold ?? 68, passed: checks.find((check) => check.code === "QUALITY")?.status === "PASS", classification: "DETERMINISTIC_SETUP_QUALITY_NOT_PROBABILITY" },
+        levels: { support: levels.support ?? null, resistance: levels.resistance ?? null, invalidation: levels.invalidation ?? signal?.invalidation ?? displayDetails.invalidationDetails ?? null },
+        quality: { score: qualityScore, band: displayDetails.qualityBand ?? signal?.qualityBand ?? "BELOW_STANDARD", minimum: this.settings.qualityThreshold ?? 68, passed: checks.find((check) => check.code === "QUALITY")?.status === "PASS", classification: "DETERMINISTIC_SETUP_QUALITY_NOT_PROBABILITY" },
         confidence: confidence.get(horizonMinutes) ?? null,
-        details: { checks, reasons: signal?.reasons ?? details.reasons ?? [], confluenceComponents: details.confluenceComponents ?? [], volatilityRegime: details.volatilityRegime ?? null, timeframeWatermarks: watermarks, entrySource: signal?.entrySource ?? null },
+        details: { checks, reasons: displayDetails.reasons ?? signal?.reasons ?? [], confluenceComponents: displayDetails.confluenceComponents ?? [], volatilityRegime: displayDetails.volatilityRegime ?? null, timeframeWatermarks: watermarks, entrySource: signal?.entrySource ?? null },
       };
     });
     return {
       classification: "MANUAL_EVENT_FUTURES_TERMINAL_USING_ATTRIBUTED_SPOT_PROXY",
       observedAt: now.toISOString(), symbol,
-      source: { status: source.status ?? "UNAVAILABLE", source: source.source ?? null, sourceName: source.sourceName ?? null, sourceTimestamp: source.sourceTimestamp ?? null, receivedAt: source.receivedAt ?? null, fallback: source.failover ?? null, candleSources: snapshot?.analysis?.sources ?? null, analysisCoherent: snapshot?.health?.analysisCoherent ?? false, actionSourceCoherent: snapshot?.health?.actionSourceCoherent ?? false, entryCoherent: snapshot?.health?.entryCoherent ?? false },
+      source: { status: source.status ?? "UNAVAILABLE", source: source.source ?? null, sourceName: source.sourceName ?? null, sourceTimestamp: source.sourceTimestamp ?? null, receivedAt: source.receivedAt ?? null, fallback: source.failover ?? null, candleSources: snapshot?.analysis?.sources ?? null, candleStatuses: snapshot?.health?.candles ?? null, analysisCalculatedAt: snapshot?.analysis?.calculatedAt ?? null, completedOneMinuteAt: snapshot?.candles?.["1m"]?.latestCompletedCloseTime ?? null, completedFiveMinuteAt: snapshot?.candles?.["5m"]?.latestCompletedCloseTime ?? null, analysisCoherent: snapshot?.health?.analysisCoherent ?? false, actionSourceCoherent: snapshot?.health?.actionSourceCoherent ?? false, entryCoherent: snapshot?.health?.entryCoherent ?? false },
       currentPrice: { value: source.data?.lastPrice ?? null, observedAt: source.sourceTimestamp ?? null },
       rounds,
     };

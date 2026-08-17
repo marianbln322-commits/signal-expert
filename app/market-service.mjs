@@ -51,12 +51,12 @@ export class MarketService {
             ? await this.provider.klinesSet(symbol, timeframes)
             : await Promise.all(timeframes.map((timeframe) => this.provider.klines(symbol, timeframe))).then((items) => Object.fromEntries(timeframes.map((timeframe, index) => [timeframe, items[index]])));
           for (const timeframe of timeframes) { state.candles[timeframe] = envelopes[timeframe]; delete state.errors.candles[timeframe]; }
-          const live = timeframes.every((timeframe) => this.status(state.candles[timeframe]) === "LIVE");
+          const live = timeframes.every((timeframe) => this.status(state.candles[timeframe], timeframe) === "LIVE");
           const sources = new Set(timeframes.map((timeframe) => state.candles[timeframe]?.source));
           if (live && sources.size === 1) {
             const closed = Object.fromEntries(timeframes.map((timeframe) => [timeframe, state.candles[timeframe].data.filter((candle) => candle.closed)]));
             state.analysis = analyzeMarket(closed, this.payoutRate, new Date(), { symbol, thresholds: this.candidateThresholds, triggerGraceMs: this.entryPolicy.triggerGraceMs });
-            state.analysis.sources = Object.fromEntries(timeframes.map((timeframe) => [timeframe, { source: state.candles[timeframe].source, sourceName: state.candles[timeframe].sourceName, sourceUrl: state.candles[timeframe].sourceUrl, sourceTimestamp: state.candles[timeframe].sourceTimestamp, receivedAt: state.candles[timeframe].receivedAt, failover: state.candles[timeframe].failover }]));
+            state.analysis.sources = Object.fromEntries(timeframes.map((timeframe) => [timeframe, { source: state.candles[timeframe].source, sourceName: state.candles[timeframe].sourceName, sourceUrl: state.candles[timeframe].sourceUrl, sourceTimestamp: state.candles[timeframe].sourceTimestamp, receivedAt: state.candles[timeframe].receivedAt, latestCompletedCloseTime: this.completedCloseTime(state.candles[timeframe]), failover: state.candles[timeframe].failover }]));
             this.database.insertSignal(symbol, state.analysis, state.candles["1m"].sourceTimestamp);
           } else {
             state.analysis = null;
@@ -71,10 +71,21 @@ export class MarketService {
       }));
     } finally { this.candleBusy = false; }
   }
-  status(envelope) {
+  completedCloseTime(envelope) {
+    const value = envelope?.latestCompletedCloseTime ?? envelope?.data?.findLast?.((candle) => candle?.closed === true)?.closeTime;
+    const timestamp = new Date(value);
+    return Number.isFinite(timestamp.getTime()) ? timestamp.toISOString() : null;
+  }
+  status(envelope, timeframe = null) {
     if (!envelope?.sourceTimestamp || !envelope?.receivedAt) return "UNAVAILABLE";
     const now = Date.now(); const source = new Date(envelope.sourceTimestamp).getTime(); const received = new Date(envelope.receivedAt).getTime();
-    return !Number.isFinite(source) || !Number.isFinite(received) || now - source > this.staleAfterMs || now - received > this.staleAfterMs ? "STALE" : "LIVE";
+    if (!Number.isFinite(source) || !Number.isFinite(received) || now - source > this.staleAfterMs || now - received > this.staleAfterMs) return "STALE";
+    if (timeframe) {
+      const intervalMs = { "1m": 60000, "5m": 300000, "15m": 900000, "1h": 3600000 }[timeframe];
+      const completed = new Date(this.completedCloseTime(envelope)).getTime();
+      if (!intervalMs || !Number.isFinite(completed) || now - completed > intervalMs + this.staleAfterMs) return "STALE";
+    }
+    return "LIVE";
   }
   diagnostics(state) {
     const errors = [state.errors.ticker && `ticker: ${state.errors.ticker}`, state.errors.depth && `order book: ${state.errors.depth}`, ...Object.entries(state.errors.candles).map(([timeframe, message]) => `${timeframe} candles: ${message}`)].filter(Boolean);
@@ -86,13 +97,14 @@ export class MarketService {
       fallbackActive: failovers.length > 0,
       activeSources: [...new Set(envelopes.map((envelope) => envelope.source))],
       primaryErrors: uniquePrimaryErrors,
-      message: failovers.length ? `Primary MEXC feed unavailable. Using explicitly attributed ${failovers[0].fallbackName} data. ${uniquePrimaryErrors.join("; ")}` : errors.join("; ") || null,
+      failover: failovers[0] ?? null,
+      message: failovers.length ? `${failovers[0].primaryName} unavailable. Using explicitly attributed ${failovers[0].fallbackName} data. ${uniquePrimaryErrors.join("; ")}` : errors.join("; ") || null,
     };
   }
   snapshot(symbol) {
     const state = this.states.get(symbol); if (!state) return null;
     const marketStatus = this.status(state.ticker); const depthStatus = this.status(state.depth);
-    const candleStatuses = Object.fromEntries(timeframes.map((timeframe) => [timeframe, this.status(state.candles[timeframe])]));
+    const candleStatuses = Object.fromEntries(timeframes.map((timeframe) => [timeframe, this.status(state.candles[timeframe], timeframe)]));
     const candleSources = timeframes.map((timeframe) => state.candles[timeframe]?.source).filter(Boolean);
     const analysisCoherent = candleSources.length === timeframes.length && new Set(candleSources).size === 1;
     const candleSource = analysisCoherent ? candleSources[0] : null;
@@ -114,7 +126,7 @@ export class MarketService {
       symbol,
       market: state.ticker ? { ...state.ticker, classification: "RAW", status: marketStatus } : { classification: "UNAVAILABLE", status: "UNAVAILABLE" },
       orderBook: state.depth ? { ...state.depth, metrics: orderBookMetrics, classification: "RAW", status: depthStatus } : { metrics: orderBookMetrics, classification: "UNAVAILABLE", status: "UNAVAILABLE" },
-      candles: Object.fromEntries(timeframes.map((timeframe) => { const envelope = state.candles[timeframe]; return [timeframe, envelope ? { ...envelope, classification: "RAW", status: candleStatuses[timeframe] } : { classification: "UNAVAILABLE", status: "UNAVAILABLE" }]; })),
+      candles: Object.fromEntries(timeframes.map((timeframe) => { const envelope = state.candles[timeframe]; return [timeframe, envelope ? { ...envelope, latestCompletedCloseTime: this.completedCloseTime(envelope), classification: "RAW", status: candleStatuses[timeframe] } : { classification: "UNAVAILABLE", status: "UNAVAILABLE" }]; })),
       analysis: candlesLive ? state.analysis : null,
       eventRisk,
       entryPolicy: { ...entryPolicy, classification: "CONFIGURED_ENTRY_GATE_NOT_EVENT_FUTURES_LIQUIDITY" },
@@ -130,13 +142,13 @@ export class MarketService {
   }
   evaluateEntry(candidate, now = new Date()) {
     const snapshot = this.snapshot(candidate?.symbol);
-    if (!snapshot) return { allowed: false, classification: "AUDITABLE_ENTRY_POLICY_PAPER_AND_MANUAL_ONLY", policyVersion: "entry-gates-v0.6.0", evaluatedAt: now.toISOString(), checks: [{ code: "SYMBOL", status: "BLOCKED", reason: "Symbol is not configured.", evidence: null }] };
+    if (!snapshot) return { allowed: false, classification: "AUDITABLE_ENTRY_POLICY_PAPER_AND_MANUAL_ONLY", policyVersion: "entry-gates-v0.7.0", evaluatedAt: now.toISOString(), checks: [{ code: "SYMBOL", status: "BLOCKED", reason: "Symbol is not configured.", evidence: null }] };
     return evaluateEntryGates({ snapshot, candidate, policy: this.entryPolicyFor(candidate.symbol), now });
   }
   sources() {
     const providers = this.provider.providers ?? [this.provider];
     return [
-      ...providers.map((provider, index) => ({ id: provider.sourceId ?? `provider-${index}`, name: provider.name, role: index === 0 ? "PRIMARY" : "FALLBACK", type: provider.official ? "OFFICIAL_PUBLIC_API" : "CONFIGURED_PROVIDER", updateFrequency: "Ticker/depth default 3s; klines default 15s", limitations: index === 0 ? "MEXC Spot underlying data, not Event Futures payout or contracts." : "Independent Spot fallback; prices may differ from the MEXC Event Futures settlement index.", symbols: this.symbols })),
+      ...providers.map((provider, index) => ({ id: provider.sourceId ?? `provider-${index}`, name: provider.name, role: index === 0 ? "PRIMARY" : "FALLBACK", type: provider.official ? "OFFICIAL_PUBLIC_API" : "CONFIGURED_PROVIDER", updateFrequency: "Ticker/depth default 3s; klines default 5s", limitations: provider.sourceId === "BINANCE_SPOT_REST" ? "Binance Spot underlying data; not Event Futures contracts, payout or settlement." : "MEXC Spot fallback underlying data; not Event Futures contracts, payout or settlement.", symbols: this.symbols })),
       { id: "mexc-event-futures", name: "MEXC Event Futures", role: "UNAVAILABLE", type: "UNVERIFIED", updateFrequency: null, limitations: "Official integration endpoint not verified; live execution disabled.", symbols: this.symbols },
       this.eventRisk.source(),
     ];

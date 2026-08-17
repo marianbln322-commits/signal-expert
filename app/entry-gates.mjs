@@ -84,7 +84,7 @@ export function evaluateEntryGates({ snapshot, candidate, policy, now = new Date
   return {
     allowed: checks.every((check) => check.status !== "BLOCKED"),
     classification: "AUDITABLE_ENTRY_POLICY_PAPER_AND_MANUAL_ONLY",
-    policyVersion: "entry-gates-v0.6.0",
+    policyVersion: "entry-gates-v0.7.0",
     evaluatedAt: now.toISOString(),
     checks,
     orderBook: metrics,

@@ -43,17 +43,23 @@ const qualityThresholds = Object.freeze({
 });
 if (!(qualityThresholds.standard < qualityThresholds.high && qualityThresholds.high < qualityThresholds.exceptional)) throw new Error("Autonomous quality thresholds must increase from STANDARD to HIGH to EXCEPTIONAL");
 
+const explicitPrimaryMarketUrl = process.env.PRIMARY_MARKET_BASE_URL ?? process.env.BINANCE_SPOT_BASE_URL;
+const legacyFallbackUrl = process.env.FALLBACK_MARKET_BASE_URL;
+const legacyBinanceFallback = !explicitPrimaryMarketUrl && /binance/i.test(legacyFallbackUrl ?? "");
+const primaryMarketBaseUrl = (explicitPrimaryMarketUrl ?? "https://data-api.binance.vision").replace(/\/$/, "");
+const fallbackMarketBaseUrl = (legacyBinanceFallback ? (process.env.MEXC_SPOT_BASE_URL ?? "https://api.mexc.com") : legacyFallbackUrl ?? process.env.MEXC_SPOT_BASE_URL ?? "https://api.mexc.com").replace(/\/$/, "");
+
 export const config = Object.freeze({
   host: process.env.API_HOST ?? "127.0.0.1",
   port: numberValue("API_PORT", 4100, { min: 1, max: 65535, integer: true }),
-  mexcBaseUrl: (process.env.MEXC_SPOT_BASE_URL ?? "https://api.mexc.com").replace(/\/$/, ""),
-  fallbackMarketBaseUrl: (process.env.FALLBACK_MARKET_BASE_URL ?? "https://data-api.binance.vision").replace(/\/$/, ""),
+  primaryMarketBaseUrl,
+  fallbackMarketBaseUrl,
   marketFailoverEnabled: booleanValue("MARKET_FAILOVER_ENABLED", true),
   providerTimeoutMs: numberValue("PROVIDER_TIMEOUT_MS", 5000, { min: 1000, max: 30000, integer: true }),
   providerAttempts: numberValue("PROVIDER_ATTEMPTS", 2, { min: 1, max: 5, integer: true }),
   symbols,
   tickerPollMs: numberValue("TICKER_POLL_MS", 3000, { min: 1000, integer: true }),
-  candlePollMs: numberValue("CANDLE_POLL_MS", 15000, { min: 5000, integer: true }),
+  candlePollMs: numberValue("CANDLE_POLL_MS", 5000, { min: 5000, integer: true }),
   staleAfterMs: numberValue("STALE_AFTER_MS", 30000, { min: 5000, integer: true }),
   eventRiskEnabled: booleanValue("EVENT_RISK_ENABLED", false),
   eventRiskBaseUrl: (process.env.EVENT_RISK_BASE_URL ?? "https://api.tradingeconomics.com").replace(/\/$/, ""),

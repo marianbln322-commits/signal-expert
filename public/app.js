@@ -156,7 +156,7 @@ function renderProviderDiagnostic(snapshot) {
   if (!provider?.message) { element.classList.add("hidden"); return; }
   const fallback = provider.fallbackActive;
   element.className = `alert ${fallback ? "alert-warning" : "alert-error"}`;
-  element.querySelector("strong").textContent = fallback ? "MEXC UNAVAILABLE — FALLBACK ACTIVE" : "MARKET DATA UNAVAILABLE";
+  element.querySelector("strong").textContent = fallback ? `${provider.failover?.primaryName ?? "PRIMARY FEED"} UNAVAILABLE — FALLBACK ACTIVE` : "MARKET DATA UNAVAILABLE";
   element.querySelector("span").textContent = provider.message;
 }
 
@@ -260,7 +260,7 @@ function renderBook(book) {
   $("bids").innerHTML = rows((book?.bids ?? []).slice(0, 6), "bid");
 }
 
-function manualConfidenceFor(symbol, horizonMinutes, strategyVersion = "0.6.0") {
+function manualConfidenceFor(symbol, horizonMinutes, strategyVersion = "0.7.0") {
   return state.manualSignals?.empiricalConfidence?.find((item) => item.symbol === symbol && item.horizonMinutes === horizonMinutes && item.strategyVersion === strategyVersion) ?? null;
 }
 
@@ -568,8 +568,9 @@ function renderManualSignals() {
   $("manual-signal-scan").textContent = manual.nextScanAt ? time(manual.nextScanAt) : "—";
   const terminalSource = terminal?.source;
   $("manual-signal-source").textContent = terminalSource?.status === "LIVE"
-    ? `${terminalSource.sourceName ?? terminalSource.source} · ${time(terminalSource.sourceTimestamp)}${terminalSource.fallback?.active ? " · FALLBACK" : ""}${terminalSource.actionSourceCoherent === false ? " · SURSE DIFERITE — BLOCAT" : ""}`
+    ? `${terminalSource.sourceName ?? terminalSource.source} · tick ${time(terminalSource.sourceTimestamp)}${terminalSource.fallback?.active ? ` · FALLBACK ${terminalSource.fallback.fallbackName ?? terminalSource.sourceName ?? terminalSource.source}` : " · PRIMARY"}${terminalSource.actionSourceCoherent === false ? " · SURSE DIFERITE — BLOCAT" : ""}`
     : "Fără preț Spot proaspăt";
+  $("manual-candle-freshness").textContent = `1m ${time(terminalSource?.completedOneMinuteAt)} (${terminalSource?.candleStatuses?.["1m"] ?? "—"}) · 5m ${time(terminalSource?.completedFiveMinuteAt)} (${terminalSource?.candleStatuses?.["5m"] ?? "—"}) · analiză ${time(terminalSource?.analysisCalculatedAt)}`;
 
   const checkLabel = (code) => ({
     CURRENT_ENTRY_RECHECK: "Revalidare setup", SIGNAL_DESK_DISABLED: "Scanner dezactivat",
@@ -584,14 +585,44 @@ function renderManualSignals() {
     const direction = ["UP", "DOWN"].includes(item?.direction) ? ` · ${directionMeta(item.direction).label}` : "";
     return `<div class="terminal-confirm ${passed ? "terminal-pass" : skipped ? "terminal-skip" : "terminal-block"}"><small>${escape(label)}</small><b>${passed ? "CONFIRMAT" : skipped ? "NEVERIFICAT" : "AȘTEAPTĂ"}${escape(direction)}</b><span>${time(item?.completedAt)}</span></div>`;
   };
+  const interactionLabel = (value) => ({ CLEAR: "DEPARTE", APPROACHING: "SE APROPIE", TESTING: "TESTEAZĂ NIVELUL", REJECTED: "RESPINGERE CONFIRMATĂ", BREAK_PENDING_CONFIRMATION: "BREAKOUT NEConfirmat", BREAK_CONFIRMED: "BREAKOUT CONFIRMAT", UNAVAILABLE: "NEVERIFICAT" })[value] ?? String(value ?? "NEVERIFICAT").replaceAll("_", " ");
+  const interactionSummary = (item) => `${interactionLabel(item?.status)}${item?.hasConfirmedBreak && item?.status !== "BREAK_CONFIRMED" ? ` + BREAK CONFIRMAT LA ${Number.isFinite(item.confirmedBreakLevel) ? money(item.confirmedBreakLevel) : "NIVEL ANTERIOR"}` : ""}`;
+  const correctionLabel = (value) => ({ NO_CORRECTION: "FĂRĂ CORECȚIE", CORRECTION_STARTING: "CORECȚIE POSIBILĂ", CORRECTION_ACTIVE: "CORECȚIE ACTIVĂ", CORRECTION_END_CONFIRMED: "FINAL CORECȚIE CONFIRMAT", LOCAL_LEVEL_BREAK_CONFIRMED: "NIVEL LOCAL STRĂPUNS", NO_TREND: "FĂRĂ TREND", INSUFFICIENT_DATA: "DATE INSUFICIENTE", UNAVAILABLE: "NEVERIFICAT" })[value] ?? String(value ?? "NEVERIFICAT").replaceAll("_", " ");
+  const outlookLabel = (value) => ({ CONTINUATION_UP: "CONTINUARE PROBABILĂ UP", CONTINUATION_DOWN: "CONTINUARE PROBABILĂ DOWN", REVERSAL_WATCH_UP: "POSIBILĂ TRANZIȚIE UP", REVERSAL_WATCH_DOWN: "POSIBILĂ TRANZIȚIE DOWN", RANGE_OR_TRANSITION: "RANGE / TRANZIȚIE", UNAVAILABLE: "NEVERIFICAT" })[value] ?? String(value ?? "NEVERIFICAT").replaceAll("_", " ");
   const level = (label, item, kind) => {
+    const interaction = interactionSummary(item?.interaction);
     const context = Number.isFinite(item?.distanceBps)
-      ? `${item.distanceBps.toFixed(1)} bps · ${item.proximity === "NEAR" ? "APROAPE" : "LIBER"} · ${item.timeframe ?? "—"} · ${(item.source ?? "SURSA NECUNOSCUTĂ").replaceAll("_", " ")}`
+      ? `${item.distanceBps.toFixed(1)} bps · ${interaction} · ${item.timeframe ?? "—"} · ${(item.source ?? "SURSA NECUNOSCUTĂ").replaceAll("_", " ")}`
       : "nivel indisponibil";
     return `<div class="terminal-level ${kind}"><small>${label}</small><b>${Number.isFinite(item?.price) ? money(item.price) : "—"}</b><span title="${escape(context)}">${escape(context)}</span></div>`;
   };
+  const decisionExplanation = (round) => {
+    const correction = round.correction;
+    const code = round.actionable?.primaryBlocker?.code;
+    if (["CORRECTION_ACTIVE", "CORRECTION_STARTING"].includes(correction?.status)) return `Trendul 5m rămâne ${correction.trendDirection}, dar corecția 1m este încă activă; așteaptă confirmarea finalului ei.`;
+    if (correction?.status === "LOCAL_LEVEL_BREAK_CONFIRMED") return `Două lumânări 1m închise au străpuns nivelul local de ${correction.levelInteraction?.kind === "SUPPORT" ? "suport" : "rezistență"}${Number.isFinite(correction.levelInteraction?.confirmedBreakLevel) ? ` la ${money(correction.levelInteraction.confirmedBreakLevel)}` : ""}. Intrarea rămâne blocată până la reconfirmare; trendul 5m nu este declarat invalid fără închiderea sa structurală.`;
+    return ({
+      COMPLETED_1M_TRIGGER: "Așteaptă o lumânare 1m închisă cu impuls sau respingere clară în direcția trendului.",
+      FIVE_MINUTE_CONFIRMATION: "Triggerul 1m nu este încă susținut de structura trendului 5m.",
+      FIFTEEN_MINUTE_ALIGNMENT: "Contextul 15m este opus sau neutru; direcția nu are încă aliniere completă.",
+      QUALITY: "Scorul setupului este sub pragul minim de calitate.",
+      TRIGGER_FRESHNESS: "Triggerul 1m a expirat; se așteaptă următoarea lumânare relevantă.",
+      CANDLE_SOURCE_COHERENCE: "Lumânările, prețul și order book-ul nu vin momentan din aceeași sursă.",
+      MARKET_FRESHNESS: "Datele de piață nu sunt suficient de proaspete pentru evaluare.",
+      CURRENT_ENTRY_RECHECK: "Setupul inițial nu mai este prezent în analiza actuală.",
+    })[code] ?? round.actionable?.primaryBlocker?.text ?? "Așteaptă alinierea fluxului 1m, trendului 5m și contextului 15m.";
+  };
   const roundMarkup = (round) => {
-    const bias = ["UP", "DOWN"].includes(round.setupDirection) ? directionMeta(round.setupDirection) : { label: "— NEUTRU", meaning: "Tendința nu este suficient de clară." };
+    const forecast = round.forecast ?? { upPercent: 50, downPercent: 50, leader: "NEUTRAL", confidence: "LOW", available: false };
+    const forecastAvailable = forecast.available !== false && Number.isFinite(forecast.upPercent) && Number.isFinite(forecast.downPercent);
+    const flow = round.marketFlow?.oneMinute ?? { direction: "NEUTRAL", strengthPercent: 0, momentum: "UNAVAILABLE", bars: 0 };
+    const fiveTrend = round.marketFlow?.fiveMinute ?? { direction: "NEUTRAL", establishedDirection: "NEUTRAL", outlook: "UNAVAILABLE", confidencePercent: 0 };
+    const correction = round.correction ?? { status: "UNAVAILABLE", depthAtr: null, depthBps: null, durationBars: 0, levelInteraction: { status: "UNAVAILABLE" } };
+    const correctionRoute = correction.correctionDirection === "DOWN" ? "PULLBACK DOWN CĂTRE SUPORT" : correction.correctionDirection === "UP" ? "RALIU CORECTIV UP CĂTRE REZISTENȚĂ" : "FĂRĂ DIRECȚIE CORECTIVĂ";
+    const supportInteraction = round.levelInteractions?.support;
+    const resistanceInteraction = round.levelInteractions?.resistance;
+    const trendDirection = ["UP", "DOWN"].includes(fiveTrend.establishedDirection) ? fiveTrend.establishedDirection : fiveTrend.direction;
+    const bias = ["UP", "DOWN"].includes(trendDirection) ? directionMeta(trendDirection) : { label: "— NEUTRU", meaning: "Trendul 5m nu este suficient de clar." };
     const actionDirection = round.actionable?.direction;
     const action = round.state === "ENTER_NOW"
       ? { label: `SETUP PROXY VALID ${directionMeta(actionDirection).label}`, className: actionDirection === "UP" ? "terminal-action-up" : "terminal-action-down", note: "Toate filtrele Spot proxy au trecut. Verifică separat contractul Event Futures; aceasta nu este o instrucțiune sau confirmare de ordin live." }
@@ -601,7 +632,7 @@ function renderManualSignals() {
           ? { label: "ÎNCHEIAT · ISTORIC", className: "terminal-action-track", note: "Acest rezultat proxy nu este un setup nou." }
           : round.state === "DISABLED"
             ? { label: "SCANNER DEZACTIVAT", className: "terminal-action-wait", note: round.actionable?.primaryBlocker?.text ?? "Scannerul manual este dezactivat." }
-            : { label: "WAIT · FĂRĂ SETUP", className: "terminal-action-wait", note: round.actionable?.primaryBlocker?.text ?? "Așteaptă alinierea tuturor confirmărilor." };
+            : { label: "WAIT · FĂRĂ SETUP", className: "terminal-action-wait", note: decisionExplanation(round) };
     const countdownTarget = round.state === "ENTER_NOW" ? round.actionable.entryValidUntil : round.state === "TRACKING" ? round.timing.targetAt : round.timing.entryValidUntil;
     const quality = round.quality ?? { score: 0, band: "BELOW_STANDARD", minimum: 68 };
     const invalidation = round.levels?.invalidation;
@@ -613,16 +644,26 @@ function renderManualSignals() {
     const checksMarkup = checks.map((check) => `<div class="terminal-check"><span>${escape(checkLabel(check.code))}</span><b class="gate-${check.status.toLowerCase()}">${escape(check.status)}</b><small>${escape(check.reason)}</small></div>`).join("");
     const reasons = (round.details?.reasons ?? []).slice(-5).map((reason) => `<li>${escape(reason)}</li>`).join("");
     return `<article class="event-round-card event-round-${round.state.toLowerCase()}">
-      <div class="event-round-head"><div><small>PREVIZIUNE MANUALĂ</small><strong>${escape(round.symbol)} · ${round.horizonMinutes} MINUTE</strong></div><div class="event-countdown"><small>${round.state === "ENTER_NOW" ? "SETUPUL EXPIRĂ" : round.state === "TRACKING" ? "REZULTAT PROXY" : "TRIGGER VALID"}</small><b>${countdownTarget ? remaining(countdownTarget) : "—"}</b></div></div>
+      <div class="event-round-head"><div><small>ORIZONT ANALIZAT</small><strong>${escape(round.symbol)} · ${round.horizonMinutes} MINUTE</strong></div><div class="event-countdown"><small>${round.state === "ENTER_NOW" ? "SETUPUL EXPIRĂ" : round.state === "TRACKING" ? "REZULTAT PROXY" : "TRIGGER VALID"}</small><b>${countdownTarget ? remaining(countdownTarget) : "—"}</b></div></div>
+      <div class="terminal-forecast">
+        <div class="forecast-side forecast-up"><small>ESTIMARE TEHNICĂ UP</small><b>↑ ${forecastAvailable ? `${forecast.upPercent}%` : "—"}</b></div>
+        <div class="forecast-center"><div class="forecast-track"><i class="forecast-up-fill" style="width:${forecastAvailable ? forecast.upPercent : 0}%"></i><i class="forecast-down-fill" style="width:${forecastAvailable ? forecast.downPercent : 0}%"></i></div><strong>${escape(forecastAvailable ? (forecast.leader === "NEUTRAL" ? "ECHILIBRU" : `${directionMeta(forecast.leader).label} DOMINANT`) : "DATE INSUFICIENTE")}</strong><span>${escape(forecastAvailable ? `${forecast.confidence} · scor tehnic necalibrat, nu rată garantată` : "Procentele apar numai după minimum 50 de lumânări închise pe toate intervalele")}</span></div>
+        <div class="forecast-side forecast-down"><small>ESTIMARE TEHNICĂ DOWN</small><b>${forecastAvailable ? `${forecast.downPercent}%` : "—"} ↓</b></div>
+      </div>
       <div class="terminal-decision-grid">
-        <div class="terminal-bias ${directionClass(round.setupDirection)}"><small>BIAS PIAȚĂ</small><b>${escape(bias.label)}</b><span>${round.confirmations?.fifteenMinute?.regime ?? "INSUFFICIENT_DATA"} pe 15m</span></div>
-        <div class="terminal-action ${action.className}"><small>STARE SEMNAL</small><b>${escape(action.label)}</b><span>${escape(action.note)}</span></div>
+        <div class="terminal-bias ${directionClass(trendDirection)}"><small>TREND STABILIT PE 5m</small><b>${escape(bias.label)}</b><span>${escape(outlookLabel(fiveTrend.outlook))} · acord ${fiveTrend.confidencePercent ?? 0}%</span></div>
+        <div class="terminal-action ${action.className}"><small>DECIZIE ACUM</small><b>${escape(action.label)}</b><span>${escape(action.note)}</span></div>
+      </div>
+      <div class="terminal-pulse-grid">
+        <div class="terminal-pulse ${directionClass(flow.direction)}"><small>FLUX ULTIMELE ${flow.bars ?? 0} LUMÂNĂRI 1m</small><b>${escape(directionMeta(flow.direction).label)} · ${flow.strengthPercent ?? 0}%</b><span>impuls ${escape(String(flow.momentum ?? "UNAVAILABLE").replaceAll("_", " ").toLowerCase())}</span></div>
+        <div class="terminal-pulse correction-${String(correction.status ?? "unavailable").toLowerCase()}"><small>CORECȚIE FAȚĂ DE TRENDUL 5m</small><b>${escape(correctionLabel(correction.status))}</b><span>${escape(correctionRoute)}${Number.isFinite(correction.depthAtr) ? ` · ${correction.depthAtr.toFixed(2)} ATR · ${correction.durationBars} lumânări 1m` : " · se așteaptă suficiente lumânări închise"}</span></div>
+        <div class="terminal-pulse"><small>INTERACȚIUNI CU NIVELURILE</small><b>S ${escape(interactionSummary(supportInteraction))} · R ${escape(interactionSummary(resistanceInteraction))}</b><span>SUPORT ${Number.isFinite(supportInteraction?.level) ? money(supportInteraction.level) : "—"} · REZISTENȚĂ ${Number.isFinite(resistanceInteraction?.level) ? money(resistanceInteraction.level) : "—"}</span></div>
       </div>
       <div class="terminal-prices"><div><small>REFERINȚĂ 1m ÎNCHISĂ</small><b>${Number.isFinite(round.prices?.reference?.value) ? money(round.prices.reference.value) : "—"}</b><span>${time(round.prices?.reference?.observedAt)}</span></div><div><small>PREȚ PROXY ÎNREGISTRAT</small><b>${Number.isFinite(round.prices?.entry?.value) ? money(round.prices.entry.value) : "—"}</b><span>${round.state === "ENTER_NOW" || round.state === "TRACKING" ? "observație Spot salvată" : "numai la setup proxy valid"}</span></div><div><small>PREȚ SPOT ACUM</small><b>${Number.isFinite(round.prices?.current?.value) ? money(round.prices.current.value) : "—"}</b><span>${time(round.prices?.current?.observedAt)}</span></div></div>
       <div class="terminal-confirmations">${confirmation("TRIGGER 1m", round.confirmations?.oneMinute)}${confirmation("TREND 5m", round.confirmations?.fiveMinute)}${confirmation("TREND 15m", round.confirmations?.fifteenMinute)}</div>
       <div class="terminal-levels">${level("SUPORT", round.levels?.support, "support")}${level("REZISTENȚĂ", round.levels?.resistance, "resistance")}<div class="terminal-level invalidation"><small>INVALIDARE</small><b>${Number.isFinite(invalidation?.price) ? money(invalidation.price) : "—"}</b><span title="${escape(invalidation?.text ?? invalidationContext)}">${escape(invalidationContext || "nivel necesar")}</span></div></div>
       <div class="terminal-quality"><div><small>CALITATE SETUP · MINIM ${quality.minimum}</small><b>${quality.score}/100 · ${escape(quality.band)}</b></div><i><span style="width:${Math.max(0, Math.min(100, quality.score))}%"></span></i></div>
-      <div class="terminal-primary-reason ${round.state === "ENTER_NOW" ? "reason-ready" : "reason-wait"}"><strong>${round.state === "ENTER_NOW" ? "TOATE FILTRELE SPOT PROXY AU TRECUT" : escape(checkLabel(round.actionable?.primaryBlocker?.code ?? "WAIT_FOR_SETUP"))}</strong><span>${escape(round.actionable?.primaryBlocker?.text ?? action.note)}</span></div>
+      <div class="terminal-primary-reason ${round.state === "ENTER_NOW" ? "reason-ready" : "reason-wait"}"><strong>${round.state === "ENTER_NOW" ? "TOATE FILTRELE SPOT PROXY AU TRECUT" : escape(checkLabel(round.actionable?.primaryBlocker?.code ?? "WAIT_FOR_SETUP"))}</strong><span>${escape(round.state === "ENTER_NOW" ? action.note : decisionExplanation(round))}</span></div>
       <details class="terminal-details"><summary>Vezi analiza completă și toate filtrele</summary><div class="terminal-checks">${checksMarkup || '<div class="terminal-check"><small>Se așteaptă evaluarea.</small></div>'}</div>${reasons ? `<ul>${reasons}</ul>` : ""}<p>Calitatea este un scor determinist, nu probabilitate garantată. Setupul folosește doar proxy Spot; contractul, payout-ul, lichiditatea și decontarea Event Futures trebuie verificate separat. Aplicația nu trimite ordine.</p></details>
     </article>`;
   };

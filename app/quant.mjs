@@ -5,7 +5,7 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 export const QUALITY_THRESHOLDS = Object.freeze({ standard: 68, high: 78, exceptional: 88 });
 export const STAKE_PROFILES = Object.freeze({ FLAT: "FLAT", ADAPTIVE_CAPPED: "ADAPTIVE_CAPPED", OBSERVED_10_30_90_270: "OBSERVED_10_30_90_270" });
 const AUTONOMOUS_STRATEGY = "completed-candle-mtf-entry-gates";
-export const AUTONOMOUS_STRATEGY_VERSION = "0.6.0";
+export const AUTONOMOUS_STRATEGY_VERSION = "0.7.0";
 const analysisTimeframes = ["1m", "5m", "15m", "1h"];
 
 export function sma(values, period) {
@@ -236,6 +236,132 @@ export function detectOneMinuteTrigger(candles, indicators = calculateIndicators
   };
 }
 
+export function analyzeOneMinuteFlow(candles, indicators = calculateIndicators(candles)) {
+  const sample = candles.filter((candle) => candle.closed === true).slice(-8);
+  const atrValue = indicators.atr14;
+  const unavailable = { status: "INSUFFICIENT_DATA", direction: "NEUTRAL", signedScore: 0, strengthPercent: 0, momentum: "UNAVAILABLE", bars: sample.length, netAtr: null, bodyPressure: null, wickPressure: null, upMoves: 0, downMoves: 0 };
+  if (sample.length < 5 || !Number.isFinite(atrValue) || atrValue <= 0) return unavailable;
+  const changes = sample.slice(1).map((candle, index) => candle.close - sample[index].close);
+  const upMoves = changes.filter((change) => change > 0).length;
+  const downMoves = changes.filter((change) => change < 0).length;
+  const netAtr = (sample.at(-1).close - sample[0].close) / atrValue;
+  const bodyPressure = sample.reduce((sum, candle) => sum + (candle.close - candle.open) / atrValue, 0) / sample.length;
+  const wickPressure = sample.reduce((sum, candle) => {
+    const upper = candle.high - Math.max(candle.open, candle.close);
+    const lower = Math.min(candle.open, candle.close) - candle.low;
+    return sum + (lower - upper) / atrValue;
+  }, 0) / sample.length;
+  const moveBalance = (upMoves - downMoves) / Math.max(1, changes.length);
+  const signedScore = clamp(netAtr * 0.38 + bodyPressure * 0.32 + moveBalance * 0.2 + wickPressure * 0.1, -1, 1);
+  const direction = signedScore >= 0.12 ? "UP" : signedScore <= -0.12 ? "DOWN" : "NEUTRAL";
+  const recentImpulse = changes.slice(-3).reduce((sum, change) => sum + change, 0) / atrValue;
+  const priorImpulse = changes.slice(-6, -3).reduce((sum, change) => sum + change, 0) / atrValue;
+  const sameDirection = Math.sign(recentImpulse) !== 0 && Math.sign(recentImpulse) === Math.sign(priorImpulse);
+  const momentum = Math.abs(recentImpulse) < 0.12 ? "FLAT" : sameDirection && Math.abs(recentImpulse) > Math.abs(priorImpulse) * 1.2 ? "ACCELERATING" : sameDirection && Math.abs(recentImpulse) < Math.abs(priorImpulse) * 0.75 ? "DECELERATING" : "STEADY";
+  return {
+    status: "READY", direction, signedScore, strengthPercent: Math.round(Math.abs(signedScore) * 100), momentum, bars: sample.length,
+    netAtr, bodyPressure, wickPressure, upMoves, downMoves,
+    completedAt: new Date(sample.at(-1).closeTime).toISOString(),
+    classification: "COMPLETED_1M_FLOW_NOT_FORMING_CANDLE",
+  };
+}
+
+export function analyzeFiveMinuteTrend(candles, analysis = timeframeAnalysis("5m", candles), structure = marketStructure("5m", candles)) {
+  const sample = candles.filter((candle) => candle.closed === true);
+  const current = sample.at(-1); const indicators = analysis.indicators;
+  if (sample.length < 30 || !current || !Number.isFinite(indicators.atr14) || indicators.atr14 <= 0) {
+    return { status: "INSUFFICIENT_DATA", direction: "NEUTRAL", outlook: "UNAVAILABLE", signedScore: 0, confidencePercent: 0, regime: analysis.regime, structureDirection: structure.structureDirection ?? "NEUTRAL", completedAt: null };
+  }
+  const previousIndicators = calculateIndicators(sample.slice(0, -1));
+  const regimeVote = analysis.regime === "BULLISH" ? 1 : analysis.regime === "BEARISH" ? -1 : 0;
+  const structureVote = structure.structureDirection === "UP" ? 1 : structure.structureDirection === "DOWN" ? -1 : 0;
+  const recent = sample.slice(-5);
+  const closeSlopeAtr = (recent.at(-1).close - recent[0].close) / indicators.atr14;
+  const emaSlopeAtr = Number.isFinite(previousIndicators.ema9) ? (indicators.ema9 - previousIndicators.ema9) / indicators.atr14 : 0;
+  const signedScore = clamp(regimeVote * 0.32 + structureVote * 0.38 + clamp(closeSlopeAtr, -1, 1) * 0.2 + clamp(emaSlopeAtr * 4, -1, 1) * 0.1, -1, 1);
+  const direction = signedScore >= 0.15 ? "UP" : signedScore <= -0.15 ? "DOWN" : "NEUTRAL";
+  const establishedDirection = structureVote !== 0 ? (structureVote > 0 ? "UP" : "DOWN") : regimeVote !== 0 ? (regimeVote > 0 ? "UP" : "DOWN") : "NEUTRAL";
+  const outlook = direction === "NEUTRAL" ? "RANGE_OR_TRANSITION"
+    : establishedDirection === "NEUTRAL" || direction === establishedDirection ? `CONTINUATION_${direction}` : `REVERSAL_WATCH_${direction}`;
+  return {
+    status: "READY", direction, establishedDirection, outlook, signedScore, confidencePercent: Math.round(Math.abs(signedScore) * 100),
+    regime: analysis.regime, structureDirection: structure.structureDirection, closeSlopeAtr, emaSlopeAtr,
+    completedAt: new Date(current.closeTime).toISOString(), classification: "COMPLETED_5M_TREND_OUTLOOK_NOT_GUARANTEE",
+  };
+}
+
+export function detectLevelInteraction(candles, level, kind, atrValue) {
+  const sample = candles.filter((candle) => candle.closed === true).slice(-3);
+  const current = sample.at(-1); const previous = sample.at(-2);
+  if (!current || !Number.isFinite(level?.price) || !Number.isFinite(atrValue) || atrValue <= 0 || !["SUPPORT", "RESISTANCE"].includes(kind)) return { kind, status: "UNAVAILABLE", level: level?.price ?? null, observedAt: null };
+  const price = level.price; const tolerance = atrValue * 0.15;
+  const distanceAtr = Math.abs(current.close - price) / atrValue;
+  const body = Math.abs(current.close - current.open);
+  const rejected = kind === "SUPPORT"
+    ? current.low <= price + tolerance && current.close > price && current.close >= current.open && Math.min(current.open, current.close) - current.low >= body * 0.7
+    : current.high >= price - tolerance && current.close < price && current.close <= current.open && current.high - Math.max(current.open, current.close) >= body * 0.7;
+  const currentBeyond = kind === "SUPPORT" ? current.close < price : current.close > price;
+  const previousBeyond = previous ? (kind === "SUPPORT" ? previous.close < price : previous.close > price) : false;
+  const touched = kind === "SUPPORT" ? current.low <= price + tolerance : current.high >= price - tolerance;
+  const status = currentBeyond && previousBeyond ? "BREAK_CONFIRMED"
+    : currentBeyond ? "BREAK_PENDING_CONFIRMATION"
+      : rejected ? "REJECTED"
+        : touched ? "TESTING"
+          : distanceAtr <= 0.75 ? "APPROACHING" : "CLEAR";
+  const hasConfirmedBreak = status === "BREAK_CONFIRMED" || level.confirmedBreak === true;
+  return { kind, status, level: price, distanceAtr, touched, rejected, hasConfirmedBreak, confirmedBreakLevel: status === "BREAK_CONFIRMED" ? price : level.confirmedBreakLevel ?? null, observedAt: new Date(current.closeTime).toISOString(), source: level.source ?? null, timeframe: level.timeframe ?? null };
+}
+
+export function detectCorrectionState(candles, trendDirection, atrValue, support, resistance, oneMinuteTrigger) {
+  const sample = candles.filter((candle) => candle.closed === true).slice(-10);
+  const base = { status: "UNAVAILABLE", trendDirection, correctionDirection: "NEUTRAL", depthAtr: null, depthBps: null, durationBars: 0, severity: "NONE", targetLevel: null, levelInteraction: null, confirmedAt: null, text: "Correction state unavailable." };
+  if (sample.length < 5 || !["UP", "DOWN"].includes(trendDirection) || !Number.isFinite(atrValue) || atrValue <= 0) return { ...base, status: trendDirection === "NEUTRAL" ? "NO_TREND" : "INSUFFICIENT_DATA" };
+  const current = sample.at(-1); const previous = sample.at(-2); const anchors = sample.slice(0, -1);
+  const anchor = anchors.reduce((selected, candle, index) => {
+    if (!selected) return { candle, index };
+    const better = trendDirection === "UP" ? candle.close > selected.candle.close : candle.close < selected.candle.close;
+    return better ? { candle, index } : selected;
+  }, null);
+  const durationBars = sample.length - 1 - anchor.index;
+  const rawDepth = trendDirection === "UP" ? anchor.candle.close - current.close : current.close - anchor.candle.close;
+  const depth = Math.max(0, rawDepth); const depthAtr = depth / atrValue;
+  const moves = sample.slice(anchor.index + 1).map((candle, index) => candle.close - sample[anchor.index + index].close);
+  const counterMoves = moves.filter((move) => trendDirection === "UP" ? move < 0 : move > 0).length;
+  const historicalCorrection = sample.slice(0, -2).reduce((result, anchorCandle, anchorIndex) => {
+    const priorCloses = sample.slice(0, anchorIndex + 1).map((candle) => candle.close);
+    const isRunningExtreme = trendDirection === "UP" ? anchorCandle.close >= Math.max(...priorCloses) : anchorCandle.close <= Math.min(...priorCloses);
+    if (!isRunningExtreme) return result;
+    return sample.slice(anchorIndex + 2, -1).reduce((episode, candle, offset) => {
+      const endIndex = anchorIndex + offset + 2;
+      const historicalRawDepth = trendDirection === "UP" ? anchorCandle.close - candle.close : candle.close - anchorCandle.close;
+      const historicalDepth = Math.max(0, historicalRawDepth);
+      const historicalDepthAtr = historicalDepth / atrValue;
+      const historicalDurationBars = endIndex - anchorIndex;
+      const historicalMoves = sample.slice(anchorIndex + 1, endIndex + 1).map((item, moveIndex) => item.close - sample[anchorIndex + moveIndex].close);
+      const historicalCounterMoves = historicalMoves.filter((move) => trendDirection === "UP" ? move < 0 : move > 0).length;
+      const observed = historicalDepthAtr >= 0.25 && historicalDurationBars >= 2 && historicalCounterMoves >= Math.ceil(historicalDurationBars / 2);
+      return { observed: episode.observed || observed, maxDepth: Math.max(episode.maxDepth, observed ? historicalDepth : 0) };
+    }, result);
+  }, { observed: false, maxDepth: 0 });
+  const targetLevel = trendDirection === "UP" ? support : resistance;
+  const levelInteraction = detectLevelInteraction(sample, targetLevel, trendDirection === "UP" ? "SUPPORT" : "RESISTANCE", atrValue);
+  const invalidated = levelInteraction.hasConfirmedBreak === true;
+  const correctionObserved = depthAtr >= 0.25 && durationBars >= 2 && counterMoves >= Math.ceil(durationBars / 2);
+  const correctionStarting = !correctionObserved && depthAtr >= 0.12 && durationBars >= 1;
+  const resumed = historicalCorrection.observed && oneMinuteTrigger?.direction === trendDirection && (trendDirection === "UP" ? current.close > previous.high : current.close < previous.low);
+  const reportedDepth = resumed ? Math.max(depth, historicalCorrection.maxDepth) : depth;
+  const reportedDepthAtr = reportedDepth / atrValue;
+  const reportedDepthBps = current.close > 0 ? reportedDepth / current.close * 10000 : null;
+  const status = invalidated ? "LOCAL_LEVEL_BREAK_CONFIRMED" : resumed ? "CORRECTION_END_CONFIRMED" : correctionObserved ? "CORRECTION_ACTIVE" : correctionStarting ? "CORRECTION_STARTING" : "NO_CORRECTION";
+  const severity = reportedDepthAtr >= 1.2 ? "DEEP" : reportedDepthAtr >= 0.65 ? "MODERATE" : reportedDepthAtr >= 0.25 ? "SHALLOW" : "NONE";
+  const text = status === "LOCAL_LEVEL_BREAK_CONFIRMED" ? `Two completed 1m closes confirmed a local break of ${levelInteraction.kind.toLowerCase()}${Number.isFinite(levelInteraction.confirmedBreakLevel) ? ` at ${levelInteraction.confirmedBreakLevel}` : ""}; the higher-timeframe trend is not declared invalid until its own invalidation candle closes.`
+    : status === "CORRECTION_END_CONFIRMED" ? `Correction end confirmed by a completed 1m ${trendDirection} trigger.`
+      : status === "CORRECTION_ACTIVE" ? `${severity.toLowerCase()} counter-trend correction active for ${durationBars} completed 1m candles.`
+        : status === "CORRECTION_STARTING" ? "A counter-trend pullback may be starting; confirmation is not complete."
+          : "No qualifying 1m correction against the established 5m trend.";
+  return { status, trendDirection, correctionDirection: trendDirection === "UP" ? "DOWN" : "UP", depthAtr: reportedDepthAtr, depthBps: reportedDepthBps, durationBars, counterMoves, historicalCorrectionObserved: historicalCorrection.observed, severity, targetLevel, levelInteraction, confirmedAt: new Date(current.closeTime).toISOString(), text, classification: "COMPLETED_CANDLE_CORRECTION_STATE_NOT_FORECAST_CERTAINTY" };
+}
+
 export function generateSignals(candles, options = {}) {
   const thresholds = { ...QUALITY_THRESHOLDS, ...(options.thresholds ?? {}) };
   const symbol = options.symbol ?? "UNKNOWN";
@@ -247,6 +373,9 @@ export function generateSignals(candles, options = {}) {
   const current = triggerCandles.at(-1);
   const oneMinuteTrigger = detectOneMinuteTrigger(triggerCandles, analyses["1m"].indicators);
   const trigger = oneMinuteTrigger.direction === "UP" ? oneMinuteTrigger.strength : oneMinuteTrigger.direction === "DOWN" ? -oneMinuteTrigger.strength : 0;
+  const oneMinuteFlow = analyzeOneMinuteFlow(triggerCandles, analyses["1m"].indicators);
+  const oneMinuteComposite = clamp(trigger * 0.62 + oneMinuteFlow.signedScore * 0.38, -1, 1);
+  const fiveMinuteTrend = analyzeFiveMinuteTrend(completed["5m"], analyses["5m"], structureFeatures["5m"]);
   const triggerCloseMs = Number.isFinite(current?.closeTime) ? current.closeTime : null;
   const triggerValidUntil = triggerCloseMs === null ? null : new Date(triggerCloseMs + (options.triggerGraceMs ?? 90000)).toISOString();
   const fiveMinuteDirection = structureFeatures["5m"].structureDirection ?? "NEUTRAL";
@@ -257,7 +386,7 @@ export function generateSignals(candles, options = {}) {
   ];
   return definitions.map(({ horizonMinutes, weights, emphasis, invalidationTimeframe }) => {
     const directions = Object.fromEntries(analysisTimeframes.map((timeframe) => [timeframe, regimeDirection(analyses[timeframe])]));
-    const signedStrength = trigger * weights.trigger + directions["5m"] * weights["5m"] + directions["15m"] * weights["15m"] + directions["1h"] * weights["1h"];
+    const signedStrength = oneMinuteComposite * weights.trigger + directions["5m"] * weights["5m"] + directions["15m"] * weights["15m"] + directions["1h"] * weights["1h"];
     const intendedDirection = signedStrength > 0 ? 1 : signedStrength < 0 ? -1 : 0;
     const intendedLabel = intendedDirection > 0 ? "UP" : intendedDirection < 0 ? "DOWN" : "NEUTRAL";
     const structuralAlignment = horizonMinutes === 10
@@ -321,8 +450,8 @@ export function generateSignals(candles, options = {}) {
         : (level.price < nearest.price ? level : nearest))
       : null;
     const invalidationPrice = invalidationLevel?.price ?? null;
-    const qualified = qualifiesBeforeInvalidation && invalidationPrice !== null;
-    const direction = qualified ? intendedLabel : "WAIT";
+    let qualified = qualifiesBeforeInvalidation && invalidationPrice !== null;
+    let direction = qualified ? intendedLabel : "WAIT";
     const invalidationBasis = intendedDirection > 0 ? "nearest active structural support" : intendedDirection < 0 ? "nearest active structural resistance" : "no directional structure";
     const invalidation = intendedDirection === 0
       ? `No directional ${horizonMinutes}m bias exists, so no structural invalidation can be assigned.`
@@ -338,46 +467,91 @@ export function generateSignals(candles, options = {}) {
     const levelFeature = structureFeatures[invalidationTimeframe];
     const levelIndicators = analyses[invalidationTimeframe].indicators;
     const levelAtr = levelIndicators.atr14;
-    const nearestLevel = (items, side) => {
-      const eligible = items.filter((item) => Number.isFinite(item.price) && (side === "SUPPORT" ? item.price < price : item.price > price));
-      if (!eligible.length || !(price > 0)) return null;
-      const selected = eligible.reduce((nearest, item) => side === "SUPPORT" ? (item.price > nearest.price ? item : nearest) : (item.price < nearest.price ? item : nearest));
-      const distance = Math.abs(price - selected.price);
-      const distanceAtr = Number.isFinite(levelAtr) && levelAtr > 0 ? distance / levelAtr : null;
-      return { ...selected, timeframe: invalidationTimeframe, distanceBps: distance / price * 10000, distanceAtr, proximity: distanceAtr !== null && distanceAtr <= 0.5 ? "NEAR" : "CLEAR" };
+    const levelInteractionPriority = { BREAK_PENDING_CONFIRMATION: 6, REJECTED: 5, TESTING: 4, APPROACHING: 3, BREAK_CONFIRMED: 2, CLEAR: 1, UNAVAILABLE: 0 };
+    const selectRelevantLevel = (items, side) => {
+      if (!(price > 0)) return { level: null, interaction: detectLevelInteraction(triggerCandles, null, side, triggerAtr) };
+      const evaluated = items.filter((item) => Number.isFinite(item.price)).map((item) => {
+        const distance = Math.abs(price - item.price);
+        const distanceAtr = Number.isFinite(levelAtr) && levelAtr > 0 ? distance / levelAtr : null;
+        const level = { ...item, role: side, timeframe: invalidationTimeframe, distanceBps: distance / price * 10000, distanceAtr, proximity: distanceAtr !== null && distanceAtr <= 0.5 ? "NEAR" : "CLEAR" };
+        return { level, interaction: detectLevelInteraction(triggerCandles, level, side, triggerAtr) };
+      });
+      if (!evaluated.length) return { level: null, interaction: detectLevelInteraction(triggerCandles, null, side, triggerAtr) };
+      const selected = evaluated.reduce((currentSelection, item) => {
+        const selectedPriority = levelInteractionPriority[currentSelection.interaction.status] ?? 0;
+        const itemPriority = levelInteractionPriority[item.interaction.status] ?? 0;
+        return itemPriority > selectedPriority || (itemPriority === selectedPriority && item.level.distanceBps < currentSelection.level.distanceBps) ? item : currentSelection;
+      });
+      const confirmedBreak = evaluated.filter((item) => item.interaction.status === "BREAK_CONFIRMED").sort((left, right) => left.level.distanceBps - right.level.distanceBps)[0] ?? null;
+      if (!confirmedBreak || selected.interaction.status === "BREAK_CONFIRMED") return selected;
+      const level = { ...selected.level, confirmedBreak: true, confirmedBreakLevel: confirmedBreak.level.price };
+      return { level, interaction: { ...selected.interaction, hasConfirmedBreak: true, confirmedBreakLevel: confirmedBreak.level.price } };
     };
-    const supportLevel = nearestLevel([
+    const supportSelection = selectRelevantLevel([
       { price: levelFeature.latestSwingLow?.price, source: "CONFIRMED_SWING_LOW" },
       { price: levelIndicators.support, source: "ROLLING_SUPPORT_30" },
-      { price: levelFeature.emaContext.ema20, source: "EMA20_DYNAMIC_SUPPORT" },
+      { price: levelFeature.emaContext.direction === "UP" ? levelFeature.emaContext.ema20 : null, source: "EMA20_DYNAMIC_SUPPORT" },
       { price: levelFeature.recentFvgs.bullish?.lower, source: "BULLISH_FVG_LOWER_BOUNDARY" },
     ], "SUPPORT");
-    const resistanceLevel = nearestLevel([
+    const resistanceSelection = selectRelevantLevel([
       { price: levelFeature.latestSwingHigh?.price, source: "CONFIRMED_SWING_HIGH" },
       { price: levelIndicators.resistance, source: "ROLLING_RESISTANCE_30" },
-      { price: levelFeature.emaContext.ema20, source: "EMA20_DYNAMIC_RESISTANCE" },
+      { price: levelFeature.emaContext.direction === "DOWN" ? levelFeature.emaContext.ema20 : null, source: "EMA20_DYNAMIC_RESISTANCE" },
       { price: levelFeature.recentFvgs.bearish?.upper, source: "BEARISH_FVG_UPPER_BOUNDARY" },
     ], "RESISTANCE");
+    const supportLevel = supportSelection.level;
+    const resistanceLevel = resistanceSelection.level;
+    const supportInteraction = supportSelection.interaction;
+    const resistanceInteraction = resistanceSelection.interaction;
+    const correctionTrend = fiveMinuteDirection !== "NEUTRAL" ? fiveMinuteDirection : fiveMinuteTrend.establishedDirection ?? fiveMinuteTrend.direction;
+    const correction = detectCorrectionState(triggerCandles, correctionTrend, triggerAtr, supportLevel, resistanceLevel, oneMinuteTrigger);
+    const correctionBlocksEntry = ["CORRECTION_STARTING", "CORRECTION_ACTIVE", "LOCAL_LEVEL_BREAK_CONFIRMED"].includes(correction.status);
+    if (correctionBlocksEntry) { qualified = false; direction = "WAIT"; }
+    const activeDirectionalComponents = confluenceComponents.filter((item) => item.active && ["UP", "DOWN"].includes(item.direction));
+    const upComponentWeight = activeDirectionalComponents.filter((item) => item.direction === "UP").reduce((sum, item) => sum + item.weight, 0);
+    const downComponentWeight = activeDirectionalComponents.filter((item) => item.direction === "DOWN").reduce((sum, item) => sum + item.weight, 0);
+    const confluenceSigned = (upComponentWeight - downComponentWeight) / Math.max(1, upComponentWeight + downComponentWeight);
+    const correctionAdjustment = correction.status === "CORRECTION_ACTIVE" || correction.status === "CORRECTION_STARTING"
+      ? (correctionTrend === "UP" ? -1 : correctionTrend === "DOWN" ? 1 : 0) * (horizonMinutes === 10 ? 0.12 : 0.05)
+      : correction.status === "CORRECTION_END_CONFIRMED" ? (correctionTrend === "UP" ? 1 : -1) * (horizonMinutes === 10 ? 0.1 : 0.04)
+        : correction.status === "LOCAL_LEVEL_BREAK_CONFIRMED" ? (correctionTrend === "UP" ? -1 : 1) * 0.16 : 0;
+    const forecastSigned = complete ? clamp(signedStrength * 0.64 + oneMinuteFlow.signedScore * (horizonMinutes === 10 ? 0.14 : 0.06) + fiveMinuteTrend.signedScore * 0.1 + confluenceSigned * 0.12 + correctionAdjustment, -1, 1) : 0;
+    const technicalUpPercent = complete ? Math.round(clamp(50 + forecastSigned * 42, 8, 92)) : 50;
+    const technicalDownPercent = 100 - technicalUpPercent;
+    const technicalEdge = Math.abs(technicalUpPercent - technicalDownPercent);
+    const forecast = {
+      upPercent: technicalUpPercent, downPercent: technicalDownPercent,
+      leader: technicalUpPercent === technicalDownPercent ? "NEUTRAL" : technicalUpPercent > technicalDownPercent ? "UP" : "DOWN",
+      edgePercent: technicalEdge, confidence: technicalEdge >= 30 ? "HIGH" : technicalEdge >= 16 ? "MEDIUM" : "LOW",
+      available: complete, updatedAt: timeframeCloseWatermarks["1m"],
+      classification: "UNCALIBRATED_TECHNICAL_DIRECTION_ESTIMATE_NOT_WIN_PROBABILITY",
+      factors: { oneMinuteFlow: oneMinuteFlow.signedScore, fiveMinuteTrend: fiveMinuteTrend.signedScore, multiTimeframeStrength: signedStrength, confluence: confluenceSigned, correctionAdjustment },
+    };
+    const supportWithInteraction = supportLevel ? { ...supportLevel, interaction: supportInteraction } : null;
+    const resistanceWithInteraction = resistanceLevel ? { ...resistanceLevel, interaction: resistanceInteraction } : null;
     const fifteenMinuteDirection = regimeDirection(analyses["15m"]) > 0 ? "UP" : regimeDirection(analyses["15m"]) < 0 ? "DOWN" : "NEUTRAL";
     const fifteenMinuteAligned = intendedLabel !== "NEUTRAL" && fifteenMinuteDirection === intendedLabel && !structureContradicted;
     const reasons = complete
-      ? [`${horizonMinutes}m emphasizes ${emphasis}.`, `Completed 1m trigger ${oneMinuteTrigger.direction} uses ${oneMinuteTrigger.patterns.map((pattern) => pattern.name).join(", ") || "no qualifying pattern"}; explicit 5m structure is ${fiveMinuteDirection}.`, `Completed-candle confluence produced setup quality ${qualityScore}/100 (${band}); quality is an auditable rules score, NOT a probability.`, `Market-structure adjustment is ${structureAdjustment >= 0 ? "+" : ""}${structureAdjustment} points from ${alignedStructureWeight} aligned versus ${opposingStructureWeight} opposing component weight.`, `1m relative volume is ${relativeVolume === null ? "unavailable" : `${relativeVolume.toFixed(2)}x`} and volatility is ${volatilityRegime}.`, !structuralAlignment ? "Entry blocked: the completed 1m trigger is not explicitly confirmed by aligned 5m structure and higher-timeframe context." : structureContradicted ? "A recent opposing 15m CHoCH/market-structure shift blocks entry." : volatilityRegime === "EXTREME" ? "Extreme 1m ATR volatility blocks entry." : invalidationPrice === null ? "A finite, unbreached, direction-appropriate structural invalidation level from the declared timeframe is required before entry." : direction === "WAIT" ? `Quality is below the STANDARD threshold ${thresholds.standard}.` : `${direction} alignment qualifies as ${band}.`, invalidation]
+      ? [`${horizonMinutes}m emphasizes ${emphasis}.`, `Technical direction split is ${forecast.upPercent}% UP / ${forecast.downPercent}% DOWN (${forecast.confidence}); this is an uncalibrated rules estimate, not win probability.`, `Completed 1m flow is ${oneMinuteFlow.direction} at ${oneMinuteFlow.strengthPercent}% strength with ${oneMinuteFlow.momentum.toLowerCase()} momentum across ${oneMinuteFlow.bars} bars.`, `Completed 5m trend is ${fiveMinuteTrend.establishedDirection ?? fiveMinuteTrend.direction}; outlook is ${fiveMinuteTrend.outlook} at ${fiveMinuteTrend.confidencePercent}% agreement.`, `${correction.text} Level interaction: ${correction.levelInteraction?.status ?? "UNAVAILABLE"}.`, `Completed 1m trigger ${oneMinuteTrigger.direction} uses ${oneMinuteTrigger.patterns.map((pattern) => pattern.name).join(", ") || "no qualifying pattern"}; explicit 5m structure is ${fiveMinuteDirection}.`, `Completed-candle confluence produced setup quality ${qualityScore}/100 (${band}); quality is an auditable rules score, NOT a probability.`, `Market-structure adjustment is ${structureAdjustment >= 0 ? "+" : ""}${structureAdjustment} points from ${alignedStructureWeight} aligned versus ${opposingStructureWeight} opposing component weight.`, `1m relative volume is ${relativeVolume === null ? "unavailable" : `${relativeVolume.toFixed(2)}x`} and volatility is ${volatilityRegime}.`, !structuralAlignment ? "Entry blocked: the completed 1m trigger is not explicitly confirmed by aligned 5m structure and higher-timeframe context." : correctionBlocksEntry ? `Entry blocked: ${correction.text}` : structureContradicted ? "A recent opposing 15m CHoCH/market-structure shift blocks entry." : volatilityRegime === "EXTREME" ? "Extreme 1m ATR volatility blocks entry." : invalidationPrice === null ? "A finite, unbreached, direction-appropriate structural invalidation level from the declared timeframe is required before entry." : direction === "WAIT" ? `Quality is below the STANDARD threshold ${thresholds.standard}.` : `${direction} alignment qualifies as ${band}.`, invalidation]
       : ["All four timeframes require at least 50 completed candles and a close watermark for EMA50/structure context.", invalidation];
     const watermarkKey = analysisTimeframes.map((timeframe) => `${timeframe}:${timeframeCloseWatermarks[timeframe] ?? "missing"}`).join("|");
     return {
       decisionKey: `${AUTONOMOUS_STRATEGY_VERSION}:${symbol}:${horizonMinutes}:${watermarkKey}`,
       symbol, horizonMinutes, direction, setupDirection: intendedLabel, actionableDirection: qualified ? intendedLabel : null, qualified,
+      forecast, correction, levelInteractions: { support: supportInteraction, resistance: resistanceInteraction },
       qualityScore, qualityBand: band, volatilityRegime, referencePrice: Number.isFinite(price) && price > 0 ? price : null,
       timeframeCloseWatermarks: { ...timeframeCloseWatermarks }, triggerValidUntil, reasons, confluenceComponents,
       technicalFeatures: {
         oneMinuteTrigger,
+        oneMinuteFlow,
+        fiveMinuteTrend,
         fiveMinuteConfirmation: { status: oneMinuteTrigger.direction !== "NEUTRAL" && oneMinuteTrigger.direction === fiveMinuteDirection ? "CONFIRMED" : "NOT_CONFIRMED", direction: fiveMinuteDirection, watermark: timeframeCloseWatermarks["5m"], evidence: structureFeatures["5m"].structureEvidence },
         fifteenMinuteAlignment: { status: fifteenMinuteAligned ? "ALIGNED" : "NOT_ALIGNED", direction: fifteenMinuteDirection, regime: analyses["15m"].regime, watermark: timeframeCloseWatermarks["15m"], evidence: structureFeatures["15m"].structureEvidence },
         higherTimeframeRegimes: { "15m": analyses["15m"].regime, "1h": analyses["1h"].regime },
         relativeVolume20: relativeVolume,
         atrFraction,
       },
-      levels: { support: supportLevel, resistance: resistanceLevel, invalidation: invalidationDetails },
+      levels: { support: supportWithInteraction, resistance: resistanceWithInteraction, invalidation: invalidationDetails },
       structureFeatures: { ...structureFeatures }, invalidationPrice, invalidation, invalidationDetails,
       qualityDefinition: { classification: "DETERMINISTIC_SETUP_QUALITY_NOT_PROBABILITY", baseQuality: Math.round(clamp(baseQuality, 0, 100)), structureAdjustment, scoreRange: [0, 100] },
       strategyName: AUTONOMOUS_STRATEGY, strategyVersion: AUTONOMOUS_STRATEGY_VERSION,
@@ -420,7 +594,7 @@ export function analyzeMarket(candles, payoutRate, now = new Date(), options = {
   if (indicators.support !== null) invalidation.push(`Bullish scenario invalid below 1m support ${indicators.support.toFixed(2)}.`);
   if (indicators.resistance !== null) invalidation.push(`Bearish scenario invalid above 1m resistance ${indicators.resistance.toFixed(2)}.`);
   const candidates = generateSignals(completedCandles, options);
-  return { direction, upScore, downScore, technicalUpProbability, technicalDownProbability, confidence: Math.abs(difference) >= 30 ? "HIGH" : Math.abs(difference) >= 15 ? "MEDIUM" : "LOW", calibrationStatus: "UNCALIBRATED", breakEvenProbability: breakEven, heuristicProbability, reasons, invalidation, timeframes, candidates, classification: "MODEL_ESTIMATE", modelVersion: "rules-v0.6.0", calculatedAt: now.toISOString() };
+  return { direction, upScore, downScore, technicalUpProbability, technicalDownProbability, confidence: Math.abs(difference) >= 30 ? "HIGH" : Math.abs(difference) >= 15 ? "MEDIUM" : "LOW", calibrationStatus: "UNCALIBRATED", breakEvenProbability: breakEven, heuristicProbability, reasons, invalidation, timeframes, candidates, classification: "MODEL_ESTIMATE", modelVersion: "rules-v0.7.0", calculatedAt: now.toISOString() };
 }
 export function adaptiveStake(input) {
   const reasons = []; const breakEven = breakEvenProbability(input.payoutRate);

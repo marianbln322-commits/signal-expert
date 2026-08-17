@@ -7,14 +7,14 @@ services:
       DATABASE_PATH: /app/data/signal-expert.db
       PUBLIC_DIRECTORY: /app/public
       MIGRATION_DIRECTORY: /app/migrations
-      MEXC_SPOT_BASE_URL: https://api.mexc.com
+      PRIMARY_MARKET_BASE_URL: https://data-api.binance.vision
       MARKET_FAILOVER_ENABLED: "true"
-      FALLBACK_MARKET_BASE_URL: https://data-api.binance.vision
+      FALLBACK_MARKET_BASE_URL: https://api.mexc.com
       PROVIDER_TIMEOUT_MS: 5000
       PROVIDER_ATTEMPTS: 2
       MARKET_SYMBOLS: BTCUSDT,ETHUSDT
       TICKER_POLL_MS: 3000
-      CANDLE_POLL_MS: 15000
+      CANDLE_POLL_MS: 5000
       STALE_AFTER_MS: 30000
       ENTRY_TRIGGER_GRACE_MS: ${ENTRY_TRIGGER_GRACE_MS:-90000}
       ENTRY_BTC_MAX_SPREAD_BPS: ${ENTRY_BTC_MAX_SPREAD_BPS:-2}

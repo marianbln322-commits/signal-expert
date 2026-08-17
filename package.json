@@ -1,9 +1,9 @@
 {
   "name": "signal-expert",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
-  "description": "Transparent MEXC market analytics and event-futures research platform",
+  "description": "Transparent Binance-primary market analytics and event-futures research platform",
   "engines": { "node": ">=22.5" },
   "scripts": {
     "dev": "node --watch app/server.mjs",
