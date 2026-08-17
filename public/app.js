@@ -20,6 +20,8 @@ let manualSignalBaselineReady = false;
 let knownReadySignalIds = new Set();
 let manualDeadlineTimer = null;
 let refreshGeneration = 0;
+let refreshInFlight = false;
+let refreshQueued = false;
 try { soundEnabled = localStorage.getItem("signal-expert-manual-signal-sound") === "enabled"; } catch { soundEnabled = false; }
 
 async function request(path, options) {
@@ -475,16 +477,23 @@ function renderAccount() {
 }
 
 async function refresh() {
+  if (document.hidden) { refreshQueued = true; return; }
+  if (refreshInFlight) { refreshQueued = true; return; }
+  refreshInFlight = true;
+  refreshQueued = false;
   const requestedSymbol = state.symbol;
   const generation = ++refreshGeneration;
   try {
-    const [snapshot, account, autonomous, performance, manualSignals] = await Promise.all([request(`/api/v1/market/${requestedSymbol}`), request("/api/v1/paper/account"), request("/api/v1/autonomous/status"), request("/api/v1/autonomous/performance"), request(`/api/v1/manual-signals/status?symbol=${encodeURIComponent(requestedSymbol)}`)]);
+    const dashboard = await request(`/api/v1/dashboard?symbol=${encodeURIComponent(requestedSymbol)}`);
     if (generation !== refreshGeneration || requestedSymbol !== state.symbol) return;
-    state.snapshot = snapshot; state.account = account; state.autonomous = autonomous; state.performance = performance; state.manualSignals = manualSignals;
+    state.snapshot = dashboard.snapshot; state.account = dashboard.account; state.autonomous = dashboard.autonomous; state.performance = dashboard.performance; state.manualSignals = dashboard.manualSignals;
     renderMarket(); renderAccount(); renderAutonomous(); renderManualSignals(); $("connection-error").classList.add("hidden");
   } catch (error) {
     if (generation !== refreshGeneration || requestedSymbol !== state.symbol) return;
     $("connection-error").classList.remove("hidden"); $("connection-error").querySelector("span").textContent = error.message; status($("health"), "OFFLINE");
+  } finally {
+    refreshInFlight = false;
+    if (refreshQueued && !document.hidden) queueMicrotask(refresh);
   }
 }
 
@@ -525,7 +534,9 @@ function configureSound() {
 }
 
 document.querySelectorAll("[data-symbol]").forEach((button) => button.addEventListener("click", () => {
-  state.symbol = button.dataset.symbol;
+  const nextSymbol = button.dataset.symbol;
+  if (state.symbol === nextSymbol && state.snapshot && state.manualSignals) return;
+  state.symbol = nextSymbol;
   document.querySelectorAll("[data-symbol]").forEach((item) => item.classList.toggle("active", item === button));
   state.snapshot = null; state.manualSignals = null; refresh();
 }));
@@ -542,6 +553,7 @@ const metricsPanel = document.querySelector(".metrics-grid");
 if (terminalPanel && metricsPanel) metricsPanel.before(terminalPanel);
 configureSound();
 setInterval(() => { $("clock").textContent = `UTC ${new Date().toISOString().slice(11, 19)}`; }, 1000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 setInterval(refresh, 3000);
 refresh();
 

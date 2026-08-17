@@ -13,7 +13,7 @@ import { EventRiskService, TradingEconomicsCalendarProvider } from "./event-risk
 
 const jsonHeaders = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer", "x-frame-options": "DENY" };
 const types = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml" };
-function sendJson(response, status, value) { response.writeHead(status, jsonHeaders); response.end(JSON.stringify(value)); }
+function sendJson(response, status, value, headers = {}) { response.writeHead(status, { ...jsonHeaders, ...headers }); response.end(JSON.stringify(value)); }
 async function body(request, limit = 65536) { const chunks = []; let size = 0; for await (const chunk of request) { size += chunk.length; if (size > limit) throw new Error("Request body too large"); chunks.push(chunk); } if (!chunks.length) return {}; try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { throw new Error("Invalid JSON body"); } }
 function validatePaper(value) {
   if (!value || typeof value !== "object") throw new Error("Invalid paper position");
@@ -76,7 +76,7 @@ export async function createApplication(options = {}) {
   const server = createServer(async (request, response) => {
     const started = Date.now(); const ip = request.socket.remoteAddress ?? "local"; const bucket = rate.get(ip) ?? { count: 0, reset: started + 60000 };
     if (started > bucket.reset) { bucket.count = 0; bucket.reset = started + 60000; } bucket.count += 1; rate.set(ip, bucket);
-    if (bucket.count > 180) return sendJson(response, 429, { error: "RATE_LIMITED", message: "Too many local requests" });
+    if (bucket.count > 180) return sendJson(response, 429, { error: "RATE_LIMITED", message: "Too many local requests" }, { "retry-after": String(Math.max(1, Math.ceil((bucket.reset - started) / 1000))) });
     const url = new URL(request.url ?? "/", "http://localhost");
     if (request.method === "POST") {
       if (!(request.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) return sendJson(response, 415, { error: "UNSUPPORTED_MEDIA_TYPE", message: "application/json is required" });
@@ -93,6 +93,14 @@ export async function createApplication(options = {}) {
     }
     try {
       if (request.method === "GET" && url.pathname === "/health") return sendJson(response, 200, { status: "ok", timestamp: new Date().toISOString(), mode: config.tradingMode, database: database.health(), eventRisk: eventRisk.status(), entryPolicy: { version: "entry-gates-v0.6.0", liveExecutionAvailable: false }, autonomousExecution: { mode: "PAPER_ONLY", enabled: config.autonomousEnabled && config.tradingMode === "paper", liveAvailable: false }, manualSignals: { mode: "MANUAL_SIGNALS_ONLY", enabled: config.manualSignalsEnabled && config.tradingMode === "paper", marketClassification: "SPOT_PROXY", settlementClassification: "NOT_EVENT_FUTURES_SETTLEMENT", liveExecutionAvailable: false }, liveExecution: { available: false, reason: "No verified MEXC Event Futures execution API is connected; the application supplies manual research signals and PAPER shadow outcomes only." } });
+      if (request.method === "GET" && url.pathname === "/api/v1/dashboard") {
+        if (url.searchParams.getAll("symbol").length !== 1) throw new Error("Invalid symbol query");
+        const requestedSymbol = url.searchParams.get("symbol"); const symbol = requestedSymbol?.toUpperCase();
+        if (!symbol || !config.symbols.includes(symbol)) throw new Error("Invalid symbol query");
+        const snapshot = market.snapshot(symbol);
+        if (!snapshot) return sendJson(response, 404, { error: "NOT_FOUND", message: "Symbol not configured" });
+        return sendJson(response, 200, { timestamp: new Date().toISOString(), symbol, snapshot, account: paper.account(), autonomous: autonomous.status(), performance: autonomous.performance(), manualSignals: manualSignals.status(symbol) });
+      }
       if (request.method === "GET" && url.pathname === "/api/v1/event-risk") return sendJson(response, 200, eventRisk.status());
       if (request.method === "GET" && url.pathname === "/api/v1/sources") return sendJson(response, 200, { timestamp: new Date().toISOString(), sources: market.sources() });
       if (request.method === "GET" && url.pathname.startsWith("/api/v1/market/")) { const symbol = url.pathname.split("/").at(-1).toUpperCase(); const snapshot = market.snapshot(symbol); return snapshot ? sendJson(response, 200, snapshot) : sendJson(response, 404, { error: "NOT_FOUND", message: "Symbol not configured" }); }
@@ -110,7 +118,7 @@ export async function createApplication(options = {}) {
         return signal ? sendJson(response, 200, signal) : sendJson(response, 404, { error: "NOT_FOUND", message: "Manual research signal not found" });
       }
       if (request.method === "POST" && url.pathname === "/api/v1/autonomous/state") return sendJson(response, 200, autonomous.setAction(validateAutonomousAction(await body(request))));
-      if (url.pathname === "/api/v1/autonomous/status" || url.pathname === "/api/v1/autonomous/performance" || url.pathname === "/api/v1/autonomous/state" || url.pathname === "/api/v1/manual-signals/status" || /^\/api\/v1\/manual-signals\/[^/]+$/.test(url.pathname)) return sendJson(response, 405, { error: "METHOD_NOT_ALLOWED" });
+      if (url.pathname === "/api/v1/dashboard" || url.pathname === "/api/v1/autonomous/status" || url.pathname === "/api/v1/autonomous/performance" || url.pathname === "/api/v1/autonomous/state" || url.pathname === "/api/v1/manual-signals/status" || /^\/api\/v1\/manual-signals\/[^/]+$/.test(url.pathname)) return sendJson(response, 405, { error: "METHOD_NOT_ALLOWED" });
       if (request.method === "POST" && url.pathname === "/api/v1/paper/positions") { if (config.tradingMode !== "paper") return sendJson(response, 403, { error: "DISABLED", message: "Paper trading disabled" }); const position = paper.open(validatePaper(await body(request))); return sendJson(response, 201, position); }
       if (request.method === "POST" && url.pathname === "/api/v1/paper/risk-quote") return sendJson(response, 200, paper.riskQuote(validateQuote(await body(request))));
       if (request.method !== "GET") return sendJson(response, 404, { error: "NOT_FOUND" });
