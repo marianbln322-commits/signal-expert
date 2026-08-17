@@ -27,11 +27,17 @@ export class MarketService {
     try {
       await Promise.all(this.symbols.map(async (symbol) => {
         const state = this.states.get(symbol); state.lastAttemptAt = new Date().toISOString();
-        const [ticker, depth] = await Promise.allSettled([this.provider.ticker(symbol), this.provider.depth(symbol)]);
-        if (ticker.status === "fulfilled") { state.ticker = ticker.value; state.errors.ticker = null; this.audit(symbol, "LIVE", ticker.value, ticker.value.failover?.active ? ticker.value.failover.primaryError : null); }
-        else { state.errors.ticker = this.error(ticker.reason); this.audit(symbol, "ERROR", null, state.errors.ticker); }
-        if (depth.status === "fulfilled") { state.depth = depth.value; state.errors.depth = null; }
-        else state.errors.depth = this.error(depth.reason);
+        try {
+          const bundle = typeof this.provider.tickerDepth === "function"
+            ? await this.provider.tickerDepth(symbol)
+            : await Promise.all([this.provider.ticker(symbol), this.provider.depth(symbol)]).then(([ticker, depth]) => ({ ticker, depth }));
+          state.ticker = bundle.ticker; state.depth = bundle.depth; state.errors.ticker = null; state.errors.depth = null;
+          this.audit(symbol, "LIVE", bundle.ticker, bundle.ticker.failover?.active ? bundle.ticker.failover.primaryError : null);
+        } catch (error) {
+          const message = this.error(error);
+          state.ticker = null; state.depth = null; state.errors.ticker = message; state.errors.depth = message;
+          this.audit(symbol, "ERROR", null, message);
+        }
       }));
     } finally { this.tickerBusy = false; }
   }
@@ -40,19 +46,26 @@ export class MarketService {
     try {
       await Promise.all(this.symbols.map(async (symbol) => {
         const state = this.states.get(symbol); state.lastAttemptAt = new Date().toISOString();
-        const results = await Promise.allSettled(timeframes.map((timeframe) => this.provider.klines(symbol, timeframe)));
-        let complete = true;
-        results.forEach((result, index) => {
-          const timeframe = timeframes[index];
-          if (result.status === "fulfilled") { state.candles[timeframe] = result.value; delete state.errors.candles[timeframe]; }
-          else { complete = false; state.candles[timeframe] = null; state.errors.candles[timeframe] = this.error(result.reason); }
-        });
-        if (complete && timeframes.every((timeframe) => this.status(state.candles[timeframe]) === "LIVE")) {
-          const closed = Object.fromEntries(timeframes.map((timeframe) => [timeframe, state.candles[timeframe].data.filter((candle) => candle.closed)]));
-          state.analysis = analyzeMarket(closed, this.payoutRate, new Date(), { symbol, thresholds: this.candidateThresholds, triggerGraceMs: this.entryPolicy.triggerGraceMs });
-          state.analysis.sources = Object.fromEntries(timeframes.map((timeframe) => [timeframe, { source: state.candles[timeframe].source, sourceName: state.candles[timeframe].sourceName, sourceUrl: state.candles[timeframe].sourceUrl, sourceTimestamp: state.candles[timeframe].sourceTimestamp, receivedAt: state.candles[timeframe].receivedAt, failover: state.candles[timeframe].failover }]));
-          this.database.insertSignal(symbol, state.analysis, state.candles["1m"].sourceTimestamp);
-        } else state.analysis = null;
+        try {
+          const envelopes = typeof this.provider.klinesSet === "function"
+            ? await this.provider.klinesSet(symbol, timeframes)
+            : await Promise.all(timeframes.map((timeframe) => this.provider.klines(symbol, timeframe))).then((items) => Object.fromEntries(timeframes.map((timeframe, index) => [timeframe, items[index]])));
+          for (const timeframe of timeframes) { state.candles[timeframe] = envelopes[timeframe]; delete state.errors.candles[timeframe]; }
+          const live = timeframes.every((timeframe) => this.status(state.candles[timeframe]) === "LIVE");
+          const sources = new Set(timeframes.map((timeframe) => state.candles[timeframe]?.source));
+          if (live && sources.size === 1) {
+            const closed = Object.fromEntries(timeframes.map((timeframe) => [timeframe, state.candles[timeframe].data.filter((candle) => candle.closed)]));
+            state.analysis = analyzeMarket(closed, this.payoutRate, new Date(), { symbol, thresholds: this.candidateThresholds, triggerGraceMs: this.entryPolicy.triggerGraceMs });
+            state.analysis.sources = Object.fromEntries(timeframes.map((timeframe) => [timeframe, { source: state.candles[timeframe].source, sourceName: state.candles[timeframe].sourceName, sourceUrl: state.candles[timeframe].sourceUrl, sourceTimestamp: state.candles[timeframe].sourceTimestamp, receivedAt: state.candles[timeframe].receivedAt, failover: state.candles[timeframe].failover }]));
+            this.database.insertSignal(symbol, state.analysis, state.candles["1m"].sourceTimestamp);
+          } else {
+            state.analysis = null;
+            if (sources.size > 1) for (const timeframe of timeframes) state.errors.candles[timeframe] = "Candle timeframes came from mixed providers; analysis fails closed.";
+          }
+        } catch (error) {
+          const message = this.error(error); state.analysis = null;
+          for (const timeframe of timeframes) { state.candles[timeframe] = null; state.errors.candles[timeframe] = message; }
+        }
         const candleErrors = Object.entries(state.errors.candles).map(([timeframe, message]) => `${timeframe}: ${message}`);
         if (candleErrors.length) this.audit(symbol, "ERROR", null, candleErrors.join("; "));
       }));
@@ -80,9 +93,12 @@ export class MarketService {
     const state = this.states.get(symbol); if (!state) return null;
     const marketStatus = this.status(state.ticker); const depthStatus = this.status(state.depth);
     const candleStatuses = Object.fromEntries(timeframes.map((timeframe) => [timeframe, this.status(state.candles[timeframe])]));
+    const candleSources = timeframes.map((timeframe) => state.candles[timeframe]?.source).filter(Boolean);
+    const analysisCoherent = candleSources.length === timeframes.length && new Set(candleSources).size === 1;
+    const candleSource = analysisCoherent ? candleSources[0] : null;
     const candlesLive = timeframes.every((timeframe) => candleStatuses[timeframe] === "LIVE");
     const baseLive = marketStatus === "LIVE" && candlesLive;
-    const dataUsable = baseLive && !state.errors.ticker && Object.keys(state.errors.candles).length === 0;
+    const dataUsable = baseLive && analysisCoherent && !state.errors.ticker && Object.keys(state.errors.candles).length === 0;
     const provider = this.diagnostics(state);
     const orderBookMetrics = deriveOrderBookMetrics(state.depth);
     const eventRisk = this.eventRisk.status();
@@ -90,7 +106,9 @@ export class MarketService {
     const receiptTimes = [state.ticker?.receivedAt, state.depth?.receivedAt].map((value) => new Date(value).getTime());
     const sourceSkewMs = receiptTimes.every(Number.isFinite) ? Math.abs(receiptTimes[0] - receiptTimes[1]) : null;
     const sameEntrySource = Boolean(state.ticker?.source && state.ticker.source === state.depth?.source);
-    const entryMarketReady = dataUsable && depthStatus === "LIVE" && orderBookMetrics.valid && orderBookMetrics.spreadBps <= entryPolicy.maxSpreadBps && orderBookMetrics.topNotional >= entryPolicy.minTopNotional && sameEntrySource && sourceSkewMs !== null && sourceSkewMs <= entryPolicy.maxSourceSkewMs && (!entryPolicy.eventRiskEnabled || eventRisk.allowed === true);
+    const actionSourceCoherent = Boolean(sameEntrySource && candleSource && state.ticker.source === candleSource);
+    const entryCoherent = sameEntrySource && sourceSkewMs !== null && sourceSkewMs <= entryPolicy.maxSourceSkewMs;
+    const entryMarketReady = dataUsable && !state.errors.depth && depthStatus === "LIVE" && orderBookMetrics.valid && orderBookMetrics.spreadBps <= entryPolicy.maxSpreadBps && orderBookMetrics.topNotional >= entryPolicy.minTopNotional && entryCoherent && actionSourceCoherent && (!entryPolicy.eventRiskEnabled || eventRisk.allowed === true);
     const overall = dataUsable ? (provider.fallbackActive || provider.errors.length ? "DEGRADED" : "LIVE") : provider.errors.length ? "ERROR" : "DEGRADED";
     return {
       symbol,
@@ -101,7 +119,7 @@ export class MarketService {
       eventRisk,
       entryPolicy: { ...entryPolicy, classification: "CONFIGURED_ENTRY_GATE_NOT_EVENT_FUTURES_LIQUIDITY" },
       eventFutures: { classification: "UNAVAILABLE", status: "UNAVAILABLE", reason: "No official MEXC Event Futures API has been verified for live payout, contracts or execution. The active underlying Spot source is identified next to every value.", paperPayout: { value: this.payoutRate, classification: "CALCULATED", source: "USER_CONFIGURATION", live: false } },
-      health: { overall, dataUsable, entryMarketReady, market: marketStatus, orderBook: depthStatus, candles: candleStatuses, provider, sourceSkewMs, sameEntrySource, lastAttemptAt: state.lastAttemptAt, error: provider.errors.join("; ") || null },
+      health: { overall, dataUsable, entryMarketReady, analysisCoherent, actionSourceCoherent, entryCoherent, market: marketStatus, orderBook: depthStatus, candles: candleStatuses, provider, sourceSkewMs, sameEntrySource, candleSource, lastAttemptAt: state.lastAttemptAt, error: provider.errors.join("; ") || null },
     };
   }
   entryPolicyFor(symbol) {
@@ -112,7 +130,7 @@ export class MarketService {
   }
   evaluateEntry(candidate, now = new Date()) {
     const snapshot = this.snapshot(candidate?.symbol);
-    if (!snapshot) return { allowed: false, classification: "AUDITABLE_ENTRY_POLICY_PAPER_AND_MANUAL_ONLY", policyVersion: "entry-gates-v0.5.0", evaluatedAt: now.toISOString(), checks: [{ code: "SYMBOL", status: "BLOCKED", reason: "Symbol is not configured.", evidence: null }] };
+    if (!snapshot) return { allowed: false, classification: "AUDITABLE_ENTRY_POLICY_PAPER_AND_MANUAL_ONLY", policyVersion: "entry-gates-v0.6.0", evaluatedAt: now.toISOString(), checks: [{ code: "SYMBOL", status: "BLOCKED", reason: "Symbol is not configured.", evidence: null }] };
     return evaluateEntryGates({ snapshot, candidate, policy: this.entryPolicyFor(candidate.symbol), now });
   }
   sources() {

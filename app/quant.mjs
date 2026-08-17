@@ -5,7 +5,7 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 export const QUALITY_THRESHOLDS = Object.freeze({ standard: 68, high: 78, exceptional: 88 });
 export const STAKE_PROFILES = Object.freeze({ FLAT: "FLAT", ADAPTIVE_CAPPED: "ADAPTIVE_CAPPED", OBSERVED_10_30_90_270: "OBSERVED_10_30_90_270" });
 const AUTONOMOUS_STRATEGY = "completed-candle-mtf-entry-gates";
-export const AUTONOMOUS_STRATEGY_VERSION = "0.5.0";
+export const AUTONOMOUS_STRATEGY_VERSION = "0.6.0";
 const analysisTimeframes = ["1m", "5m", "15m", "1h"];
 
 export function sma(values, period) {
@@ -335,21 +335,49 @@ export function generateSignals(candles, options = {}) {
       condition: intendedDirection > 0 ? "COMPLETED_CLOSE_BELOW" : intendedDirection < 0 ? "COMPLETED_CLOSE_ABOVE" : null,
       basis: invalidationBasis,
     };
+    const levelFeature = structureFeatures[invalidationTimeframe];
+    const levelIndicators = analyses[invalidationTimeframe].indicators;
+    const levelAtr = levelIndicators.atr14;
+    const nearestLevel = (items, side) => {
+      const eligible = items.filter((item) => Number.isFinite(item.price) && (side === "SUPPORT" ? item.price < price : item.price > price));
+      if (!eligible.length || !(price > 0)) return null;
+      const selected = eligible.reduce((nearest, item) => side === "SUPPORT" ? (item.price > nearest.price ? item : nearest) : (item.price < nearest.price ? item : nearest));
+      const distance = Math.abs(price - selected.price);
+      const distanceAtr = Number.isFinite(levelAtr) && levelAtr > 0 ? distance / levelAtr : null;
+      return { ...selected, timeframe: invalidationTimeframe, distanceBps: distance / price * 10000, distanceAtr, proximity: distanceAtr !== null && distanceAtr <= 0.5 ? "NEAR" : "CLEAR" };
+    };
+    const supportLevel = nearestLevel([
+      { price: levelFeature.latestSwingLow?.price, source: "CONFIRMED_SWING_LOW" },
+      { price: levelIndicators.support, source: "ROLLING_SUPPORT_30" },
+      { price: levelFeature.emaContext.ema20, source: "EMA20_DYNAMIC_SUPPORT" },
+      { price: levelFeature.recentFvgs.bullish?.lower, source: "BULLISH_FVG_LOWER_BOUNDARY" },
+    ], "SUPPORT");
+    const resistanceLevel = nearestLevel([
+      { price: levelFeature.latestSwingHigh?.price, source: "CONFIRMED_SWING_HIGH" },
+      { price: levelIndicators.resistance, source: "ROLLING_RESISTANCE_30" },
+      { price: levelFeature.emaContext.ema20, source: "EMA20_DYNAMIC_RESISTANCE" },
+      { price: levelFeature.recentFvgs.bearish?.upper, source: "BEARISH_FVG_UPPER_BOUNDARY" },
+    ], "RESISTANCE");
+    const fifteenMinuteDirection = regimeDirection(analyses["15m"]) > 0 ? "UP" : regimeDirection(analyses["15m"]) < 0 ? "DOWN" : "NEUTRAL";
+    const fifteenMinuteAligned = intendedLabel !== "NEUTRAL" && fifteenMinuteDirection === intendedLabel && !structureContradicted;
     const reasons = complete
       ? [`${horizonMinutes}m emphasizes ${emphasis}.`, `Completed 1m trigger ${oneMinuteTrigger.direction} uses ${oneMinuteTrigger.patterns.map((pattern) => pattern.name).join(", ") || "no qualifying pattern"}; explicit 5m structure is ${fiveMinuteDirection}.`, `Completed-candle confluence produced setup quality ${qualityScore}/100 (${band}); quality is an auditable rules score, NOT a probability.`, `Market-structure adjustment is ${structureAdjustment >= 0 ? "+" : ""}${structureAdjustment} points from ${alignedStructureWeight} aligned versus ${opposingStructureWeight} opposing component weight.`, `1m relative volume is ${relativeVolume === null ? "unavailable" : `${relativeVolume.toFixed(2)}x`} and volatility is ${volatilityRegime}.`, !structuralAlignment ? "Entry blocked: the completed 1m trigger is not explicitly confirmed by aligned 5m structure and higher-timeframe context." : structureContradicted ? "A recent opposing 15m CHoCH/market-structure shift blocks entry." : volatilityRegime === "EXTREME" ? "Extreme 1m ATR volatility blocks entry." : invalidationPrice === null ? "A finite, unbreached, direction-appropriate structural invalidation level from the declared timeframe is required before entry." : direction === "WAIT" ? `Quality is below the STANDARD threshold ${thresholds.standard}.` : `${direction} alignment qualifies as ${band}.`, invalidation]
       : ["All four timeframes require at least 50 completed candles and a close watermark for EMA50/structure context.", invalidation];
     const watermarkKey = analysisTimeframes.map((timeframe) => `${timeframe}:${timeframeCloseWatermarks[timeframe] ?? "missing"}`).join("|");
     return {
       decisionKey: `${AUTONOMOUS_STRATEGY_VERSION}:${symbol}:${horizonMinutes}:${watermarkKey}`,
-      symbol, horizonMinutes, direction, qualityScore, qualityBand: band, volatilityRegime,
+      symbol, horizonMinutes, direction, setupDirection: intendedLabel, actionableDirection: qualified ? intendedLabel : null, qualified,
+      qualityScore, qualityBand: band, volatilityRegime, referencePrice: Number.isFinite(price) && price > 0 ? price : null,
       timeframeCloseWatermarks: { ...timeframeCloseWatermarks }, triggerValidUntil, reasons, confluenceComponents,
       technicalFeatures: {
         oneMinuteTrigger,
         fiveMinuteConfirmation: { status: oneMinuteTrigger.direction !== "NEUTRAL" && oneMinuteTrigger.direction === fiveMinuteDirection ? "CONFIRMED" : "NOT_CONFIRMED", direction: fiveMinuteDirection, watermark: timeframeCloseWatermarks["5m"], evidence: structureFeatures["5m"].structureEvidence },
+        fifteenMinuteAlignment: { status: fifteenMinuteAligned ? "ALIGNED" : "NOT_ALIGNED", direction: fifteenMinuteDirection, regime: analyses["15m"].regime, watermark: timeframeCloseWatermarks["15m"], evidence: structureFeatures["15m"].structureEvidence },
         higherTimeframeRegimes: { "15m": analyses["15m"].regime, "1h": analyses["1h"].regime },
         relativeVolume20: relativeVolume,
         atrFraction,
       },
+      levels: { support: supportLevel, resistance: resistanceLevel, invalidation: invalidationDetails },
       structureFeatures: { ...structureFeatures }, invalidationPrice, invalidation, invalidationDetails,
       qualityDefinition: { classification: "DETERMINISTIC_SETUP_QUALITY_NOT_PROBABILITY", baseQuality: Math.round(clamp(baseQuality, 0, 100)), structureAdjustment, scoreRange: [0, 100] },
       strategyName: AUTONOMOUS_STRATEGY, strategyVersion: AUTONOMOUS_STRATEGY_VERSION,
@@ -392,7 +420,7 @@ export function analyzeMarket(candles, payoutRate, now = new Date(), options = {
   if (indicators.support !== null) invalidation.push(`Bullish scenario invalid below 1m support ${indicators.support.toFixed(2)}.`);
   if (indicators.resistance !== null) invalidation.push(`Bearish scenario invalid above 1m resistance ${indicators.resistance.toFixed(2)}.`);
   const candidates = generateSignals(completedCandles, options);
-  return { direction, upScore, downScore, technicalUpProbability, technicalDownProbability, confidence: Math.abs(difference) >= 30 ? "HIGH" : Math.abs(difference) >= 15 ? "MEDIUM" : "LOW", calibrationStatus: "UNCALIBRATED", breakEvenProbability: breakEven, heuristicProbability, reasons, invalidation, timeframes, candidates, classification: "MODEL_ESTIMATE", modelVersion: "rules-v0.5.0", calculatedAt: now.toISOString() };
+  return { direction, upScore, downScore, technicalUpProbability, technicalDownProbability, confidence: Math.abs(difference) >= 30 ? "HIGH" : Math.abs(difference) >= 15 ? "MEDIUM" : "LOW", calibrationStatus: "UNCALIBRATED", breakEvenProbability: breakEven, heuristicProbability, reasons, invalidation, timeframes, candidates, classification: "MODEL_ESTIMATE", modelVersion: "rules-v0.6.0", calculatedAt: now.toISOString() };
 }
 export function adaptiveStake(input) {
   const reasons = []; const breakEven = breakEvenProbability(input.payoutRate);

@@ -66,7 +66,7 @@ export const config = Object.freeze({
   triggerGraceMs: numberValue("ENTRY_TRIGGER_GRACE_MS", 90000, { min: 5000, max: 300000, integer: true }),
   btcMaxSpreadBps: numberValue("ENTRY_BTC_MAX_SPREAD_BPS", 2, { min: 0.01, max: 100 }),
   ethMaxSpreadBps: numberValue("ENTRY_ETH_MAX_SPREAD_BPS", 3, { min: 0.01, max: 100 }),
-  minTopNotional: numberValue("ENTRY_MIN_TOP_NOTIONAL_USDT", 1000, { min: 0 }),
+  minTopNotional: numberValue("ENTRY_MIN_TOP_NOTIONAL_USDT", 100, { min: 0 }),
   maxSourceSkewMs: numberValue("ENTRY_MAX_SOURCE_SKEW_MS", 10000, { min: 0, max: 300000, integer: true }),
   databasePath: resolve(process.env.DATABASE_PATH ?? "data/signal-expert.db"),
   publicDirectory: resolve(process.env.PUBLIC_DIRECTORY ?? "public"),

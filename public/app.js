@@ -19,6 +19,7 @@ let audioContext = null;
 let manualSignalBaselineReady = false;
 let knownReadySignalIds = new Set();
 let manualDeadlineTimer = null;
+let refreshGeneration = 0;
 try { soundEnabled = localStorage.getItem("signal-expert-manual-signal-sound") === "enabled"; } catch { soundEnabled = false; }
 
 async function request(path, options) {
@@ -163,15 +164,15 @@ function renderEntryGates(snapshot) {
   const check = (code) => checks.find((item) => item.code === code);
   const allPass = (codes) => codes.every((code) => check(code)?.status === "PASS");
 
-  const mtfCodes = ["COMPLETED_1M_TRIGGER", "FIVE_MINUTE_CONFIRMATION", "TRIGGER_FRESHNESS"];
+  const mtfCodes = ["COMPLETED_1M_TRIGGER", "FIVE_MINUTE_CONFIRMATION", "FIFTEEN_MINUTE_ALIGNMENT", "TRIGGER_FRESHNESS"];
   const mtfPassed = candidate && allPass(mtfCodes);
   const direction = directionMeta(candidate?.direction);
   $("mtf-gate-status").textContent = mtfPassed ? `PASS · ${direction.label}` : "BLOCKED / WAIT";
   $("mtf-gate-status").className = mtfPassed ? "gate-pass" : "gate-blocked";
   const mtfBlocked = mtfCodes.map(check).find((item) => item?.status === "BLOCKED");
   $("mtf-gate-detail").textContent = mtfPassed
-    ? `Completed 1m trigger and completed 5m structure agree · valid until ${time(candidate.triggerValidUntil)}`
-    : mtfBlocked?.reason ?? "A fresh completed 1m trigger must match completed 5m structure.";
+    ? `Completed 1m trigger, 5m structure and 15m trend agree · valid until ${time(candidate.triggerValidUntil)}`
+    : mtfBlocked?.reason ?? "A fresh completed 1m trigger must match completed 5m structure and completed 15m trend.";
 
   const orderBookCodes = ["ORDER_BOOK_VALID", "SPREAD_LIMIT", "TOP_LIQUIDITY", "SOURCE_COHERENCE"];
   const bookPassed = candidate && allPass(orderBookCodes);
@@ -182,7 +183,7 @@ function renderEntryGates(snapshot) {
   $("spread-gate-status").className = bookPassed ? "gate-pass" : "gate-blocked";
   const bookBlocked = orderBookCodes.map(check).find((item) => item?.status === "BLOCKED");
   $("spread-gate-detail").textContent = metrics?.valid
-    ? `${metrics.spreadBps.toFixed(3)} / max ${maximum?.toFixed(3) ?? "—"} bps · best-side minimum ${money(metrics.topNotional)} / min ${money(minimum)} USDT${bookBlocked ? ` · ${bookBlocked.reason}` : ""}`
+    ? `${metrics.spreadBps.toFixed(3)} / max ${maximum?.toFixed(3) ?? "—"} bps · 10-level liquidity ${money(metrics.topNotional)} / min ${money(minimum)} USDT${bookBlocked ? ` · ${bookBlocked.reason}` : ""}`
     : bookBlocked?.reason ?? metrics?.reason ?? "No validated LIVE Spot top of book.";
 
   const macroCheck = check("MACRO_NEWS");
@@ -257,11 +258,11 @@ function renderBook(book) {
   $("bids").innerHTML = rows((book?.bids ?? []).slice(0, 6), "bid");
 }
 
-function manualConfidenceFor(symbol, horizonMinutes, strategyVersion = "0.5.0") {
+function manualConfidenceFor(symbol, horizonMinutes, strategyVersion = "0.6.0") {
   return state.manualSignals?.empiricalConfidence?.find((item) => item.symbol === symbol && item.horizonMinutes === horizonMinutes && item.strategyVersion === strategyVersion) ?? null;
 }
 
-function renderManualSignals() {
+function renderLegacyManualSignals() {
   const manual = state.manualSignals;
   if (!manual) return;
   const bySegment = new Map((manual.current ?? []).map((signal) => [`${signal.symbol}:${signal.horizonMinutes}`, signal]));
@@ -292,11 +293,11 @@ function renderManualSignals() {
         : "No UP or DOWN signal right now.";
     const currentBlockReason = signal.currentEntryGate?.checks?.find((check) => check.status === "BLOCKED")?.reason;
     const instruction = actionable
-      ? `ENTER NOW · CHOOSE ${directionArrow} ${direction}`
+      ? `PROXY SETUP READY · ${directionArrow} ${direction}`
       : tracking
-        ? "DO NOT ENTER NOW · WATCH ONLY"
+        ? "RESEARCH WINDOW CLOSED · WATCH ONLY"
         : currentlyBlocked
-          ? "CURRENT GATES BLOCKED · DO NOT ENTER"
+          ? "CURRENT PROXY GATES BLOCKED"
           : actionState === "DISABLED"
             ? "DISABLED · DO NOT ENTER"
             : signal.status === "EXPIRED"
@@ -310,10 +311,10 @@ function renderManualSignals() {
           ? `The creation-time call remains in the audit, but live entry checks now block action. ${currentBlockReason ?? "Waiting for the next live recheck."}`
           : signal.status === "EXPIRED"
             ? "This call has finished. It is history, not a new entry."
-            : "Wait for an ENTER NOW instruction before choosing UP or DOWN.";
-    const statusLabel = actionable ? "ENTER NOW" : tracking ? "WATCH ONLY" : currentlyBlocked ? "GATES BLOCKED" : actionState === "DISABLED" ? "DISABLED" : signal.status === "EXPIRED" ? "FINISHED" : "WAIT";
+            : "Wait for a proxy setup-ready state before reviewing the direction.";
+    const statusLabel = actionable ? "PROXY READY" : tracking ? "WATCH ONLY" : currentlyBlocked ? "GATES BLOCKED" : actionState === "DISABLED" ? "DISABLED" : signal.status === "EXPIRED" ? "FINISHED" : "WAIT";
     const actionClass = actionable ? "enter-now" : tracking ? "watch-only" : "wait";
-    const timer = actionable ? `entry closes ${remaining(signal.entryValidUntil)}` : tracking ? `proxy observation in ${remaining(signal.resolvesAt)}` : currentlyBlocked ? `entry window ${remaining(signal.entryValidUntil)} · live recheck pending` : signal.status === "EXPIRED" ? `resolved ${time(signal.resolvedAt)}` : "no entry window";
+    const timer = actionable ? `research window closes ${remaining(signal.entryValidUntil)}` : tracking ? `proxy observation in ${remaining(signal.resolvesAt)}` : currentlyBlocked ? `research window ${remaining(signal.entryValidUntil)} · live recheck pending` : signal.status === "EXPIRED" ? `resolved ${time(signal.resolvedAt)}` : "no research window";
     const sourceName = signal.entrySource?.sourceName ?? signal.entrySource?.source ?? "No entry source";
     const fallback = signal.entrySource?.failover?.active === true;
     const invalidation = signal.invalidation?.text ?? (Number.isFinite(signal.invalidationPrice) ? `Completed-candle invalidation ${money(signal.invalidationPrice)}` : "No finite invalidation");
@@ -474,11 +475,15 @@ function renderAccount() {
 }
 
 async function refresh() {
+  const requestedSymbol = state.symbol;
+  const generation = ++refreshGeneration;
   try {
-    const [snapshot, account, autonomous, performance, manualSignals] = await Promise.all([request(`/api/v1/market/${state.symbol}`), request("/api/v1/paper/account"), request("/api/v1/autonomous/status"), request("/api/v1/autonomous/performance"), request("/api/v1/manual-signals/status")]);
+    const [snapshot, account, autonomous, performance, manualSignals] = await Promise.all([request(`/api/v1/market/${requestedSymbol}`), request("/api/v1/paper/account"), request("/api/v1/autonomous/status"), request("/api/v1/autonomous/performance"), request(`/api/v1/manual-signals/status?symbol=${encodeURIComponent(requestedSymbol)}`)]);
+    if (generation !== refreshGeneration || requestedSymbol !== state.symbol) return;
     state.snapshot = snapshot; state.account = account; state.autonomous = autonomous; state.performance = performance; state.manualSignals = manualSignals;
     renderMarket(); renderAccount(); renderAutonomous(); renderManualSignals(); $("connection-error").classList.add("hidden");
   } catch (error) {
+    if (generation !== refreshGeneration || requestedSymbol !== state.symbol) return;
     $("connection-error").classList.remove("hidden"); $("connection-error").querySelector("span").textContent = error.message; status($("health"), "OFFLINE");
   }
 }
@@ -522,7 +527,7 @@ function configureSound() {
 document.querySelectorAll("[data-symbol]").forEach((button) => button.addEventListener("click", () => {
   state.symbol = button.dataset.symbol;
   document.querySelectorAll("[data-symbol]").forEach((item) => item.classList.toggle("active", item === button));
-  state.snapshot = null; refresh();
+  state.snapshot = null; state.manualSignals = null; refresh();
 }));
 document.querySelectorAll("[data-timeframe]").forEach((button) => button.addEventListener("click", () => {
   state.timeframe = button.dataset.timeframe;
@@ -532,7 +537,89 @@ document.querySelectorAll("[data-timeframe]").forEach((button) => button.addEven
 document.querySelectorAll("[data-direction]").forEach((button) => button.addEventListener("click", () => openPaper(button.dataset.direction)));
 $("risk-button").addEventListener("click", riskQuote);
 $("auto-toggle").addEventListener("click", changeAutonomousState);
+const terminalPanel = document.querySelector(".terminal-command");
+const metricsPanel = document.querySelector(".metrics-grid");
+if (terminalPanel && metricsPanel) metricsPanel.before(terminalPanel);
 configureSound();
 setInterval(() => { $("clock").textContent = `UTC ${new Date().toISOString().slice(11, 19)}`; }, 1000);
 setInterval(refresh, 3000);
 refresh();
+
+
+
+function renderManualSignals() {
+  const manual = state.manualSignals;
+  if (!manual) return;
+  const terminal = manual.terminal;
+  $("manual-signal-state").textContent = manual.enabled ? "SCANNING" : "DISABLED";
+  $("manual-signal-state").className = `mode ${manual.enabled ? "auto-running" : "auto-paused"}`;
+  $("manual-signal-scan").textContent = manual.nextScanAt ? time(manual.nextScanAt) : "—";
+  const terminalSource = terminal?.source;
+  $("manual-signal-source").textContent = terminalSource?.status === "LIVE"
+    ? `${terminalSource.sourceName ?? terminalSource.source} · ${time(terminalSource.sourceTimestamp)}${terminalSource.fallback?.active ? " · FALLBACK" : ""}${terminalSource.actionSourceCoherent === false ? " · SURSE DIFERITE — BLOCAT" : ""}`
+    : "Fără preț Spot proaspăt";
+
+  const checkLabel = (code) => ({
+    CURRENT_ENTRY_RECHECK: "Revalidare setup", SIGNAL_DESK_DISABLED: "Scanner dezactivat",
+    COMPLETED_1M_TRIGGER: "Trigger 1m", FIVE_MINUTE_CONFIRMATION: "Trend 5m", FIFTEEN_MINUTE_ALIGNMENT: "Trend 15m",
+    TRIGGER_FRESHNESS: "Fereastră intrare", QUALITY: "Calitate", FINITE_INVALIDATION: "Invalidare",
+    CANDLE_SOURCE_COHERENCE: "Sursă lumânări", MARKET_FRESHNESS: "Date proaspete", ORDER_BOOK_VALID: "Order book",
+    SPREAD_LIMIT: "Spread", TOP_LIQUIDITY: "Lichiditate", SOURCE_COHERENCE: "Sursă preț/book", MACRO_NEWS: "Macro/news", DIRECTION: "Direcție",
+  })[code] ?? code.replaceAll("_", " ");
+  const confirmation = (label, item) => {
+    const passed = item?.status === "PASS";
+    const skipped = item?.status === "SKIPPED";
+    const direction = ["UP", "DOWN"].includes(item?.direction) ? ` · ${directionMeta(item.direction).label}` : "";
+    return `<div class="terminal-confirm ${passed ? "terminal-pass" : skipped ? "terminal-skip" : "terminal-block"}"><small>${escape(label)}</small><b>${passed ? "CONFIRMAT" : skipped ? "NEVERIFICAT" : "AȘTEAPTĂ"}${escape(direction)}</b><span>${time(item?.completedAt)}</span></div>`;
+  };
+  const level = (label, item, kind) => {
+    const context = Number.isFinite(item?.distanceBps)
+      ? `${item.distanceBps.toFixed(1)} bps · ${item.proximity === "NEAR" ? "APROAPE" : "LIBER"} · ${item.timeframe ?? "—"} · ${(item.source ?? "SURSA NECUNOSCUTĂ").replaceAll("_", " ")}`
+      : "nivel indisponibil";
+    return `<div class="terminal-level ${kind}"><small>${label}</small><b>${Number.isFinite(item?.price) ? money(item.price) : "—"}</b><span title="${escape(context)}">${escape(context)}</span></div>`;
+  };
+  const roundMarkup = (round) => {
+    const bias = ["UP", "DOWN"].includes(round.setupDirection) ? directionMeta(round.setupDirection) : { label: "— NEUTRU", meaning: "Tendința nu este suficient de clară." };
+    const actionDirection = round.actionable?.direction;
+    const action = round.state === "ENTER_NOW"
+      ? { label: `SETUP PROXY VALID ${directionMeta(actionDirection).label}`, className: actionDirection === "UP" ? "terminal-action-up" : "terminal-action-down", note: "Toate filtrele Spot proxy au trecut. Verifică separat contractul Event Futures; aceasta nu este o instrucțiune sau confirmare de ordin live." }
+      : round.state === "TRACKING"
+        ? { label: "FEREASTRĂ ÎNCHISĂ · URMĂRIRE", className: "terminal-action-track", note: "Fereastra setupului s-a închis; semnalul este urmărit numai pentru rezultatul proxy." }
+        : round.state === "RESOLVED"
+          ? { label: "ÎNCHEIAT · ISTORIC", className: "terminal-action-track", note: "Acest rezultat proxy nu este un setup nou." }
+          : round.state === "DISABLED"
+            ? { label: "SCANNER DEZACTIVAT", className: "terminal-action-wait", note: round.actionable?.primaryBlocker?.text ?? "Scannerul manual este dezactivat." }
+            : { label: "WAIT · FĂRĂ SETUP", className: "terminal-action-wait", note: round.actionable?.primaryBlocker?.text ?? "Așteaptă alinierea tuturor confirmărilor." };
+    const countdownTarget = round.state === "ENTER_NOW" ? round.actionable.entryValidUntil : round.state === "TRACKING" ? round.timing.targetAt : round.timing.entryValidUntil;
+    const quality = round.quality ?? { score: 0, band: "BELOW_STANDARD", minimum: 68 };
+    const invalidation = round.levels?.invalidation;
+    const invalidationCondition = invalidation?.condition === "COMPLETED_CLOSE_BELOW"
+      ? "închidere completă sub nivel"
+      : invalidation?.condition === "COMPLETED_CLOSE_ABOVE" ? "închidere completă peste nivel" : "regulă indisponibilă";
+    const invalidationContext = [invalidation?.timeframe, invalidationCondition, invalidation?.source?.replaceAll("_", " ")].filter(Boolean).join(" · ");
+    const checks = round.details?.checks ?? [];
+    const checksMarkup = checks.map((check) => `<div class="terminal-check"><span>${escape(checkLabel(check.code))}</span><b class="gate-${check.status.toLowerCase()}">${escape(check.status)}</b><small>${escape(check.reason)}</small></div>`).join("");
+    const reasons = (round.details?.reasons ?? []).slice(-5).map((reason) => `<li>${escape(reason)}</li>`).join("");
+    return `<article class="event-round-card event-round-${round.state.toLowerCase()}">
+      <div class="event-round-head"><div><small>PREVIZIUNE MANUALĂ</small><strong>${escape(round.symbol)} · ${round.horizonMinutes} MINUTE</strong></div><div class="event-countdown"><small>${round.state === "ENTER_NOW" ? "SETUPUL EXPIRĂ" : round.state === "TRACKING" ? "REZULTAT PROXY" : "TRIGGER VALID"}</small><b>${countdownTarget ? remaining(countdownTarget) : "—"}</b></div></div>
+      <div class="terminal-decision-grid">
+        <div class="terminal-bias ${directionClass(round.setupDirection)}"><small>BIAS PIAȚĂ</small><b>${escape(bias.label)}</b><span>${round.confirmations?.fifteenMinute?.regime ?? "INSUFFICIENT_DATA"} pe 15m</span></div>
+        <div class="terminal-action ${action.className}"><small>STARE SEMNAL</small><b>${escape(action.label)}</b><span>${escape(action.note)}</span></div>
+      </div>
+      <div class="terminal-prices"><div><small>REFERINȚĂ 1m ÎNCHISĂ</small><b>${Number.isFinite(round.prices?.reference?.value) ? money(round.prices.reference.value) : "—"}</b><span>${time(round.prices?.reference?.observedAt)}</span></div><div><small>PREȚ PROXY ÎNREGISTRAT</small><b>${Number.isFinite(round.prices?.entry?.value) ? money(round.prices.entry.value) : "—"}</b><span>${round.state === "ENTER_NOW" || round.state === "TRACKING" ? "observație Spot salvată" : "numai la setup proxy valid"}</span></div><div><small>PREȚ SPOT ACUM</small><b>${Number.isFinite(round.prices?.current?.value) ? money(round.prices.current.value) : "—"}</b><span>${time(round.prices?.current?.observedAt)}</span></div></div>
+      <div class="terminal-confirmations">${confirmation("TRIGGER 1m", round.confirmations?.oneMinute)}${confirmation("TREND 5m", round.confirmations?.fiveMinute)}${confirmation("TREND 15m", round.confirmations?.fifteenMinute)}</div>
+      <div class="terminal-levels">${level("SUPORT", round.levels?.support, "support")}${level("REZISTENȚĂ", round.levels?.resistance, "resistance")}<div class="terminal-level invalidation"><small>INVALIDARE</small><b>${Number.isFinite(invalidation?.price) ? money(invalidation.price) : "—"}</b><span title="${escape(invalidation?.text ?? invalidationContext)}">${escape(invalidationContext || "nivel necesar")}</span></div></div>
+      <div class="terminal-quality"><div><small>CALITATE SETUP · MINIM ${quality.minimum}</small><b>${quality.score}/100 · ${escape(quality.band)}</b></div><i><span style="width:${Math.max(0, Math.min(100, quality.score))}%"></span></i></div>
+      <div class="terminal-primary-reason ${round.state === "ENTER_NOW" ? "reason-ready" : "reason-wait"}"><strong>${round.state === "ENTER_NOW" ? "TOATE FILTRELE SPOT PROXY AU TRECUT" : escape(checkLabel(round.actionable?.primaryBlocker?.code ?? "WAIT_FOR_SETUP"))}</strong><span>${escape(round.actionable?.primaryBlocker?.text ?? action.note)}</span></div>
+      <details class="terminal-details"><summary>Vezi analiza completă și toate filtrele</summary><div class="terminal-checks">${checksMarkup || '<div class="terminal-check"><small>Se așteaptă evaluarea.</small></div>'}</div>${reasons ? `<ul>${reasons}</ul>` : ""}<p>Calitatea este un scor determinist, nu probabilitate garantată. Setupul folosește doar proxy Spot; contractul, payout-ul, lichiditatea și decontarea Event Futures trebuie verificate separat. Aplicația nu trimite ordine.</p></details>
+    </article>`;
+  };
+  $("manual-signal-cards").innerHTML = terminal?.rounds?.length ? terminal.rounds.map(roundMarkup).join("") : '<div class="empty-card">Terminalul așteaptă date coerente pentru simbolul selectat.</div>';
+
+  $("manual-confidence").innerHTML = (manual.empiricalConfidence ?? []).map((item) => `<div class="confidence-row"><strong>${escape(item.symbol)} · ${item.horizonMinutes}m</strong><span class="segment-${segmentClass(item.status)}">${escape(item.status)}</span><b>${item.measuredRate == null ? "Indisponibil" : pct(item.measuredRate)}</b><small>${item.decisiveSample}/${item.minDecisiveSample} rezultate decisive · proxy Spot</small></div>`).join("") || '<div class="empty-card">Încrederea rămâne indisponibilă până la eșantionul minim.</div>';
+  $("manual-history").innerHTML = (manual.recent ?? []).slice(0, 12).map((signal) => `<div class="manual-history-row"><span>${time(signal.generatedAt)}</span><strong>${escape(signal.symbol)} · ${signal.horizonMinutes}m</strong><b class="${directionClass(signal.direction)}">${escape(directionMeta(signal.direction).label)}</b><span>${escape(localManualActionState(signal))}</span><span>${signal.qualityScore}/100</span><small>${escape(signal.proxyOutcome ?? signal.reasons?.at(-1) ?? "Înregistrat")}</small></div>`).join("") || '<div class="empty-card">Nu există încă istoric.</div>';
+  notifyNewManualSignal(manual.ready ?? []);
+  if (manualDeadlineTimer) clearTimeout(manualDeadlineTimer);
+  const futureTimes = (terminal?.rounds ?? []).flatMap((round) => [round.actionable?.entryValidUntil, round.timing?.targetAt]).map((value) => new Date(value).getTime()).filter((value) => Number.isFinite(value) && value > Date.now()).sort((left, right) => left - right);
+  manualDeadlineTimer = futureTimes.length ? setTimeout(() => { manualDeadlineTimer = null; renderManualSignals(); }, Math.max(1, futureTimes[0] - Date.now() + 1)) : null;
+}

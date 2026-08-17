@@ -26,6 +26,10 @@ function tickerProvenance(market, observedAt) {
 }
 function candidateDetails(candidate, entryGate = null) {
   return {
+    setupDirection: candidate.setupDirection ?? null,
+    actionableDirection: candidate.actionableDirection ?? null,
+    referencePrice: candidate.referencePrice ?? null,
+    levels: candidate.levels ?? {},
     volatilityRegime: candidate.volatilityRegime ?? null,
     confluenceComponents: candidate.confluenceComponents ?? [],
     structureFeatures: candidate.structureFeatures ?? {},
@@ -70,7 +74,7 @@ export class ManualSignalService {
     return {
       allowed: false,
       classification: "CURRENT_ENTRY_RECHECK_UNAVAILABLE",
-      policyVersion: "entry-gates-v0.5.0",
+      policyVersion: "entry-gates-v0.6.0",
       evaluatedAt: now.toISOString(),
       checks: [{ code: "CURRENT_ENTRY_RECHECK", status: "BLOCKED", reason: "The original candidate is no longer present in the current completed-candle analysis.", evidence: { candidateKey: signal.candidateKey } }],
     };
@@ -123,6 +127,80 @@ export class ManualSignalService {
     }
     return [...selected.values()].sort((left, right) => left.symbol.localeCompare(right.symbol) || left.horizonMinutes - right.horizonMinutes);
   }
+  terminal(symbol, now = new Date()) {
+    if (!symbol) return null;
+    const snapshot = this.market.snapshot(symbol);
+    const candidates = snapshot?.analysis?.candidates ?? [];
+    const signals = new Map(this.latestSegments(symbol).map((signal) => [signal.horizonMinutes, signal]));
+    const confidence = new Map(this.confidence(symbol).map((item) => [item.horizonMinutes, item]));
+    const blockerPriority = ["CURRENT_ENTRY_RECHECK", "MARKET_FRESHNESS", "CANDLE_SOURCE_COHERENCE", "COMPLETED_1M_TRIGGER", "FIVE_MINUTE_CONFIRMATION", "FIFTEEN_MINUTE_ALIGNMENT", "TRIGGER_FRESHNESS", "QUALITY", "FINITE_INVALIDATION", "ORDER_BOOK_VALID", "SPREAD_LIMIT", "TOP_LIQUIDITY", "SOURCE_COHERENCE", "MACRO_NEWS", "DIRECTION"];
+    const source = snapshot?.market ?? {};
+    const rounds = this.settings.horizons.map((horizonMinutes) => {
+      const candidate = candidates.find((item) => item.horizonMinutes === horizonMinutes) ?? null;
+      const latestSignal = signals.get(horizonMinutes) ?? null;
+      const activeSignal = latestSignal?.status === "READY" ? latestSignal : null;
+      const matchingSignal = candidate && latestSignal?.candidateKey === candidate.decisionKey ? latestSignal : null;
+      const signal = activeSignal ?? matchingSignal ?? (!candidate ? latestSignal : null);
+      const details = signal?.details ?? candidate ?? {};
+      const gate = signal?.currentEntryGate ?? (!signal && candidate ? this.market.evaluateEntry(candidate, now) : signal?.details?.entryGate ?? null);
+      const checks = gate?.checks ?? [];
+      const blocked = blockerPriority.map((code) => checks.find((check) => check.code === code && check.status === "BLOCKED")).find(Boolean) ?? null;
+      const actionState = !this.settings.enabled
+        ? "DISABLED"
+        : signal?.actionState ?? (candidate && gate?.allowed && ["UP", "DOWN"].includes(candidate.direction) ? "READY_PENDING_CAPTURE" : blocked ? "BLOCKED" : "WAIT");
+      const actionable = actionState === "ENTER_NOW";
+      const tracking = actionState === "TRACKING_DO_NOT_ENTER_LATE";
+      const resolved = signal?.status === "EXPIRED";
+      const disabled = actionState === "DISABLED";
+      const state = actionable ? "ENTER_NOW" : tracking ? "TRACKING" : resolved ? "RESOLVED" : disabled ? "DISABLED" : ["BLOCKED_CURRENT_GATES", "BLOCKED"].includes(actionState) || blocked ? "BLOCKED" : "WAIT";
+      const setupDirection = details.setupDirection ?? (signal?.direction === "WAIT" ? "NEUTRAL" : signal?.direction) ?? "NEUTRAL";
+      const oneMinute = details.technicalFeatures?.oneMinuteTrigger ?? null;
+      const fiveMinute = details.technicalFeatures?.fiveMinuteConfirmation ?? null;
+      const fifteenMinute = details.technicalFeatures?.fifteenMinuteAlignment ?? null;
+      const levels = details.levels ?? {};
+      const primaryBlocker = state === "TRACKING"
+        ? { code: "ENTRY_WINDOW_CLOSED", text: "Entry window closed. Track the recorded call only; do not enter late." }
+        : state === "RESOLVED"
+          ? { code: signal?.proxyOutcome ?? "RESOLVED", text: "The proxy observation is finished; this is history, not a new entry." }
+          : state === "DISABLED"
+            ? { code: "SIGNAL_DESK_DISABLED", text: "Manual signal scanning is disabled; no current setup can be acted on." }
+            : blocked ? { code: blocked.code, text: blocked.reason }
+              : state === "WAIT" ? { code: "WAIT_FOR_SETUP", text: details.reasons?.find((reason) => reason.startsWith("Entry blocked")) ?? details.reasons?.at(-2) ?? "Waiting for completed 1m, 5m and 15m alignment." } : null;
+      const qualityScore = signal?.qualityScore ?? details.qualityScore ?? 0;
+      const watermarks = signal?.timeframeCloseWatermarks ?? details.timeframeCloseWatermarks ?? {};
+      return {
+        roundId: `${symbol}:${horizonMinutes}:${signal?.candidateKey ?? candidate?.decisionKey ?? "waiting"}`,
+        classification: "MANUAL_EVENT_FUTURES_SIGNAL_USING_SPOT_PROXY",
+        symbol,
+        horizonMinutes,
+        state,
+        setupDirection,
+        actionable: { allowed: actionable, direction: actionable ? signal?.direction ?? null : null, entryValidUntil: signal?.entryValidUntil ?? null, primaryBlocker, blockedCount: checks.filter((check) => check.status === "BLOCKED").length },
+        timing: { generatedAt: signal?.generatedAt ?? snapshot?.analysis?.calculatedAt ?? null, entryValidUntil: signal?.entryValidUntil ?? candidate?.triggerValidUntil ?? null, targetAt: signal?.resolvesAt ?? null },
+        prices: {
+          reference: { value: details.referencePrice ?? null, basis: "LATEST_COMPLETED_1M_CLOSE", observedAt: watermarks["1m"] ?? null },
+          entry: { value: signal?.entryPrice ?? null, observedAt: signal?.entryAt ?? null },
+          current: { value: source.data?.lastPrice ?? null, observedAt: source.sourceTimestamp ?? null },
+        },
+        confirmations: {
+          oneMinute: { status: checks.find((check) => check.code === "COMPLETED_1M_TRIGGER")?.status ?? "BLOCKED", direction: oneMinute?.direction ?? "NEUTRAL", completedAt: oneMinute?.candleCloseTime ?? null, strength: oneMinute?.strength ?? 0, patterns: oneMinute?.patterns ?? [] },
+          fiveMinute: { status: checks.find((check) => check.code === "FIVE_MINUTE_CONFIRMATION")?.status ?? "BLOCKED", direction: fiveMinute?.direction ?? "NEUTRAL", completedAt: fiveMinute?.watermark ?? null, evidence: fiveMinute?.evidence ?? null },
+          fifteenMinute: { status: checks.find((check) => check.code === "FIFTEEN_MINUTE_ALIGNMENT")?.status ?? "BLOCKED", direction: fifteenMinute?.direction ?? "NEUTRAL", regime: fifteenMinute?.regime ?? "INSUFFICIENT_DATA", completedAt: fifteenMinute?.watermark ?? null, evidence: fifteenMinute?.evidence ?? null },
+        },
+        levels: { support: levels.support ?? null, resistance: levels.resistance ?? null, invalidation: levels.invalidation ?? signal?.invalidation ?? details.invalidationDetails ?? null },
+        quality: { score: qualityScore, band: signal?.qualityBand ?? details.qualityBand ?? "BELOW_STANDARD", minimum: this.settings.qualityThreshold ?? 68, passed: checks.find((check) => check.code === "QUALITY")?.status === "PASS", classification: "DETERMINISTIC_SETUP_QUALITY_NOT_PROBABILITY" },
+        confidence: confidence.get(horizonMinutes) ?? null,
+        details: { checks, reasons: signal?.reasons ?? details.reasons ?? [], confluenceComponents: details.confluenceComponents ?? [], volatilityRegime: details.volatilityRegime ?? null, timeframeWatermarks: watermarks, entrySource: signal?.entrySource ?? null },
+      };
+    });
+    return {
+      classification: "MANUAL_EVENT_FUTURES_TERMINAL_USING_ATTRIBUTED_SPOT_PROXY",
+      observedAt: now.toISOString(), symbol,
+      source: { status: source.status ?? "UNAVAILABLE", source: source.source ?? null, sourceName: source.sourceName ?? null, sourceTimestamp: source.sourceTimestamp ?? null, receivedAt: source.receivedAt ?? null, fallback: source.failover ?? null, candleSources: snapshot?.analysis?.sources ?? null, analysisCoherent: snapshot?.health?.analysisCoherent ?? false, actionSourceCoherent: snapshot?.health?.actionSourceCoherent ?? false, entryCoherent: snapshot?.health?.entryCoherent ?? false },
+      currentPrice: { value: source.data?.lastPrice ?? null, observedAt: source.sourceTimestamp ?? null },
+      rounds,
+    };
+  }
   status(symbol = null) {
     return {
       mode: "MANUAL_SIGNALS_ONLY",
@@ -136,6 +214,7 @@ export class ManualSignalService {
       nextScanAt: this.nextScanAt,
       lastScanAt: this.lastScanAt,
       lastError: this.lastError,
+      terminal: this.terminal(symbol),
       current: this.latestSegments(symbol),
       ready: this.ready(symbol),
       recent: this.recent(50, symbol),

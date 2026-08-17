@@ -67,6 +67,7 @@ export async function createApplication(options = {}) {
     maxResolutionLagMs: config.manualSignalMaxResolutionLagMs,
     minDecisiveSample: config.manualSignalMinDecisiveSample,
     confidenceGateEnabled: config.manualSignalConfidenceGateEnabled,
+    qualityThreshold: config.qualityThresholds.standard,
     payoutRate: config.payoutRate,
     symbols: config.symbols,
     horizons: [10, 30],
@@ -91,7 +92,7 @@ export async function createApplication(options = {}) {
       catch { return sendJson(response, 403, { error: "ORIGIN_REJECTED", message: "Invalid origin" }); }
     }
     try {
-      if (request.method === "GET" && url.pathname === "/health") return sendJson(response, 200, { status: "ok", timestamp: new Date().toISOString(), mode: config.tradingMode, database: database.health(), eventRisk: eventRisk.status(), entryPolicy: { version: "entry-gates-v0.5.0", liveExecutionAvailable: false }, autonomousExecution: { mode: "PAPER_ONLY", enabled: config.autonomousEnabled && config.tradingMode === "paper", liveAvailable: false }, manualSignals: { mode: "MANUAL_SIGNALS_ONLY", enabled: config.manualSignalsEnabled && config.tradingMode === "paper", marketClassification: "SPOT_PROXY", settlementClassification: "NOT_EVENT_FUTURES_SETTLEMENT", liveExecutionAvailable: false }, liveExecution: { available: false, reason: "No verified MEXC Event Futures execution API is connected; the application supplies manual research signals and PAPER shadow outcomes only." } });
+      if (request.method === "GET" && url.pathname === "/health") return sendJson(response, 200, { status: "ok", timestamp: new Date().toISOString(), mode: config.tradingMode, database: database.health(), eventRisk: eventRisk.status(), entryPolicy: { version: "entry-gates-v0.6.0", liveExecutionAvailable: false }, autonomousExecution: { mode: "PAPER_ONLY", enabled: config.autonomousEnabled && config.tradingMode === "paper", liveAvailable: false }, manualSignals: { mode: "MANUAL_SIGNALS_ONLY", enabled: config.manualSignalsEnabled && config.tradingMode === "paper", marketClassification: "SPOT_PROXY", settlementClassification: "NOT_EVENT_FUTURES_SETTLEMENT", liveExecutionAvailable: false }, liveExecution: { available: false, reason: "No verified MEXC Event Futures execution API is connected; the application supplies manual research signals and PAPER shadow outcomes only." } });
       if (request.method === "GET" && url.pathname === "/api/v1/event-risk") return sendJson(response, 200, eventRisk.status());
       if (request.method === "GET" && url.pathname === "/api/v1/sources") return sendJson(response, 200, { timestamp: new Date().toISOString(), sources: market.sources() });
       if (request.method === "GET" && url.pathname.startsWith("/api/v1/market/")) { const symbol = url.pathname.split("/").at(-1).toUpperCase(); const snapshot = market.snapshot(symbol); return snapshot ? sendJson(response, 200, snapshot) : sendJson(response, 404, { error: "NOT_FOUND", message: "Symbol not configured" }); }

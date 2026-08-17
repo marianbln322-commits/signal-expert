@@ -13,15 +13,18 @@ MEXC Spot REST v3 (primary)
   -> timeout, retry, runtime schema checks
   -> in-memory market cache and freshness state
   -> deterministic quantitative + completed-candle structure engine
-  -> completed 1m trigger + explicitly aligned completed 5m confirmation
+  -> completed 1m trigger + explicitly aligned completed 5m confirmation + completed 15m trend
+  -> one-provider coherence across candle, ticker and order-book inputs before action
   -> EMA20/50, FVG/IFVG, sweep, CHoCH/MSS and finite invalidation audit
   -> completed-candle 10m/30m setup ranking
   -> one shared auditable entry policy:
        fresh ticker/candles + trigger deadline
-       -> validated Spot spread + best-side top liquidity
+       -> one provider across 1m/5m/15m/1h candles, ticker and order book
+       -> validated Spot spread + cumulative 10-level near-book liquidity
        -> ticker/book provider and timestamp coherence
        -> macro PASS / BLOCKED, or SKIPPED when disabled (not filtered)
-  -> strict manual signal entry window + immutable Spot-proxy provenance
+  -> research-window setup state + immutable Spot-proxy provenance
+  -> selected-symbol 10m/30m cards assembled atomically from one candidate key
   -> prospective symbol+horizon confidence hidden until minimum sample
   -> Wilson safeguard against configured-payout break-even
   -> bankroll-aware autonomous PAPER shadow state machine
@@ -31,9 +34,9 @@ MEXC Spot REST v3 (primary)
   -> static responsive dashboard
 
 Manual signal scan -> unique four-timeframe candidate key
-  -> require fresh completed 1m trigger aligned with completed 5m structure
-  -> require quality + finite invalidation + fresh usable attributed Spot ticker/candles
-  -> require validated Spot spread/top liquidity + source coherence
+  -> require fresh completed 1m trigger aligned with completed 5m structure and completed 15m trend
+  -> require quality + horizon-specific support/resistance + finite completed-close invalidation + fresh usable attributed Spot ticker/candles
+  -> require one provider across candles/ticker/book plus validated Spot spread/near-book liquidity and timestamp coherence
   -> require macro CLEAR when enabled; disabled records SKIPPED, not filtered
   -> READY and ENTER_NOW for configured short entry window
   -> TRACKING_DO_NOT_ENTER_LATE until target horizon
@@ -69,11 +72,11 @@ Manual PAPER request -> input/cap checks -> find matching current candidate
 - `NOT_EVENT_FUTURES_SETTLEMENT`: explicit classification for proxy resolution observations.
 - `UNAVAILABLE`: no verified source, insufficient sample, or no data.
 
-## Strategy and entry policy v0.5
+## Strategy and entry policy v0.6
 
-Rules are used because no historical Event Futures labels exist. The directional display uses completed 1h regime, completed 15m/5m structure, and completed 1m trigger with EMA 9/21, RSI 14, ATR 14, Bollinger 20/2, relative volume and wick rejection. Strategy v0.5 records objective 1m engulfing, rejection, ATR/volume impulse, and trend-continuation-close evidence; the trigger remains ineligible unless consolidated completed 5m structure confirms the same direction. The autonomous engine additionally builds objective structure on completed 5m/15m/1h candles: two-sided confirmed pivots, three-candle FVGs and later retests, completed-close FVG inversion, confirmed-level liquidity sweeps, completed-close CHoCH/MSS, and EMA20/50 trend/dynamic context. Its confluence components expose objective definitions, direction, activity, timeframe and weight. Every candidate requires a finite completed-candle structural invalidation before it can become eligible.
+Rules are used because no historical Event Futures labels exist. The directional display uses completed 1h regime, completed 15m/5m structure, and completed 1m trigger with EMA 9/21, RSI 14, ATR 14, Bollinger 20/2, relative volume and wick rejection. Strategy v0.6 records objective 1m engulfing, rejection, ATR/volume impulse, and trend-continuation-close evidence; the trigger remains ineligible unless completed 5m structure and completed 15m trend confirm the same direction. The engine additionally builds objective structure on completed 5m/15m/1h candles: two-sided confirmed pivots, three-candle FVGs and later retests, completed-close FVG inversion, confirmed-level liquidity sweeps, completed-close CHoCH/MSS, and EMA20/50 trend/dynamic context. Its confluence components expose objective definitions, direction, activity, timeframe and weight. Each horizon receives nearest support/resistance with source and distance plus a finite structural invalidation that requires a completed 5m close for 10m setups or a completed 15m close for 30m setups.
 
-The shared entry-policy v0.5 is applied when a manual signal is created, during autonomous selection, and again immediately before a manual or autonomous PAPER position is persisted. Its immutable checks cover direction, quality, invalidation, completed 1m/5m confirmation, trigger deadline, market freshness, validated Spot order book, configured spread, minimum best-side top-of-book notional, provider identity and receipt-time coherence, and macro/news state. An enabled but stale, unavailable, or blacked-out macro source blocks. A disabled macro source is `SKIPPED` and means not filtered; it is never represented as `CLEAR` or `PASS`. Manual READY responses also carry a current non-mutating gate overlay, and both manual WAIT and autonomous BLOCKED decisions are reevaluated while the same trigger is still current so transient market gates are not frozen at their first observation.
+The shared entry-policy v0.6 is applied when a manual signal is created, during autonomous selection, and again immediately before a manual or autonomous PAPER position is persisted. Its immutable checks cover direction, quality, invalidation, completed 1m trigger, completed 5m confirmation, completed 15m alignment, trigger deadline, market freshness, validated Spot order book, configured spread, cumulative 10-level near-book notional, one provider across all candle/ticker/book inputs, receipt-time coherence, and macro/news state. MEXC and Binance failover occurs atomically within the ticker/depth bundle and within the four-timeframe candle bundle; if independently refreshed bundles disagree on provider, analysis may remain visible but entry fails closed. An enabled but stale, unavailable, or blacked-out macro source blocks. A disabled macro source is `SKIPPED` and means not filtered; it is never represented as `CLEAR` or `PASS`. Manual READY responses also carry a current non-mutating gate overlay, and both manual WAIT and autonomous BLOCKED decisions are reevaluated while the same trigger is still current so transient market gates are not frozen at their first observation.
 
 The 10m evaluator emphasizes the completed 1m trigger and aligned 5m/15m context. The 30m evaluator emphasizes aligned 1h/15m structure with 5m confirmation. Forming candles are discarded at both service and model boundaries, swing points are not usable until their right-side confirmation candles close, and a deterministic key containing all four close timestamps prevents duplicate decisions.
 
