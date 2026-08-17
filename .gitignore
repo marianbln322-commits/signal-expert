@@ -1,0 +1,11 @@
+dist/
+release/
+*.zip
+data/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+npm-debug.log*
