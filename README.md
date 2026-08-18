@@ -25,6 +25,8 @@ Requirements: Node.js 22.5 or newer. The release is self-contained and does not 
 - **Prospective calibration only:** isotonic and Platt models are fitted only from resolved, prospective forecast outcomes. The dashboard shows `WARMUP` and null calibrated probabilities until the configured minimum real sample exists.
 - **Strict forecast resolution:** a forecast resolves on the first complete 1m close after its horizon. WAIT forecasts and READY forecasts are retained for audit.
 - **Counterfactual readiness:** blocked candidates expose ordered, auditable requirements instead of inventing readiness.
+- **Exact forecast availability:** the raw UP/DOWN split is null until all four timeframes have 50 completed candles, close watermarks, and no canonical engine blocker; every missing count, watermark, or engine condition is exposed with observed and required evidence.
+- **Conservative reaction zones:** each candidate carries descriptive ceiling/resistance and floor/support zones built from its existing levels, 1m ATR, completed rejection patterns, level interactions, structure, LIVE canonical order flow, and order-book evidence. They are not reversal guarantees, entry gates, or stake advice.
 - **Operational lifecycle:** bounded latency/feed metrics, watermark stall and recovery, failover episodes, alert cooldown/hysteresis, restart reconciliation, and one persistent alert lifecycle.
 - **Deterministic replay and walk-forward:** events are ordered by `receivedAt + sequence`; incomplete candles and future observations are excluded from earlier decisions. Replay, baselines, folds, predictions, outcomes, and metrics can be persisted.
 - **Deep dashboard/API:** feed, synchronized depth, order flow, extended regime, separate engines, calibration, replay, operations, alerts, and existing PAPER/manual signal views are available locally.
@@ -40,9 +42,10 @@ Raw provider values, deterministic calculations, uncalibrated model estimates, p
 1. Binance REST bootstraps ticker, candles, and the depth snapshot; Binance WebSocket supplies aggregate trades, book updates, and candle events.
 2. Only completed candles enter decisions. Market data is checked for transport freshness, timeframe freshness, source coherence, and receipt-time skew.
 3. Objective structure includes confirmed swings, FVG/IFVG and retests, sweeps, CHoCH/MSS, support/resistance interactions, corrections, and finite completed-close invalidation.
-4. The eight-regime classifier and normalized feature layer feed the independent 10m and 30m engines.
-5. The entry policy rechecks direction, quality, trigger deadline, 1m/5m/15m alignment, event risk, depth, spread, liquidity, freshness, provider coherence, and operational health immediately before a local PAPER open.
-6. Forecasts and decisions are persisted prospectively; outcomes are resolved without look-ahead and are then eligible for calibration.
+4. The eight-regime classifier and normalized feature layer feed the independent 10m and 30m engines. Foundational candle-count/watermark blockers are merged with canonical engine blockers before any forecast split is exposed.
+5. After canonical evidence is attached, a descriptive reaction-zone stage reuses the candidate's nearest levels, 1m ATR/candles, structure, level interactions, order flow, and order-book evidence; it never changes direction, quality, entry gates, execution, or sizing.
+6. The entry policy rechecks direction, quality, trigger deadline, 1m/5m/15m alignment, event risk, depth, spread, liquidity, freshness, provider coherence, and operational health immediately before a local PAPER open.
+7. Forecasts and decisions are persisted prospectively; outcomes are resolved without look-ahead and are then eligible for calibration.
 
 The autonomous scheduler can open at most one local PAPER position. Bankroll, stake, exposure, daily stop, and recovery limits remain hard caps. A previous loss can select a configured paper recovery stage but can never create a signal.
 

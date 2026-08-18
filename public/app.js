@@ -261,6 +261,52 @@ function renderBook(book) {
 }
 
 function finiteText(value, digits = 2) { return Number.isFinite(value) ? Number(value).toFixed(digits) : "—"; }
+function metadataValue(value) {
+  if (value === null || value === undefined || value === "") return "lipsește";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+function forecastBlockersMarkup(forecast) {
+  const availability = forecast?.availability;
+  if (!availability || !Array.isArray(availability.blockers)) return '<div class="forecast-blockers forecast-metadata-missing"><b>METADATE BLOCANTE INDISPONIBILE</b><span>Înregistrarea veche nu conține explicația structurată a indisponibilității.</span></div>';
+  if (!availability.blockers.length) return "";
+  return `<div class="forecast-blockers"><b>DE CE NU ESTE DISPONIBIL</b><ol>${availability.blockers.map((item) => `<li><strong>${escape(item.code ?? "BLOCANT NECUNOSCUT")}</strong><span>${escape(item.timeframe ?? "toate intervalele")} · sursă ${escape(item.source ?? "motor canonic")} · observat ${escape(metadataValue(item.observed))} · necesar ${escape(metadataValue(item.required))}</span><small>${escape(item.reason ?? "Motiv indisponibil")}</small></li>`).join("")}</ol><em>Observat la ${escape(time(availability.observedAt))}</em></div>`;
+}
+function reactionZoneMarkup(label, zone, kind) {
+  const statusLabels = { UNAVAILABLE: "INDISPONIBILĂ", MONITORING: "MONITORIZARE", TESTING_ZONE: "ZONĂ TESTATĂ", REJECTION_CONFIRMED: "RESPINGERE CONFIRMATĂ", BREAKOUT_CONFIRMED: "BREAKOUT CONFIRMAT" };
+  const suppliedStatus = statusLabels[zone?.status] ? zone.status : "UNAVAILABLE";
+  const blockersComplete = Array.isArray(zone?.blockers);
+  const strictReaction = suppliedStatus === "REJECTION_CONFIRMED"
+    && zone?.confirmations?.zoneTouch?.confirmed === true
+    && zone?.confirmations?.rejection?.confirmed === true
+    && zone?.confirmations?.orderFlow?.confirmed === true
+    && zone?.confirmations?.orderFlow?.live === true
+    && zone?.confirmations?.breakout?.confirmed === false
+    && zone?.confirmations?.breakout?.pending !== true
+    && zone?.potentialSetup?.available === true
+    && blockersComplete
+    && zone.blockers.length === 0;
+  const displayStatus = suppliedStatus === "REJECTION_CONFIRMED" && !strictReaction ? "TESTING_ZONE" : suppliedStatus;
+  const range = Number.isFinite(zone?.zone?.lower) && Number.isFinite(zone?.zone?.upper) ? `${money(zone.zone.lower)} – ${money(zone.zone.upper)}` : "—";
+  const relationLabels = { BELOW: "SUB ZONĂ", INSIDE: "ÎN ZONĂ", ABOVE: "PESTE ZONĂ" };
+  const relation = relationLabels[zone?.reference?.relation] ?? "POZIȚIE NECUNOSCUTĂ";
+  const distance = Number.isFinite(zone?.reference?.distanceToZone?.bps) && Number.isFinite(zone?.reference?.distanceToZone?.atr)
+    ? `${zone.reference.distanceToZone.bps.toFixed(1)} bps · ${zone.reference.distanceToZone.atr.toFixed(2)} ATR · ${relation}`
+    : Number.isFinite(zone?.reference?.distanceBps) && Number.isFinite(zone?.reference?.distanceAtr)
+      ? `${zone.reference.distanceBps.toFixed(1)} bps · ${zone.reference.distanceAtr.toFixed(2)} ATR · ${relation}`
+      : "—";
+  const invalidation = Number.isFinite(zone?.invalidation?.price)
+    ? `${zone.invalidation.condition === "COMPLETED_1M_CLOSE_ABOVE_ZONE_UPPER" ? "închidere 1m completă peste" : "închidere 1m completă sub"} ${money(zone.invalidation.price)}`
+    : "regulă indisponibilă";
+  const pendingBreakout = zone?.confirmations?.breakout?.pending === true;
+  const nextAction = displayStatus === "BREAKOUT_CONFIRMED" ? "Nu mai trata nivelul drept zonă de reacție; așteaptă un nivel structural nou."
+    : pendingBreakout ? "O închidere 1m a trecut de marginea îndepărtată; așteaptă a doua închidere pentru breakout sau revenirea completă în zonă."
+      : displayStatus === "TESTING_ZONE" ? `Așteaptă respingerea ${kind === "ceiling" ? "superioară" : "inferioară"} explicită și confirmarea LIVE a order flow-ului.`
+        : displayStatus === "MONITORING" ? "Monitorizează atingerea pe o lumânare 1m completă, apoi cere ambele confirmări stricte."
+          : strictReaction ? "Folosește descrierea numai ca context; porțile existente ale candidatului rămân neschimbate."
+            : "Așteaptă ancora, ATR-ul, referința și atribuirea completă.";
+  return `<section class="reaction-zone reaction-zone-${kind} status-${String(displayStatus).toLowerCase()}"><header><div><small>${escape(label)}</small><b>${escape(range)}</b></div><span>${escape(statusLabels[displayStatus])}</span></header><div class="reaction-zone-state ${strictReaction ? "reaction-confirmed" : "reaction-waiting"}">${strictReaction ? "REACȚIE CONFIRMATĂ" : "AȘTEAPTĂ CONFIRMAREA"}</div><dl><dt>Distanță până la zonă</dt><dd>${escape(distance)}</dd><dt>Respingere 1m</dt><dd>${zone?.confirmations?.rejection?.confirmed ? "CONFIRMATĂ" : "NECONFIRMATĂ"}</dd><dt>Order flow LIVE</dt><dd>${zone?.confirmations?.orderFlow?.confirmed && zone?.confirmations?.orderFlow?.live ? `CONFIRMĂ ${escape(zone.potentialDirection)}` : `NU CONFIRMĂ · ${escape(zone?.confirmations?.orderFlow?.observedDirection ?? "NEUTRU")}`}</dd><dt>Invalidare</dt><dd>${escape(invalidation)}</dd></dl><p><b>ACȚIUNEA URMĂTOARE:</b> ${escape(nextAction)}</p><small class="reaction-disclaimer">Nu este garantată, nu este un nivel exact de inversare și nu este niciodată un motiv pentru a mări miza.</small></section>`;
+}
 function renderDeepDashboard() {
   const snapshot = state.snapshot;
   if (!snapshot) return;
@@ -297,7 +343,8 @@ function renderDeepDashboard() {
     const blockers = candidate.engineBlockers ?? engine?.blockers ?? [];
     const readiness = counterfactualByHorizon.get(candidate.horizonMinutes) ?? {};
     const technical = engine?.technical ?? {};
-    return `<article class="engine-card"><header><strong>${candidate.horizonMinutes}m · ${escape(engine?.version ?? "ENGINE UNAVAILABLE")}</strong><span class="${directionClass(candidate.direction)}">${escape(directionMeta(candidate.direction).label)}</span></header><dl><dt>Extended regime</dt><dd>${escape(regime?.regime ?? "UNAVAILABLE")}${regime?.failClosed ? " · FAIL CLOSED" : ""}</dd><dt>Raw technical split</dt><dd>${finiteText(technical.upPercent ?? candidate.forecast?.upPercent, 0)} UP / ${finiteText(technical.downPercent ?? candidate.forecast?.downPercent, 0)} DOWN</dd><dt>Raw signed score</dt><dd>${finiteText(engine?.signedScore ?? technical.signedScore, 4)}</dd><dt>READY</dt><dd>${readiness.ready ? "YES" : `NO · ${readiness.blockedCount ?? blockers.length} blockers`}</dd></dl><div class="engine-score-note">RAW SCORES · NOT PROBABILITY</div><ul class="blocker-list">${blockers.map((item) => `<li><b>${escape(item.code)}</b> · ${escape(item.reason)}</li>`).join("") || "<li>No canonical engine blocker.</li>"}</ul><div class="counterfactual-list">${(readiness.requirements ?? readiness.counterfactuals ?? []).map((item) => `<div class="counterfactual"><b>${escape(item.code)}</b> · ${escape(item.reason ?? "Blocked")}${item.operator ? ` · exact ${escape(item.operator)} ${escape(item.threshold)} (delta ${escape(item.delta)})` : item.nextCloseAt ? ` · next completed observation ${time(item.nextCloseAt)}` : " · path-dependent, no invented threshold"}</div>`).join("") || '<div class="counterfactual">No missing READY requirement.</div>'}</div></article>`;
+    const forecastAvailable = candidate.forecast?.availability?.status === "AVAILABLE" && Array.isArray(candidate.forecast?.availability?.blockers) && candidate.forecast.availability.blockers.length === 0 && candidate.forecast?.available === true && Number.isFinite(candidate.forecast?.upPercent) && Number.isFinite(candidate.forecast?.downPercent);
+    return `<article class="engine-card"><header><strong>${candidate.horizonMinutes}m · ${escape(engine?.version ?? "ENGINE UNAVAILABLE")}</strong><span class="${directionClass(candidate.direction)}">${escape(directionMeta(candidate.direction).label)}</span></header><dl><dt>Extended regime</dt><dd>${escape(regime?.regime ?? "UNAVAILABLE")}${regime?.failClosed ? " · FAIL CLOSED" : ""}</dd><dt>Raw technical split</dt><dd>${forecastAvailable ? `${finiteText(candidate.forecast.upPercent, 0)} UP / ${finiteText(candidate.forecast.downPercent, 0)} DOWN` : "— UP / — DOWN"}</dd><dt>Raw signed score</dt><dd>${finiteText(engine?.signedScore ?? technical.signedScore, 4)}</dd><dt>READY</dt><dd>${readiness.ready ? "YES" : `NO · ${readiness.blockedCount ?? blockers.length} blockers`}</dd></dl><div class="engine-score-note">RAW SCORES · NOT PROBABILITY</div>${forecastAvailable ? "" : forecastBlockersMarkup(candidate.forecast)}<ul class="blocker-list">${blockers.map((item) => `<li><b>${escape(item.code)}</b> · ${escape(item.reason)}${item.observed !== undefined || item.required !== undefined ? `<small>${escape(item.timeframe ?? "toate intervalele")} · observat ${escape(metadataValue(item.observed))} · necesar ${escape(metadataValue(item.required))}</small>` : ""}</li>`).join("") || "<li>No canonical engine blocker.</li>"}</ul><div class="counterfactual-list">${(readiness.requirements ?? readiness.counterfactuals ?? []).map((item) => `<div class="counterfactual"><b>${escape(item.code)}</b> · ${escape(item.reason ?? "Blocked")}${item.operator ? ` · exact ${escape(item.operator)} ${escape(item.threshold)} (delta ${escape(item.delta)})` : (item.nextCloseAt ?? item.nextObservableAt) ? ` · next completed observation ${time(item.nextCloseAt ?? item.nextObservableAt)}` : " · path-dependent, no invented threshold"}</div>`).join("") || '<div class="counterfactual">No missing READY requirement.</div>'}</div></article>`;
   }).join("") || '<div class="empty-card">Canonical 10m/30m engines await coherent completed candles and LIVE order flow.</div>';
 }
 
@@ -633,8 +680,8 @@ function renderManualSignals() {
     CURRENT_ENTRY_RECHECK: "Revalidare setup", SIGNAL_DESK_DISABLED: "Scanner dezactivat", FEED_HEALTH: "Feed WebSocket", CORRECTION_STATE: "Stare corecție", LEVEL_STATE: "Stare nivel",
     COMPLETED_1M_TRIGGER: "Trigger 1m", FIVE_MINUTE_CONFIRMATION: "Trend 5m", FIFTEEN_MINUTE_ALIGNMENT: "Trend 15m",
     TRIGGER_FRESHNESS: "Fereastră intrare", QUALITY: "Calitate", FINITE_INVALIDATION: "Invalidare",
-    CANDLE_SOURCE_COHERENCE: "Sursă lumânări", MARKET_FRESHNESS: "Date proaspete", ORDER_BOOK_VALID: "Order book",
-    SPREAD_LIMIT: "Spread", TOP_LIQUIDITY: "Lichiditate", SOURCE_COHERENCE: "Sursă preț/book", MACRO_NEWS: "Macro/news", DIRECTION: "Direcție",
+    CANDLE_SOURCE_COHERENCE: "Sursă lumânări", MARKET_FRESHNESS: "Date proaspete", ORDER_FLOW: "Order flow LIVE", EXTENDED_REGIME: "Regim extins", HORIZON_ENGINE: "Motor orizont", ORDER_BOOK_VALID: "Order book",
+    SPREAD_LIMIT: "Spread", TOP_LIQUIDITY: "Lichiditate", SOURCE_COHERENCE: "Sursă preț/book", MACRO_NEWS: "Macro/news", DIRECTION: "Direcție", NO_CURRENT_CANDIDATE: "Niciun candidat curent",
   })[code] ?? code.replaceAll("_", " ");
   const confirmation = (label, item) => {
     const passed = item?.status === "PASS";
@@ -669,12 +716,18 @@ function renderManualSignals() {
       TRIGGER_FRESHNESS: "Triggerul 1m a expirat; se așteaptă următoarea lumânare relevantă.",
       CANDLE_SOURCE_COHERENCE: "Lumânările, prețul și order book-ul nu vin momentan din aceeași sursă.",
       MARKET_FRESHNESS: "Datele de piață nu sunt suficient de proaspete pentru evaluare.",
+      ORDER_FLOW: "Order flow-ul canonic nu este LIVE sau nu este suficient de proaspăt; evaluarea rămâne blocată.",
+      EXTENDED_REGIME: "Regimul extins lipsește sau impune închiderea preventivă a evaluării.",
+      HORIZON_ENGINE: "Motorul canonic al orizontului este WAIT, indisponibil, în conflict sau blocat.",
+      NO_CURRENT_CANDIDATE: "Nu există un candidat canonic curent pentru acest simbol și orizont.",
       CURRENT_ENTRY_RECHECK: "Setupul inițial nu mai este prezent în analiza actuală.",
     })[code] ?? round.actionable?.primaryBlocker?.text ?? "Așteaptă alinierea fluxului 1m, trendului 5m și contextului 15m.";
   };
   const roundMarkup = (round) => {
-    const forecast = round.forecast ?? { upPercent: 50, downPercent: 50, leader: "NEUTRAL", confidence: "LOW", available: false };
-    const forecastAvailable = forecast.available !== false && Number.isFinite(forecast.upPercent) && Number.isFinite(forecast.downPercent);
+    const forecast = round.forecast ?? { upPercent: null, downPercent: null, leader: "NEUTRAL", confidence: "LOW", available: false };
+    const forecastAvailable = forecast.availability?.status === "AVAILABLE" && Array.isArray(forecast.availability?.blockers) && forecast.availability.blockers.length === 0 && forecast.available === true && Number.isFinite(forecast.upPercent) && Number.isFinite(forecast.downPercent);
+    const forecastAvailabilityMarkup = forecastAvailable ? "" : forecastBlockersMarkup(forecast);
+    const reactionZonesMarkup = `<div class="reaction-zone-grid">${reactionZoneMarkup("PLAFON POTENȚIAL", round.reactionZones?.ceiling, "ceiling")}${reactionZoneMarkup("PODEA POTENȚIAL", round.reactionZones?.floor, "floor")}</div>`;
     const flow = round.marketFlow?.oneMinute ?? { direction: "NEUTRAL", strengthPercent: 0, momentum: "UNAVAILABLE", bars: 0 };
     const fiveTrend = round.marketFlow?.fiveMinute ?? { direction: "NEUTRAL", establishedDirection: "NEUTRAL", outlook: "UNAVAILABLE", confidencePercent: 0 };
     const correction = round.correction ?? { status: "UNAVAILABLE", depthAtr: null, depthBps: null, durationBars: 0, levelInteraction: { status: "UNAVAILABLE" } };
@@ -704,7 +757,7 @@ function renderManualSignals() {
     const readiness = round.readiness ?? { ready: false, requirements: [] };
     const readinessMarkup = readiness.ready
       ? '<div class="terminal-readiness readiness-ready"><strong>READY</strong><span>Nu lipsește nicio condiție auditată.</span></div>'
-      : `<div class="terminal-readiness"><strong>CE LIPSEȘTE PENTRU READY · ${readiness.blockedCount ?? readiness.requirements?.length ?? 0}</strong><ol>${(readiness.requirements ?? []).map((item) => `<li><b>${escape(checkLabel(item.code))}</b><span>${escape(item.reason ?? item.condition ?? "Condiție neîndeplinită")}${item.nextObservableAt ? ` · următoarea observație ${time(item.nextObservableAt)}` : ""}</span></li>`).join("") || "<li><span>Se așteaptă evaluarea contrafactuală.</span></li>"}</ol></div>`;
+      : `<div class="terminal-readiness"><strong>CE LIPSEȘTE PENTRU READY · ${readiness.blockedCount ?? readiness.requirements?.length ?? 0}</strong><ol>${(readiness.requirements ?? []).map((item) => `<li><b>${escape(checkLabel(item.code))}</b><span>${escape(item.reason ?? item.condition ?? "Condiție neîndeplinită")}${(item.nextCloseAt ?? item.nextObservableAt) ? ` · următoarea observație ${time(item.nextCloseAt ?? item.nextObservableAt)}` : ""}</span></li>`).join("") || "<li><span>Se așteaptă evaluarea contrafactuală.</span></li>"}</ol></div>`;
     const regime = round.marketRegime;
     const persistent = round.persistentState;
     const stateMarkup = `<div class="terminal-state-line"><span>REGIM ${escape(regime?.phase ?? "NECUNOSCUT")} · VOLATILITATE ${escape(regime?.volatility ?? "NECUNOSCUTĂ")}</span><span>CORECȚIE PERSISTATĂ ${escape(persistent?.correction?.state ?? "—")} · v${escape(persistent?.correction?.version ?? "—")}</span></div>`;
@@ -714,8 +767,9 @@ function renderManualSignals() {
       <div class="event-round-head"><div><small>ORIZONT ANALIZAT</small><strong>${escape(round.symbol)} · ${round.horizonMinutes} MINUTE</strong></div><div class="event-countdown"><small>${round.state === "ENTER_NOW" ? "SETUPUL EXPIRĂ" : round.state === "TRACKING" ? "REZULTAT PROXY" : "TRIGGER VALID"}</small><b>${countdownTarget ? remaining(countdownTarget) : "—"}</b></div></div>
       <div class="terminal-forecast">
         <div class="forecast-side forecast-up"><small>SCOR BRUT UP · NOT PROBABILITY</small><b>↑ ${forecastAvailable ? `${forecast.upPercent}%` : "—"}</b></div>
-        <div class="forecast-center"><div class="forecast-track"><i class="forecast-up-fill" style="width:${forecastAvailable ? forecast.upPercent : 0}%"></i><i class="forecast-down-fill" style="width:${forecastAvailable ? forecast.downPercent : 0}%"></i></div><strong>${escape(forecastAvailable ? (forecast.leader === "NEUTRAL" ? "ECHILIBRU" : `${directionMeta(forecast.leader).label} DOMINANT`) : "DATE INSUFICIENTE")}</strong><span>${escape(forecastAvailable ? `${forecast.confidence} · RAW TECHNICAL SCORE · NOT PROBABILITY` : "Procentele apar numai după minimum 50 de lumânări închise pe toate intervalele")}</span></div>
+        <div class="forecast-center"><div class="forecast-track"><i class="forecast-up-fill" style="width:${forecastAvailable ? forecast.upPercent : 0}%"></i><i class="forecast-down-fill" style="width:${forecastAvailable ? forecast.downPercent : 0}%"></i></div><strong>${escape(forecastAvailable ? (forecast.leader === "NEUTRAL" ? "ECHILIBRU" : `${directionMeta(forecast.leader).label} DOMINANT`) : "SCOR INDISPONIBIL")}</strong><span>${escape(forecastAvailable ? `${forecast.confidence} · RAW TECHNICAL SCORE · NOT PROBABILITY` : "Vezi blocantele exacte observate mai jos.")}</span></div>
         <div class="forecast-side forecast-down"><small>SCOR BRUT DOWN · NOT PROBABILITY</small><b>${forecastAvailable ? `${forecast.downPercent}%` : "—"} ↓</b></div>
+        ${forecastAvailabilityMarkup}
       </div>
       <div class="terminal-decision-grid">
         <div class="terminal-bias ${directionClass(trendDirection)}"><small>TREND STABILIT PE 5m</small><b>${escape(bias.label)}</b><span>${escape(outlookLabel(fiveTrend.outlook))} · acord ${fiveTrend.confidencePercent ?? 0}%</span></div>
@@ -726,6 +780,7 @@ function renderManualSignals() {
         <div class="terminal-pulse correction-${String(correction.status ?? "unavailable").toLowerCase()}"><small>CORECȚIE FAȚĂ DE TRENDUL 5m</small><b>${escape(correctionLabel(correction.status))}</b><span>${escape(correctionRoute)}${Number.isFinite(correction.depthAtr) ? ` · ${correction.depthAtr.toFixed(2)} ATR · ${correction.durationBars} lumânări 1m` : " · se așteaptă suficiente lumânări închise"}</span></div>
         <div class="terminal-pulse"><small>INTERACȚIUNI CU NIVELURILE</small><b>S ${escape(interactionSummary(supportInteraction))} · R ${escape(interactionSummary(resistanceInteraction))}</b><span>SUPORT ${Number.isFinite(supportInteraction?.level) ? money(supportInteraction.level) : "—"} · REZISTENȚĂ ${Number.isFinite(resistanceInteraction?.level) ? money(resistanceInteraction.level) : "—"}</span></div>
       </div>
+      ${reactionZonesMarkup}
       <div class="terminal-prices"><div><small>REFERINȚĂ 1m ÎNCHISĂ</small><b>${Number.isFinite(round.prices?.reference?.value) ? money(round.prices.reference.value) : "—"}</b><span>${time(round.prices?.reference?.observedAt)}</span></div><div><small>PREȚ PROXY ÎNREGISTRAT</small><b>${Number.isFinite(round.prices?.entry?.value) ? money(round.prices.entry.value) : "—"}</b><span>${round.state === "ENTER_NOW" || round.state === "TRACKING" ? "observație Spot salvată" : "numai la setup proxy valid"}</span></div><div><small>PREȚ SPOT ACUM</small><b>${Number.isFinite(round.prices?.current?.value) ? money(round.prices.current.value) : "—"}</b><span>${time(round.prices?.current?.observedAt)}</span></div></div>
       <div class="terminal-confirmations">${confirmation("TRIGGER 1m", round.confirmations?.oneMinute)}${confirmation("TREND 5m", round.confirmations?.fiveMinute)}${confirmation("TREND 15m", round.confirmations?.fifteenMinute)}</div>
       <div class="terminal-levels">${level("SUPORT", round.levels?.support, "support")}${level("REZISTENȚĂ", round.levels?.resistance, "resistance")}<div class="terminal-level invalidation"><small>INVALIDARE</small><b>${Number.isFinite(invalidation?.price) ? money(invalidation.price) : "—"}</b><span title="${escape(invalidation?.text ?? invalidationContext)}">${escape(invalidationContext || "nivel necesar")}</span></div></div>

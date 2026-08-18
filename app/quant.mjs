@@ -1,5 +1,6 @@
 import { evaluate10m } from "./engine-10m.mjs";
 import { evaluate30m } from "./engine-30m.mjs";
+import { buildReactionZones } from "./reaction-zone-engine.mjs";
 
 const last = (values) => values.at(-1);
 const finite = (values) => values.filter(Number.isFinite);
@@ -205,6 +206,45 @@ function regimeDirection(analysis) {
 function completedWatermark(candles) {
   const closeTime = candles.at(-1)?.closeTime;
   return Number.isFinite(closeTime) ? new Date(closeTime).toISOString() : null;
+}
+function foundationalAvailabilityBlockers(completed, watermarks) {
+  return analysisTimeframes.flatMap((timeframe) => {
+    const count = completed[timeframe]?.length ?? 0;
+    const watermark = watermarks[timeframe] ?? null;
+    const evidence = { completedCandles: count, closeWatermark: watermark };
+    return [
+      ...(count < 50 ? [{
+        code: "INSUFFICIENT_COMPLETED_CANDLES",
+        source: "FOUNDATIONAL_COMPLETENESS",
+        timeframe,
+        observed: count,
+        required: 50,
+        reason: `${timeframe} has ${count} completed candles; 50 are required for foundational forecast availability.`,
+        evidence,
+      }] : []),
+      ...(!watermark ? [{
+        code: "MISSING_COMPLETED_CANDLE_WATERMARK",
+        source: "FOUNDATIONAL_COMPLETENESS",
+        timeframe,
+        observed: watermark,
+        required: "latest completed-candle close watermark",
+        reason: `${timeframe} has no completed-candle close watermark.`,
+        evidence,
+      }] : []),
+    ];
+  });
+}
+function mergeBlockers(...groups) {
+  const merged = [];
+  const identities = new Set();
+  for (const item of groups.flat()) {
+    if (!item || typeof item !== "object") continue;
+    const identity = `${item.code ?? "UNKNOWN"}|${item.source ?? "CANONICAL_HORIZON_ENGINE"}|${item.timeframe ?? "ALL"}`;
+    if (identities.has(identity)) continue;
+    identities.add(identity);
+    merged.push(item);
+  }
+  return merged;
 }
 export function detectOneMinuteTrigger(candles, indicators = calculateIndicators(candles)) {
   const current = candles.at(-1); const previous = candles.at(-2);
@@ -414,7 +454,8 @@ function generateLegacySignals(candles, options = {}) {
   const triggerCloseMs = Number.isFinite(current?.closeTime) ? current.closeTime : null;
   const triggerValidUntil = triggerCloseMs === null ? null : new Date(triggerCloseMs + (options.triggerGraceMs ?? 90000)).toISOString();
   const fiveMinuteDirection = structureFeatures["5m"].structureDirection ?? "NEUTRAL";
-  const complete = analysisTimeframes.every((timeframe) => completed[timeframe].length >= 50 && timeframeCloseWatermarks[timeframe]);
+  const foundationalBlockers = foundationalAvailabilityBlockers(completed, timeframeCloseWatermarks);
+  const complete = foundationalBlockers.length === 0;
   const marketRegime = detectMarketRegime(completed, analyses, structureFeatures);
   const weightMatrix = {
     TREND: {
@@ -566,14 +607,15 @@ function generateLegacySignals(candles, options = {}) {
       : correction.status === "CORRECTION_END_CONFIRMED" ? (correctionTrend === "UP" ? 1 : -1) * (horizonMinutes === 10 ? 0.1 : 0.04)
         : correction.status === "LOCAL_LEVEL_BREAK_CONFIRMED" ? (correctionTrend === "UP" ? -1 : 1) * 0.16 : 0;
     const forecastSigned = complete ? clamp(signedStrength * 0.64 + oneMinuteFlow.signedScore * (horizonMinutes === 10 ? 0.14 : 0.06) + fiveMinuteTrend.signedScore * 0.1 + confluenceSigned * 0.12 + correctionAdjustment, -1, 1) : 0;
-    const technicalUpPercent = complete ? Math.round(clamp(50 + forecastSigned * 42, 8, 92)) : 50;
-    const technicalDownPercent = 100 - technicalUpPercent;
-    const technicalEdge = Math.abs(technicalUpPercent - technicalDownPercent);
+    const technicalUpPercent = complete ? Math.round(clamp(50 + forecastSigned * 42, 8, 92)) : null;
+    const technicalDownPercent = complete ? 100 - technicalUpPercent : null;
+    const technicalEdge = complete ? Math.abs(technicalUpPercent - technicalDownPercent) : null;
     const forecast = {
       upPercent: technicalUpPercent, downPercent: technicalDownPercent,
-      leader: technicalUpPercent === technicalDownPercent ? "NEUTRAL" : technicalUpPercent > technicalDownPercent ? "UP" : "DOWN",
-      edgePercent: technicalEdge, confidence: technicalEdge >= 30 ? "HIGH" : technicalEdge >= 16 ? "MEDIUM" : "LOW",
+      leader: complete ? (technicalUpPercent === technicalDownPercent ? "NEUTRAL" : technicalUpPercent > technicalDownPercent ? "UP" : "DOWN") : "NEUTRAL",
+      edgePercent: technicalEdge, confidence: complete ? (technicalEdge >= 30 ? "HIGH" : technicalEdge >= 16 ? "MEDIUM" : "LOW") : "LOW",
       available: complete, updatedAt: timeframeCloseWatermarks["1m"],
+      availability: { status: complete ? "AVAILABLE" : "UNAVAILABLE", blockers: foundationalBlockers, observedAt: timeframeCloseWatermarks["1m"] },
       classification: "UNCALIBRATED_TECHNICAL_DIRECTION_ESTIMATE_NOT_WIN_PROBABILITY",
       factors: { oneMinuteFlow: oneMinuteFlow.signedScore, fiveMinuteTrend: fiveMinuteTrend.signedScore, multiTimeframeStrength: signedStrength, confluence: confluenceSigned, correctionAdjustment },
     };
@@ -626,28 +668,36 @@ export function generateSignals(candles, options = {}) {
     const engine = candidate.horizonMinutes === 10 ? evaluate10m(context) : evaluate30m(context);
     const extendedRegime = engine.regimeDetails;
     const conflict = ["UP", "DOWN"].includes(engine.direction) && engine.direction !== candidate.setupDirection;
-    const engineBlockers = [
-      ...engine.blockers,
-      ...(conflict ? [{ code: "ENGINE_STRUCTURE_CONFLICT", reason: `Canonical ${candidate.horizonMinutes}m engine direction ${engine.direction} conflicts with the structural setup ${candidate.setupDirection}.`, evidence: { engineDirection: engine.direction, setupDirection: candidate.setupDirection } }] : []),
-    ];
+    const conflictBlockers = conflict ? [{ code: "ENGINE_STRUCTURE_CONFLICT", source: "CANONICAL_HORIZON_ENGINE", timeframe: `${candidate.horizonMinutes}m`, observed: engine.direction, required: candidate.setupDirection, reason: `Canonical ${candidate.horizonMinutes}m engine direction ${engine.direction} conflicts with the structural setup ${candidate.setupDirection}.`, evidence: { engineDirection: engine.direction, setupDirection: candidate.setupDirection } }] : [];
+    const canonicalBlockers = engine.blockers.map((item) => ({
+      ...item,
+      source: item.source ?? "CANONICAL_HORIZON_ENGINE",
+      timeframe: item.timeframe ?? (item.code === "INCOMPLETE_TIMEFRAME_WATERMARKS" ? "1m/5m/15m/1h" : `${candidate.horizonMinutes}m`),
+      observed: item.observed ?? item.evidence ?? null,
+      required: item.required ?? (item.code === "INCOMPLETE_TIMEFRAME_WATERMARKS" ? "close watermark for 1m, 5m, 15m and 1h" : item.code === "REGIME_FAIL_CLOSED" ? "available non-fail-closed extended regime" : item.code === "CORRECTION_BLOCKED" ? "horizon-permitted correction state" : "available canonical engine feature"),
+    }));
+    const engineBlockers = mergeBlockers(candidate.forecast?.availability?.blockers ?? [], canonicalBlockers, conflictBlockers);
     const engineDirectional = ["UP", "DOWN"].includes(engine.direction) && engineBlockers.length === 0;
     const qualified = candidate.qualified === true && engineDirectional && !conflict;
     const direction = qualified ? engine.direction : "WAIT";
+    const forecastAvailable = engineBlockers.length === 0;
+    const technicalEdge = forecastAvailable ? Math.abs(engine.technical.upPercent - engine.technical.downPercent) : null;
     const forecast = {
       ...candidate.forecast,
-      upPercent: engine.technical.upPercent,
-      downPercent: engine.technical.downPercent,
-      leader: engine.technical.upPercent === engine.technical.downPercent ? "NEUTRAL" : engine.technical.upPercent > engine.technical.downPercent ? "UP" : "DOWN",
-      edgePercent: Math.abs(engine.technical.upPercent - engine.technical.downPercent),
-      confidence: Math.abs(engine.technical.upPercent - engine.technical.downPercent) >= 30 ? "HIGH" : Math.abs(engine.technical.upPercent - engine.technical.downPercent) >= 16 ? "MEDIUM" : "LOW",
-      available: engineBlockers.length === 0,
+      upPercent: forecastAvailable ? engine.technical.upPercent : null,
+      downPercent: forecastAvailable ? engine.technical.downPercent : null,
+      leader: forecastAvailable ? (engine.technical.upPercent === engine.technical.downPercent ? "NEUTRAL" : engine.technical.upPercent > engine.technical.downPercent ? "UP" : "DOWN") : "NEUTRAL",
+      edgePercent: technicalEdge,
+      confidence: forecastAvailable ? (technicalEdge >= 30 ? "HIGH" : technicalEdge >= 16 ? "MEDIUM" : "LOW") : "LOW",
+      available: forecastAvailable,
+      availability: { status: forecastAvailable ? "AVAILABLE" : "UNAVAILABLE", blockers: engineBlockers, observedAt: candidate.timeframeCloseWatermarks?.["1m"] ?? null },
       classification: engine.technical.classification,
       engineVersion: engine.version,
     };
     const canonicalReason = engineBlockers.length
       ? `Canonical ${candidate.horizonMinutes}m engine fails closed: ${engineBlockers.map((blocker) => blocker.code).join(", ")}.`
       : `Canonical ${candidate.horizonMinutes}m engine verdict is ${engine.direction} in ${extendedRegime.regime}.`;
-    return {
+    const canonicalCandidate = {
       ...candidate,
       direction,
       actionableDirection: qualified ? engine.direction : null,
@@ -659,8 +709,20 @@ export function generateSignals(candles, options = {}) {
       canonicalVerdict: { direction, rawDirection: engine.direction, qualified, horizonMinutes: candidate.horizonMinutes, engineVersion: engine.version, regime: extendedRegime.regime, failClosed: engineBlockers.length > 0 },
       volatilityRegime: extendedRegime.regime,
       marketRegime: { ...candidate.marketRegime, extended: extendedRegime, canonical: extendedRegime.regime },
-      technicalFeatures: { ...candidate.technicalFeatures, orderFlow: options.orderFlow ?? null, extendedRegime, engine: { version: engine.version, components: engine.components } },
+      technicalFeatures: { ...candidate.technicalFeatures, orderFlow: options.orderFlow ?? null, orderBook: options.orderBookMetrics ?? null, extendedRegime, engine: { version: engine.version, components: engine.components } },
       reasons: [...candidate.reasons, canonicalReason],
+    };
+    return {
+      ...canonicalCandidate,
+      reactionZones: buildReactionZones({
+        candidate: canonicalCandidate,
+        completedOneMinuteCandles: completed["1m"],
+        atrValue: analyses["1m"]?.indicators?.atr14,
+        referencePrice: canonicalCandidate.referencePrice,
+        orderFlow: options.orderFlow ?? null,
+        orderBookMetrics: options.orderBookMetrics ?? null,
+        observedAt: canonicalCandidate.timeframeCloseWatermarks?.["1m"] ?? null,
+      }),
     };
   });
 }

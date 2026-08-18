@@ -57,6 +57,8 @@ Attributed market state
   -> normalized multi-timeframe features
   -> eight-regime classifier
   -> independent 10m engine / independent 30m engine
+  -> exact foundational + canonical forecast availability blockers
+  -> conservative descriptive ceiling/floor reaction zones
   -> shared fail-closed entry policy
   -> prospective forecast + candidate audit
   -> manual research view / autonomous PAPER scheduler
@@ -103,6 +105,14 @@ Every canonical candidate, including WAIT, is stored prospectively with its deci
 Calibration is segmented by relevant model/symbol/horizon identity. Isotonic and regularized Platt fits are derived only from resolved prospective rows. Reports include sample counts and probability metrics. Before the configured minimum sample, status is `WARMUP` and calibrated values are null. The system never relabels setup quality or raw directional evidence as calibrated probability.
 
 Counterfactual readiness translates failed gates into ordered requirements and, where derivable, the next complete-candle observation time. It is explanatory only and cannot bypass a gate.
+
+Forecast availability is a separate fail-closed contract. Each of 1m, 5m, 15m, and 1h must provide at least 50 completed candles and a close watermark. Those structured foundational blockers are merged and deduplicated with canonical horizon-engine blockers. An unavailable forecast stores null UP/DOWN/edge values and a neutral leader instead of a synthetic 50/50 split.
+
+## Conservative reaction zones
+
+`app/reaction-zone-engine.mjs` is a pure descriptive stage invoked only after canonical engine evidence has been attached. For each candidate it always returns a ceiling around the existing nearest resistance and a floor around the existing nearest support. The range is the attributed anchor plus/minus `0.15 * completed 1m ATR`; source, timeframe, reference distance, confirmation evidence, blockers, invalidation, and next action remain explicit.
+
+The stage reuses completed 1m candles and trigger patterns, existing level interactions, structural FVG/IFVG/sweep context, canonical LIVE order-flow direction, and passed order-book metrics. `REJECTION_CONFIRMED` requires zone overlap by the latest completed 1m candle, the side-specific explicit rejection pattern, and LIVE order flow in the reaction direction. A confirmed level break or two completed closes beyond the far edge takes precedence as `BREAKOUT_CONFIRMED`. These zones never modify setup direction, quality, readiness/entry gates, autonomous execution, or stake sizing; they are not guaranteed reversal levels or reasons to increase stake.
 
 ## Replay and walk-forward
 

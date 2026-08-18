@@ -47,6 +47,9 @@ function candidateDetails(candidate, entryGate = null) {
     confluenceComponents: candidate.confluenceComponents ?? [],
     structureFeatures: candidate.structureFeatures ?? {},
     technicalFeatures: candidate.technicalFeatures ?? {},
+    reactionZones: candidate.reactionZones ?? null,
+    engineBlockers: candidate.engineBlockers ?? [],
+    canonicalVerdict: candidate.canonicalVerdict ?? null,
     qualityDefinition: candidate.qualityDefinition ?? null,
     entryGate,
   };
@@ -172,7 +175,7 @@ export class ManualSignalService {
     const candidates = snapshot?.analysis?.candidates ?? [];
     const signals = new Map(this.latestSegments(symbol).map((signal) => [signal.horizonMinutes, signal]));
     const confidence = new Map(this.confidence(symbol).map((item) => [item.horizonMinutes, item]));
-    const blockerPriority = ["CURRENT_ENTRY_RECHECK", "FEED_HEALTH", "MARKET_FRESHNESS", "CANDLE_SOURCE_COHERENCE", "CORRECTION_STATE", "LEVEL_STATE", "COMPLETED_1M_TRIGGER", "FIVE_MINUTE_CONFIRMATION", "FIFTEEN_MINUTE_ALIGNMENT", "TRIGGER_FRESHNESS", "QUALITY", "FINITE_INVALIDATION", "ORDER_BOOK_VALID", "SPREAD_LIMIT", "TOP_LIQUIDITY", "SOURCE_COHERENCE", "MACRO_NEWS", "DIRECTION"];
+    const blockerPriority = ["CURRENT_ENTRY_RECHECK", "FEED_HEALTH", "MARKET_FRESHNESS", "CANDLE_SOURCE_COHERENCE", "ORDER_FLOW", "EXTENDED_REGIME", "HORIZON_ENGINE", "CORRECTION_STATE", "LEVEL_STATE", "COMPLETED_1M_TRIGGER", "FIVE_MINUTE_CONFIRMATION", "FIFTEEN_MINUTE_ALIGNMENT", "TRIGGER_FRESHNESS", "QUALITY", "FINITE_INVALIDATION", "ORDER_BOOK_VALID", "SPREAD_LIMIT", "TOP_LIQUIDITY", "SOURCE_COHERENCE", "MACRO_NEWS", "DIRECTION"];
     const source = snapshot?.market ?? {};
     const rounds = this.settings.horizons.map((horizonMinutes) => {
       const candidate = candidates.find((item) => item.horizonMinutes === horizonMinutes) ?? null;
@@ -193,6 +196,15 @@ export class ManualSignalService {
       const disabled = actionState === "DISABLED";
       const state = actionable ? "ENTER_NOW" : tracking ? "TRACKING" : resolved ? "RESOLVED" : disabled ? "DISABLED" : ["BLOCKED_CURRENT_GATES", "BLOCKED"].includes(actionState) || blocked ? "BLOCKED" : "WAIT";
       const displayDetails = tracking || resolved ? details : candidate ?? details;
+      const noCurrentCandidateBlocker = !candidate ? {
+        code: "NO_CURRENT_CANDIDATE",
+        source: "MANUAL_SIGNAL_TERMINAL",
+        timeframe: `${horizonMinutes}m`,
+        observed: 0,
+        required: 1,
+        reason: `No current ${horizonMinutes}m canonical candidate is available for ${symbol}.`,
+        evidence: { symbol, horizonMinutes, analysisCalculatedAt: snapshot?.analysis?.calculatedAt ?? null },
+      } : null;
       const setupDirection = displayDetails.setupDirection ?? (signal?.direction === "WAIT" ? "NEUTRAL" : signal?.direction) ?? "NEUTRAL";
       const oneMinute = displayDetails.technicalFeatures?.oneMinuteTrigger ?? null;
       const oneMinuteFlow = displayDetails.technicalFeatures?.oneMinuteFlow ?? null;
@@ -206,10 +218,22 @@ export class ManualSignalService {
           ? { code: signal?.proxyOutcome ?? "RESOLVED", text: "The proxy observation is finished; this is history, not a new entry." }
           : state === "DISABLED"
             ? { code: "SIGNAL_DESK_DISABLED", text: "Manual signal scanning is disabled; no current setup can be acted on." }
-            : blocked ? { code: blocked.code, text: blocked.reason }
-              : state === "WAIT" ? { code: "WAIT_FOR_SETUP", text: displayDetails.reasons?.find((reason) => reason.startsWith("Entry blocked")) ?? displayDetails.reasons?.at(-2) ?? "Waiting for completed 1m, 5m and 15m alignment." } : null;
+            : noCurrentCandidateBlocker ? { code: noCurrentCandidateBlocker.code, text: noCurrentCandidateBlocker.reason, metadata: noCurrentCandidateBlocker }
+              : blocked ? { code: blocked.code, text: blocked.reason }
+                : state === "WAIT" ? { code: "WAIT_FOR_SETUP", text: displayDetails.reasons?.find((reason) => reason.startsWith("Entry blocked")) ?? displayDetails.reasons?.at(-2) ?? "Waiting for completed 1m, 5m and 15m alignment." } : null;
       const qualityScore = displayDetails.qualityScore ?? signal?.qualityScore ?? 0;
       const watermarks = displayDetails.timeframeCloseWatermarks ?? signal?.timeframeCloseWatermarks ?? {};
+      const fallbackForecast = {
+        upPercent: null,
+        downPercent: null,
+        leader: "NEUTRAL",
+        edgePercent: null,
+        confidence: "LOW",
+        available: false,
+        availability: { status: "UNAVAILABLE", blockers: [noCurrentCandidateBlocker].filter(Boolean), observedAt: now.toISOString() },
+        classification: "UNCALIBRATED_TECHNICAL_DIRECTION_ESTIMATE_NOT_WIN_PROBABILITY",
+      };
+      const currentAnalysisAvailable = Boolean(candidate) || tracking || resolved;
       return {
         roundId: `${symbol}:${horizonMinutes}:${signal?.candidateKey ?? candidate?.decisionKey ?? "waiting"}`,
         classification: "MANUAL_EVENT_FUTURES_SIGNAL_USING_SPOT_PROXY",
@@ -217,7 +241,7 @@ export class ManualSignalService {
         horizonMinutes,
         state,
         setupDirection,
-        forecast: displayDetails.forecast ?? { upPercent: 50, downPercent: 50, leader: "NEUTRAL", edgePercent: 0, confidence: "LOW", available: false, classification: "UNCALIBRATED_TECHNICAL_DIRECTION_ESTIMATE_NOT_WIN_PROBABILITY" },
+        forecast: currentAnalysisAvailable ? displayDetails.forecast ?? fallbackForecast : fallbackForecast,
         marketFlow: { oneMinute: oneMinuteFlow, fiveMinute: fiveMinuteTrend },
         correction: displayDetails.correction ?? null,
         levelInteractions: displayDetails.levelInteractions ?? null,
@@ -239,7 +263,8 @@ export class ManualSignalService {
         readiness: gate?.readiness ?? null,
         marketRegime: displayDetails.marketRegime ?? null,
         persistentState: displayDetails.persistentState ?? null,
-        details: { checks, reasons: displayDetails.reasons ?? signal?.reasons ?? [], confluenceComponents: displayDetails.confluenceComponents ?? [], volatilityRegime: displayDetails.volatilityRegime ?? null, marketRegime: displayDetails.marketRegime ?? null, persistentState: displayDetails.persistentState ?? null, timeframeWatermarks: watermarks, entrySource: signal?.entrySource ?? null },
+        reactionZones: currentAnalysisAvailable ? displayDetails.reactionZones ?? null : null,
+        details: { checks, reasons: displayDetails.reasons ?? signal?.reasons ?? [], confluenceComponents: displayDetails.confluenceComponents ?? [], volatilityRegime: displayDetails.volatilityRegime ?? null, marketRegime: displayDetails.marketRegime ?? null, persistentState: displayDetails.persistentState ?? null, timeframeWatermarks: watermarks, entrySource: signal?.entrySource ?? null, noCurrentCandidate: noCurrentCandidateBlocker },
       };
     });
     return {
