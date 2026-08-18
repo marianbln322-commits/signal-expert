@@ -40,8 +40,24 @@ export function evaluateEntryGates({ snapshot, candidate, policy, now = new Date
   const add = (code, passed, reason, evidence = null, skipped = false) => checks.push({ code, status: skipped ? "SKIPPED" : passed ? "PASS" : "BLOCKED", reason, evidence });
   const direction = candidate?.direction;
   const feed = snapshot?.health?.feed;
-  if (policy.feedRequired) add("FEED_HEALTH", feed?.actionReady === true, feed?.actionReady === true ? "All required Binance event-stream channels are LIVE." : `Required event stream is ${feed?.status ?? "UNAVAILABLE"}; entry fails closed.`, feed ?? null);
+  if (policy.feedRequired) add("FEED_HEALTH", feed?.actionReady === true, feed?.actionReady === true ? "All required Binance event-stream channels, including DEPTH, are LIVE." : `Required event stream is ${feed?.status ?? "UNAVAILABLE"}; entry fails closed.`, feed ?? null);
   else add("FEED_HEALTH", true, "Event-stream mode is disabled for this backward-compatible instance.", { status: "DISABLED" }, true);
+  const orderFlow = snapshot?.orderFlow;
+  const orderFlowReady = orderFlow?.status === "LIVE" && orderFlow?.freshness?.book?.status === "LIVE" && orderFlow?.freshness?.trades?.status === "LIVE";
+  const extendedRegime = candidate?.extendedRegime;
+  const blockedRegime = ["ABNORMAL_VOLATILITY", "LOW_LIQUIDITY"].includes(extendedRegime?.regime) || extendedRegime?.failClosed === true;
+  const engine = candidate?.engine;
+  const engineBlockers = candidate?.engineBlockers ?? engine?.blockers ?? [];
+  const engineReady = engine && ["UP", "DOWN"].includes(engine.direction) && engineBlockers.length === 0 && engine.direction === candidate?.direction;
+  if (policy.feedRequired) {
+    add("ORDER_FLOW", orderFlowReady, orderFlowReady ? "Synchronized Binance depth and aggressor trades provide LIVE order flow." : `Order flow is ${orderFlow?.status ?? "UNAVAILABLE"}; REST fallback and mixed-provider flow are never actionable.`, orderFlow ?? null);
+    add("EXTENDED_REGIME", Boolean(extendedRegime) && !blockedRegime, !extendedRegime ? "Extended regime is unavailable; entry fails closed." : blockedRegime ? `${extendedRegime.regime} is a canonical fail-closed regime.` : `Extended regime ${extendedRegime.regime} permits engine evaluation.`, extendedRegime ?? null);
+    add("HORIZON_ENGINE", Boolean(engineReady), engineReady ? `Canonical ${candidate.horizonMinutes}m engine ${engine.version} confirms ${engine.direction}.` : `Canonical ${candidate?.horizonMinutes ?? "unknown"}m engine is unavailable, WAIT, conflicting, or blocked.`, { version: engine?.version ?? null, direction: engine?.direction ?? null, blockers: engineBlockers });
+  } else {
+    add("ORDER_FLOW", true, "Deep order-flow gate is inactive because event-stream mode is disabled.", { status: "DISABLED" }, true);
+    add("EXTENDED_REGIME", true, "Extended-regime gate is inactive because event-stream mode is disabled.", { status: "DISABLED" }, true);
+    add("HORIZON_ENGINE", true, "Deep horizon-engine gate is inactive because event-stream mode is disabled.", { status: "DISABLED" }, true);
+  }
   const persistedCorrection = candidate?.persistentState?.correction;
   const correctionEvidence = persistedCorrection ? { ...(persistedCorrection.payload ?? {}), status: persistedCorrection.state, version: persistedCorrection.version, updatedAt: persistedCorrection.updatedAt } : candidate?.correction;
   const correctionStatus = correctionEvidence?.status ?? "UNAVAILABLE";
@@ -98,7 +114,7 @@ export function evaluateEntryGates({ snapshot, candidate, policy, now = new Date
   return {
     allowed: checks.every((check) => check.status !== "BLOCKED"),
     classification: "AUDITABLE_ENTRY_POLICY_PAPER_AND_MANUAL_ONLY",
-    policyVersion: "entry-gates-v0.8.0",
+    policyVersion: "entry-gates-v0.9.0",
     evaluatedAt: now.toISOString(),
     checks,
     orderBook: metrics,

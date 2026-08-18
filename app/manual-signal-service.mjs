@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { AUTONOMOUS_STRATEGY_VERSION } from "./quant.mjs";
+import { CalibrationService } from "./calibration-service.mjs";
 
 const MARKET_CLASSIFICATION = "SPOT_PROXY";
 const SETTLEMENT_CLASSIFICATION = "NOT_EVENT_FUTURES_SETTLEMENT";
@@ -11,6 +12,13 @@ function deterministicId(candidateKey) {
 function timestamp(value) {
   const parsed = new Date(value).getTime();
   return Number.isFinite(parsed) ? parsed : null;
+}
+function segmentLabel(value) {
+  if (typeof value === "string" && value.trim()) return value.trim().toUpperCase();
+  if (value && typeof value === "object") {
+    for (const key of ["segment", "regime", "label", "state", "status", "classification"]) if (typeof value[key] === "string" && value[key].trim()) return value[key].trim().toUpperCase();
+  }
+  return "UNSEGMENTED";
 }
 function tickerProvenance(market, observedAt) {
   return {
@@ -45,8 +53,12 @@ function candidateDetails(candidate, entryGate = null) {
 }
 
 export class ManualSignalService {
-  constructor({ market, database, settings }) {
-    this.market = market; this.database = database; this.settings = settings;
+  constructor({ market, database, settings, calibrationService = undefined, alertService = null, operationalService = null }) {
+    this.market = market; this.database = database; this.settings = settings; this.alertService = alertService; this.operationalService = operationalService;
+    const calibrationCapable = ["forecastObservationsForCalibration", "createCalibrationModel", "activeCalibrationModel", "createCalibrationMetricSnapshot"].every((method) => typeof database?.[method] === "function");
+    this.calibrationService = calibrationService === undefined && calibrationCapable
+      ? new CalibrationService({ database, minSample: settings.forecastCalibrationMinSample })
+      : calibrationService;
     this.timer = null; this.resolutionTimer = null; this.busy = false; this.nextScanAt = null; this.lastScanAt = null; this.lastError = null;
   }
   start() {
@@ -79,7 +91,7 @@ export class ManualSignalService {
     return {
       allowed: false,
       classification: "CURRENT_ENTRY_RECHECK_UNAVAILABLE",
-      policyVersion: "entry-gates-v0.8.0",
+      policyVersion: "entry-gates-v0.9.0",
       evaluatedAt: now.toISOString(),
       checks: [{ code: "CURRENT_ENTRY_RECHECK", status: "BLOCKED", reason: "The original candidate is no longer present in the current completed-candle analysis.", evidence: { candidateKey: signal.candidateKey } }],
     };
@@ -123,6 +135,8 @@ export class ManualSignalService {
     }));
   }
   forecastCalibration(symbol = null) {
+    const prospective = this.calibrationService?.status(symbol) ?? [];
+    if (prospective.length) return prospective;
     const observed = this.database.forecastCalibration({ minSample: this.settings.forecastCalibrationMinSample, symbol });
     const bySegment = new Map(observed.filter((item) => item.strategyVersion === AUTONOMOUS_STRATEGY_VERSION).map((item) => [`${item.symbol}:${item.horizonMinutes}`, item]));
     const symbols = symbol ? [symbol] : this.settings.symbols;
@@ -275,7 +289,7 @@ export class ManualSignalService {
     this.nextScanAt = new Date(now.getTime() + this.settings.scanMs).toISOString();
     try {
       this.reconcileReady(now);
-      this.captureCandidates(now);
+      this.captureCandidates();
       this.lastError = null;
     } finally { this.busy = false; }
   }
@@ -324,11 +338,75 @@ export class ManualSignalService {
       }
     }
   }
+  firstCompleteOneMinuteCandle(snapshot, resolvesAt, now = new Date()) {
+    const target = timestamp(resolvesAt); const observed = timestamp(now);
+    if (target === null || observed === null) return null;
+    const envelope = snapshot?.candles?.["1m"];
+    const candidates = (envelope?.data ?? [])
+      .filter((candle) => candle?.closed === true && Number.isFinite(candle.openTime) && Number.isFinite(candle.close) && candle.close > 0)
+      .map((candle) => ({ candle, openAt: candle.openTime, closeAt: candle.openTime + 60_000 }))
+      .filter((item) => item.openAt <= target && target < item.closeAt && item.closeAt <= observed)
+      .sort((left, right) => left.closeAt - right.closeAt);
+    const selected = candidates[0];
+    if (!selected) return null;
+    return {
+      price: selected.candle.close,
+      openAt: new Date(selected.openAt).toISOString(),
+      closeAt: new Date(selected.closeAt).toISOString(),
+      source: {
+        classification: MARKET_CLASSIFICATION,
+        source: envelope?.source ?? null,
+        sourceName: envelope?.sourceName ?? null,
+        sourceUrl: envelope?.sourceUrl ?? null,
+        sourceTimestamp: envelope?.sourceTimestamp ?? null,
+        receivedAt: envelope?.receivedAt ?? null,
+        failover: envelope?.failover ?? null,
+        observedAt: new Date(observed).toISOString(),
+      },
+    };
+  }
   reconcileForecastObservations(now = new Date()) {
-    for (const observation of this.database.pendingForecastObservations(now.toISOString())) {
+    for (const observation of this.database.pendingForecastObservations(now.toISOString(), 2000)) {
       const resolvesAt = timestamp(observation.resolvesAt); if (resolvesAt === null) continue;
+      const snapshot = this.market.snapshot(observation.symbol);
+      if (observation.resolutionPolicy === "FIRST_COMPLETE_1M_CLOSE_AFTER_HORIZON") {
+        const resolution = this.firstCompleteOneMinuteCandle(snapshot, resolvesAt, now);
+        if (!resolution) {
+          const latestExpectedCloseAt = resolvesAt + 60_000;
+          const unavailableAfter = latestExpectedCloseAt + this.settings.maxResolutionLagMs;
+          if (now.getTime() > unavailableAfter) {
+            this.database.resolveForecastObservation(observation.id, {
+              outcome: "NO_COMPLETE_1M_OBSERVATION",
+              actualDirection: "UNAVAILABLE",
+              resolutionPrice: null,
+              resolutionSource: {
+                classification: MARKET_CLASSIFICATION,
+                settlementClassification: SETTLEMENT_CLASSIFICATION,
+                targetResolutionAt: observation.resolvesAt,
+                unavailableAfter: new Date(unavailableAfter).toISOString(),
+                observedAt: now.toISOString(),
+                reason: "The authoritative first complete 1m candle after the horizon was not available inside the bounded resolution window; this outcome is excluded from calibration.",
+              },
+              resolvedAt: now.toISOString(),
+            });
+          }
+          continue;
+        }
+        const actualDirection = resolution.price === observation.entryPrice ? "TIE" : resolution.price > observation.entryPrice ? "UP" : "DOWN";
+        const outcome = actualDirection === "TIE" ? "TIE" : observation.predictedDirection === "NEUTRAL" ? "UNSCORED_DIRECTION" : observation.predictedDirection === actualDirection ? "CORRECT" : "INCORRECT";
+        this.database.resolveForecastObservation(observation.id, {
+          outcome,
+          actualDirection,
+          resolutionPrice: resolution.price,
+          resolutionCandleOpenAt: resolution.openAt,
+          resolutionCandleCloseAt: resolution.closeAt,
+          resolutionSource: { ...resolution.source, targetResolutionAt: observation.resolvesAt, settlementClassification: SETTLEMENT_CLASSIFICATION },
+          resolvedAt: now.toISOString(),
+        });
+        continue;
+      }
       const latestAllowedAt = resolvesAt + this.settings.maxResolutionLagMs;
-      const snapshot = this.market.snapshot(observation.symbol); const market = snapshot?.market ?? {};
+      const market = snapshot?.market ?? {};
       const sourceTimestamp = timestamp(market.sourceTimestamp); const price = market.data?.lastPrice;
       const timely = market.status === "LIVE" && Number.isFinite(price) && price > 0 && sourceTimestamp !== null && sourceTimestamp >= resolvesAt && sourceTimestamp <= latestAllowedAt;
       if (timely) {
@@ -351,29 +429,53 @@ export class ManualSignalService {
     }
   }
   captureForecastObservation(candidate, snapshot, now) {
-    const generatedMs = timestamp(candidate?.timeframeCloseWatermarks?.["1m"]) ?? timestamp(snapshot?.analysis?.calculatedAt) ?? now.getTime();
+    const generatedMs = timestamp(now);
+    if (generatedMs === null) return;
+    const generatedAt = new Date(generatedMs).toISOString();
     const entryPrice = candidate?.referencePrice; const forecast = candidate?.forecast;
     if (!candidate?.decisionKey || !Number.isFinite(entryPrice) || entryPrice <= 0 || !Number.isFinite(forecast?.upPercent) || !Number.isFinite(forecast?.downPercent)) return;
+    const predictedDirection = ["UP", "DOWN"].includes(forecast.leader) ? forecast.leader : forecast.upPercent >= forecast.downPercent ? "UP" : "DOWN";
+    const calibration = this.calibrationService?.prepareForecast({ ...candidate, predictedDirection }, generatedAt) ?? null;
+    if (calibration) this.alertService?.calibration({ scope: "CALIBRATION", entity: `${candidate.symbol}.${candidate.horizonMinutes}M.${predictedDirection}`, symbol: candidate.symbol, channel: "CALIBRATION", previousState: "UNINITIALIZED", state: calibration.status ?? "UNAVAILABLE", observedAt: generatedAt, payload: { classification: "PAPER_RESEARCH_CALIBRATION_ALERT", liveExecutionAvailable: false, horizonMinutes: candidate.horizonMinutes, direction: predictedDirection, method: calibration.calibrationMethod, modelId: calibration.calibrationModelId, sampleSize: calibration.sampleSize, minSample: calibration.minSample } });
     const observationKey = `${candidate.decisionKey}:prospective-unselected`;
     const entryGate = this.market.evaluateEntry(candidate, now);
+    const rawProbabilityUp = calibration?.rawProbabilityUp ?? null;
     this.database.createForecastObservation({
       id: `forecast_${createHash("sha256").update(observationKey).digest("hex")}`,
       observationKey, strategyName: candidate.strategyName, strategyVersion: candidate.strategyVersion,
+      forecastModelName: calibration?.forecastModelName ?? candidate.forecastModelName ?? "TECHNICAL_DIRECTION_SCORE",
+      forecastModelVersion: calibration?.forecastModelVersion ?? candidate.forecastModelVersion ?? candidate.strategyVersion ?? "UNVERSIONED",
       symbol: candidate.symbol, horizonMinutes: candidate.horizonMinutes,
-      generatedAt: new Date(generatedMs).toISOString(), resolvesAt: new Date(generatedMs + candidate.horizonMinutes * 60_000).toISOString(),
-      entryPrice, predictedDirection: forecast.leader ?? (forecast.upPercent >= forecast.downPercent ? "UP" : "DOWN"),
+      generatedAt, resolvesAt: new Date(generatedMs + candidate.horizonMinutes * 60_000).toISOString(),
+      entryPrice, predictedDirection,
       upScore: forecast.upPercent, downScore: forecast.downPercent, qualityScore: candidate.qualityScore ?? 0,
+      volatilitySegment: calibration?.volatilitySegment ?? segmentLabel(candidate.volatilityRegime),
+      regimeSegment: calibration?.regimeSegment ?? segmentLabel(candidate.marketRegime),
+      calibrationMethod: calibration?.calibrationMethod ?? "RAW",
+      calibrationModelId: calibration?.calibrationModelId ?? null,
+      rawProbabilityUp,
+      calibratedProbabilityUp: calibration?.calibrationMethod && calibration.calibrationMethod !== "RAW" ? calibration.calibratedProbabilityUp : null,
+      resolutionPolicy: "FIRST_COMPLETE_1M_CLOSE_AFTER_HORIZON",
       readiness: entryGate.readiness ?? { ready: entryGate.allowed, checks: entryGate.checks }, regime: candidate.marketRegime ?? {},
-      features: { setupDirection: candidate.setupDirection, correction: candidate.correction, levelInteractions: candidate.levelInteractions, technicalFeatures: candidate.technicalFeatures },
-      source: { market: tickerProvenance(snapshot.market ?? {}, now.toISOString()), candles: snapshot.analysis?.sources ?? {} },
+      features: {
+        decisionAt: generatedAt,
+        featureCloseWatermarks: candidate.timeframeCloseWatermarks ?? null,
+        setupDirection: candidate.setupDirection,
+        correction: candidate.correction,
+        levelInteractions: candidate.levelInteractions,
+        technicalFeatures: candidate.technicalFeatures,
+        rawForecast: { upScore: forecast.upPercent, downScore: forecast.downPercent, classification: "UNCALIBRATED_TECHNICAL_DIRECTION_SCORE_NOT_PROBABILITY", probability: null },
+        calibration: calibration ? { status: calibration.status, classification: calibration.classification, sampleSize: calibration.sampleSize, minSample: calibration.minSample, probabilityUp: calibration.probabilityUp, trainedThrough: calibration.trainedThrough } : { status: "UNAVAILABLE", probabilityUp: null },
+      },
+      source: { market: tickerProvenance(snapshot.market ?? {}, now.toISOString()), candles: snapshot.analysis?.sources ?? {}, classification: "PAPER_RESEARCH_ONLY" },
     });
   }
-  captureCandidates(now = new Date()) {
+  captureCandidates() {
     for (const symbol of this.settings.symbols) {
       const snapshot = this.market.snapshot(symbol);
       const candidates = snapshot?.analysis?.candidates;
       if (!Array.isArray(candidates)) continue;
-      for (const candidate of candidates) this.captureCandidate(candidate, snapshot, now);
+      for (const candidate of candidates) this.captureCandidate(candidate, snapshot, new Date());
     }
   }
   captureCandidate(candidate, snapshot, now) {
@@ -391,6 +493,7 @@ export class ManualSignalService {
     const underperforming = this.settings.confidenceGateEnabled && confidence?.status === "UNDERPERFORMING";
     const entryGate = this.market.evaluateEntry(candidate, now);
     const ready = directional && finiteInvalidation && freshTicker && entryGate.allowed && !activeSignal && !underperforming;
+    this.alertService?.ready({ scope: "MANUAL_SIGNAL", entity: `${candidate.symbol}.${candidate.horizonMinutes}M`, symbol: candidate.symbol, channel: "MANUAL_SIGNAL", previousState: "UNINITIALIZED", state: ready ? "READY" : "WAIT", observedAt: now.toISOString(), payload: { classification: "PAPER_RESEARCH_READY_ALERT", liveExecutionAvailable: false, horizonMinutes: candidate.horizonMinutes, decisionKey: candidate.decisionKey, direction: candidate.direction, blockers: entryGate.checks?.filter((check) => check.status === "BLOCKED").map((check) => check.code) ?? [] } });
     const entryAt = ready ? now.toISOString() : null;
     const reasons = [...(candidate.reasons ?? [])];
     if (!snapshot.health?.dataUsable) reasons.push("Manual signal remains WAIT because snapshot health.dataUsable is false.");

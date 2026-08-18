@@ -1,10 +1,10 @@
-const state = { symbol: "BTCUSDT", timeframe: "1m", snapshot: null, account: null, autonomous: null, performance: null, manualSignals: null };
+const state = { symbol: "BTCUSDT", timeframe: "1m", snapshot: null, account: null, autonomous: null, performance: null, manualSignals: null, operations: null, alerts: [], calibration: null, replay: null, engines: {}, counterfactuals: [] };
 const $ = (id) => document.getElementById(id);
 const money = (value, digits = 2) => Number(value).toLocaleString("ro-RO", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 const pct = (value) => `${(Number(value) * 100).toFixed(2)}%`;
 const time = (value) => value ? new Date(value).toLocaleTimeString("ro-RO", { hour12: false }) : "—";
 const escape = (value) => String(value).replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
-const safeStatus = (value) => ["LIVE", "STALE", "DEGRADED", "ERROR", "OFFLINE", "UNAVAILABLE"].includes(value) ? value.toLowerCase() : "unavailable";
+const safeStatus = (value) => ({ LIVE: "live", SYNCED: "live", STALE: "stale", DEGRADED: "degraded", RECOVERING: "degraded", REST_FALLBACK: "degraded", STARTING: "degraded", ERROR: "error", OUT_OF_SYNC: "error", GAP: "error", OFFLINE: "offline", UNAVAILABLE: "unavailable", DISABLED: "unavailable" })[value] ?? "unavailable";
 const directionClass = (value) => value === "UP" ? "positive" : value === "DOWN" ? "negative" : "";
 const directionMeta = (value) => value === "UP"
   ? { label: "↑ UP", meaning: "Price is expected to finish ABOVE the recorded entry." }
@@ -244,7 +244,7 @@ function renderMarket() {
   $("verdict").className = `verdict ${verdict === "UP" ? "verdict-up" : verdict === "DOWN" ? "verdict-down" : "verdict-wait"}`;
   $("up-score").textContent = `${analysis?.upScore ?? 50}%`; $("down-score").textContent = `${analysis?.downScore ?? 50}%`;
   $("up-fill").style.width = `${analysis?.upScore ?? 0}%`; $("down-fill").style.width = `${analysis?.downScore ?? 0}%`;
-  $("estimate").textContent = analysis?.heuristicProbability == null ? "Unavailable" : pct(analysis.heuristicProbability);
+  $("estimate").textContent = analysis ? `${Math.max(analysis.upScore ?? 0, analysis.downScore ?? 0)}/100 · RAW NOT PROBABILITY` : "Unavailable";
   $("break-even").textContent = analysis ? pct(analysis.breakEvenProbability) : "—";
   $("confidence").textContent = analysis?.confidence ?? "—"; $("model").textContent = analysis?.modelVersion ?? "—";
   $("reasons").innerHTML = (analysis?.reasons ?? ["Waiting for verified candles."]).slice(0, 5).map((reason) => `<li>${escape(reason)}</li>`).join("");
@@ -260,7 +260,61 @@ function renderBook(book) {
   $("bids").innerHTML = rows((book?.bids ?? []).slice(0, 6), "bid");
 }
 
-function manualConfidenceFor(symbol, horizonMinutes, strategyVersion = "0.8.0") {
+function finiteText(value, digits = 2) { return Number.isFinite(value) ? Number(value).toFixed(digits) : "—"; }
+function renderDeepDashboard() {
+  const snapshot = state.snapshot;
+  if (!snapshot) return;
+  const operations = state.operations ?? snapshot.operations ?? { status: "UNAVAILABLE", totals: {}, channels: [] };
+  status($("operations-status"), operations.status ?? "UNAVAILABLE");
+  const totals = operations.totals ?? {};
+  $("operations-summary").innerHTML = [["LATENCY P95", `${finiteText(operations.latencyMs?.p95, 0)} ms`], ["GAPS / MISSING", `${totals.gaps ?? 0} / ${totals.missingMessages ?? 0}`], ["RECONNECT / FAILOVER", `${totals.reconnects ?? 0} / ${totals.failovers ?? 0}`], ["STALL / INVALID", `${totals.stalls ?? 0} / ${totals.invalidations ?? 0}`]].map(([label, value]) => `<div class="deep-stat"><small>${label}</small><b>${escape(value)}</b></div>`).join("");
+  $("operations-channels").innerHTML = (operations.channels ?? []).map((channel) => `<div class="deep-row"><strong>${escape(channel.symbol)} · ${escape(channel.channel)}</strong><b class="status-${safeStatus(channel.status)}">${escape(channel.status)}</b><span>lag p95 ${finiteText(channel.latencyMs?.p95, 0)} ms · age ${finiteText(channel.ageMs?.current, 0)} ms · gap ${channel.gaps ?? 0} · duplicate ${channel.duplicates ?? 0} · watermark stall ${channel.stalls ?? 0}</span></div>`).join("") || '<div class="empty-card">No operational samples yet.</div>';
+
+  const feed = snapshot.health?.feed ?? {};
+  status($("feed-status"), feed.status ?? "UNAVAILABLE");
+  $("feed-summary").innerHTML = (feed.channels ?? []).map((channel) => `<div class="deep-row"><strong>${escape(channel.channel)}</strong><b class="status-${safeStatus(channel.status)}">${escape(channel.status)}</b><span>lag ${finiteText(channel.lagMs, 0)} ms · seq ${escape(channel.lastSequence ?? "—")} · gap ${channel.gapCount ?? 0} · reconnect ${channel.reconnectCount ?? 0}</span></div>`).join("") || `<div class="empty-card">Stream ${escape(feed.status ?? "UNAVAILABLE")}.</div>`;
+  const book = snapshot.orderBook ?? {};
+  $("depth-summary").textContent = `${book.status ?? "UNAVAILABLE"} · synchronized ${book.synchronized === true ? "YES" : "NO"} · last update ${book.data?.lastUpdateId ?? "—"} · buffer ${book.bufferSize ?? 0} · ${book.reason ?? "No depth reason."}`;
+
+  const flow = snapshot.orderFlow ?? {};
+  status($("orderflow-status"), flow.status ?? "UNAVAILABLE");
+  $("orderflow-imbalance").innerHTML = [5, 10, 20].map((level) => { const item = flow.imbalance?.[level]; return `<div class="flow-stat"><small>IMBALANCE ${level} LEVELS</small><b>${finiteText(item?.quantityImbalance, 4)} qty</b><span>${finiteText(item?.notionalImbalance, 4)} notional</span></div>`; }).join("");
+  $("orderflow-windows").innerHTML = ["10s", "30s", "60s", "5m"].map((windowName) => { const volume = flow.aggressorVolume?.[windowName]; const cvd = flow.cvd?.[windowName]; return `<div class="flow-window"><strong>${windowName}</strong><span>BUY ${finiteText(volume?.buyNotional, 0)} / SELL ${finiteText(volume?.sellNotional, 0)}</span><span>CVD ${finiteText(cvd?.notional, 0)} · ${volume?.tradeCount ?? 0} trades</span></div>`; }).join("");
+  const heuristicRows = [
+    ["ABSORPTION", flow.absorption?.detected ? `${flow.absorption.side} · score ${finiteText(flow.absorption.score, 1)}` : `none · score ${finiteText(flow.absorption?.score, 1)}`, flow.absorption?.reason],
+    ["REPLENISHMENT", flow.replenishment?.dominantSide ?? "—", `bid ${finiteText(flow.replenishment?.bid?.notional, 0)} · ask ${finiteText(flow.replenishment?.ask?.notional, 0)}`],
+    ["DISAPPEARING", flow.disappearingLiquidity?.warning ? "WARNING" : "MONITOR", `bid unexplained ${finiteText(flow.disappearingLiquidity?.bid?.unexplainedRatio, 3)} · ask ${finiteText(flow.disappearingLiquidity?.ask?.unexplainedRatio, 3)}`],
+    ["SPREAD / MICROPRICE", `${finiteText(flow.spreadInstability?.score, 1)} raw`, `micro ${finiteText(flow.microprice?.microprice, 4)} · deviation ${finiteText(flow.microprice?.deviationBps, 3)} bps`],
+    ["SPOOF-RISK HEURISTIC", `${flow.spoofRisk?.level ?? "—"} · ${finiteText(flow.spoofRisk?.score, 1)}/100`, "HEURISTIC ONLY · NOT PROBABILITY"],
+  ];
+  $("orderflow-heuristics").innerHTML = heuristicRows.map(([label, value, detail]) => `<div class="deep-row"><strong>${escape(label)}</strong><b>${escape(value)}</b><span>${escape(detail ?? "Unavailable")}</span></div>`).join("");
+
+  const candidates = snapshot.analysis?.candidates ?? [];
+  const counterfactualByHorizon = new Map((state.counterfactuals ?? snapshot.counterfactuals ?? []).map((item) => [item.horizonMinutes, item]));
+  $("engine-cards").innerHTML = candidates.map((candidate) => {
+    const engine = candidate.engine ?? state.engines?.[candidate.horizonMinutes];
+    const regime = candidate.extendedRegime ?? candidate.marketRegime?.extended;
+    const blockers = candidate.engineBlockers ?? engine?.blockers ?? [];
+    const readiness = counterfactualByHorizon.get(candidate.horizonMinutes) ?? {};
+    const technical = engine?.technical ?? {};
+    return `<article class="engine-card"><header><strong>${candidate.horizonMinutes}m · ${escape(engine?.version ?? "ENGINE UNAVAILABLE")}</strong><span class="${directionClass(candidate.direction)}">${escape(directionMeta(candidate.direction).label)}</span></header><dl><dt>Extended regime</dt><dd>${escape(regime?.regime ?? "UNAVAILABLE")}${regime?.failClosed ? " · FAIL CLOSED" : ""}</dd><dt>Raw technical split</dt><dd>${finiteText(technical.upPercent ?? candidate.forecast?.upPercent, 0)} UP / ${finiteText(technical.downPercent ?? candidate.forecast?.downPercent, 0)} DOWN</dd><dt>Raw signed score</dt><dd>${finiteText(engine?.signedScore ?? technical.signedScore, 4)}</dd><dt>READY</dt><dd>${readiness.ready ? "YES" : `NO · ${readiness.blockedCount ?? blockers.length} blockers`}</dd></dl><div class="engine-score-note">RAW SCORES · NOT PROBABILITY</div><ul class="blocker-list">${blockers.map((item) => `<li><b>${escape(item.code)}</b> · ${escape(item.reason)}</li>`).join("") || "<li>No canonical engine blocker.</li>"}</ul><div class="counterfactual-list">${(readiness.requirements ?? readiness.counterfactuals ?? []).map((item) => `<div class="counterfactual"><b>${escape(item.code)}</b> · ${escape(item.reason ?? "Blocked")}${item.operator ? ` · exact ${escape(item.operator)} ${escape(item.threshold)} (delta ${escape(item.delta)})` : item.nextCloseAt ? ` · next completed observation ${time(item.nextCloseAt)}` : " · path-dependent, no invented threshold"}</div>`).join("") || '<div class="counterfactual">No missing READY requirement.</div>'}</div></article>`;
+  }).join("") || '<div class="empty-card">Canonical 10m/30m engines await coherent completed candles and LIVE order flow.</div>';
+}
+
+function renderCalibrationAndReplay() {
+  const calibration = state.calibration ?? state.snapshot?.calibration ?? {};
+  const modelStates = calibration.status ?? [];
+  const metrics = calibration.metrics ?? [];
+  const curves = modelStates.filter((item) => item.status === "READY" && item.reliabilityCurve?.length).map((item) => ({ label: `${item.symbol} ${item.horizonMinutes}m ${item.direction} · ${item.selectedMethod}`, points: item.reliabilityCurve }))
+    .concat(metrics.filter((item) => item.calibrationMethod !== "RAW" && item.reliability?.length).slice(0, 4).map((item) => ({ label: `${item.symbol} ${item.horizonMinutes}m ${item.direction} · ${item.calibrationMethod}`, points: item.reliability })));
+  $("calibration-reliability").innerHTML = curves.slice(0, 4).map((curve) => `<div class="reliability-card"><header><strong>${escape(curve.label)}</strong><span>observed frequency by bin</span></header><div class="reliability-bars">${curve.points.map((point) => { const rawValue = point.observedFrequency ?? point.observedRate ?? point.accuracy; const value = Number(rawValue); const available = rawValue !== null && rawValue !== undefined && Number.isFinite(value) && (point.count ?? 1) > 0; return `<i class="reliability-bar${available ? "" : " reliability-unavailable"}" style="height:${available ? Math.max(2, Math.min(100, value * 100)) : 2}%"><span>${available ? Math.round(value * 100) : "—"}</span></i>`; }).join("")}</div></div>`).join("") || '<div class="empty-card">WARMUP: no reliability curve until a model is READY.</div>';
+  const replay = state.replay ?? state.snapshot?.replay ?? {};
+  $("replay-baselines").innerHTML = (replay.baselines ?? []).map((name) => `<span>${escape(name)}</span>`).join("") || "<span>No baselines configured</span>";
+  $("replay-runs").innerHTML = (replay.runs ?? []).map((run) => `<div class="deep-row"><strong>${escape(run.id)} · ${escape(run.status)}</strong><b>${escape((run.symbols ?? []).join(", ") || "ALL")}</b><span>${time(run.createdAt)} · seed ${escape(run.seed)} · ${run.metrics?.predictions ?? 0} predictions · ${run.metrics?.resolved ?? 0} resolved</span></div>`).join("") || '<div class="empty-card">No persisted replay runs. Use npm run replay for deterministic offline research.</div>';
+  $("operational-alerts").innerHTML = (state.alerts ?? state.snapshot?.alerts ?? []).slice(0, 30).map((alert) => `<div class="deep-row"><strong class="alert-severity-${String(alert.severity ?? "INFO").toLowerCase()}">${escape(alert.alertType)} · ${escape(alert.status)}</strong><b>${escape(alert.symbol)} / ${escape(alert.channel)}</b><span>${time(alert.lastSeenAt)} · ${escape(alert.payload?.state ?? alert.fingerprint)} · occurrences ${alert.occurrenceCount ?? 1}</span></div>`).join("") || '<div class="empty-card">No research alerts recorded.</div>';
+}
+
+function manualConfidenceFor(symbol, horizonMinutes, strategyVersion = "0.9.0") {
   return state.manualSignals?.empiricalConfidence?.find((item) => item.symbol === symbol && item.horizonMinutes === horizonMinutes && item.strategyVersion === strategyVersion) ?? null;
 }
 
@@ -487,7 +541,8 @@ async function refresh() {
     const dashboard = await request(`/api/v1/dashboard?symbol=${encodeURIComponent(requestedSymbol)}`);
     if (generation !== refreshGeneration || requestedSymbol !== state.symbol) return;
     state.snapshot = dashboard.snapshot; state.account = dashboard.account; state.autonomous = dashboard.autonomous; state.performance = dashboard.performance; state.manualSignals = dashboard.manualSignals;
-    renderMarket(); renderAccount(); renderAutonomous(); renderManualSignals(); $("connection-error").classList.add("hidden");
+    state.operations = dashboard.operations ?? dashboard.snapshot.operations; state.alerts = dashboard.alerts ?? dashboard.snapshot.alerts ?? []; state.calibration = dashboard.calibration ?? dashboard.snapshot.calibration; state.replay = dashboard.replay ?? dashboard.snapshot.replay; state.engines = dashboard.engines ?? dashboard.snapshot.engines ?? {}; state.counterfactuals = dashboard.counterfactuals ?? dashboard.snapshot.counterfactuals ?? [];
+    renderMarket(); renderAccount(); renderAutonomous(); renderManualSignals(); renderDeepDashboard(); renderCalibrationAndReplay(); $("connection-error").classList.add("hidden");
   } catch (error) {
     if (generation !== refreshGeneration || requestedSymbol !== state.symbol) return;
     $("connection-error").classList.remove("hidden"); $("connection-error").querySelector("span").textContent = error.message; status($("health"), "OFFLINE");
@@ -538,7 +593,7 @@ document.querySelectorAll("[data-symbol]").forEach((button) => button.addEventLi
   if (state.symbol === nextSymbol && state.snapshot && state.manualSignals) return;
   state.symbol = nextSymbol;
   document.querySelectorAll("[data-symbol]").forEach((item) => item.classList.toggle("active", item === button));
-  state.snapshot = null; state.manualSignals = null; refresh();
+  state.snapshot = null; state.manualSignals = null; state.operations = null; state.alerts = []; state.calibration = null; state.replay = null; state.engines = {}; state.counterfactuals = []; refresh();
 }));
 document.querySelectorAll("[data-timeframe]").forEach((button) => button.addEventListener("click", () => {
   state.timeframe = button.dataset.timeframe;
@@ -658,9 +713,9 @@ function renderManualSignals() {
     return `<article class="event-round-card event-round-${round.state.toLowerCase()}">
       <div class="event-round-head"><div><small>ORIZONT ANALIZAT</small><strong>${escape(round.symbol)} · ${round.horizonMinutes} MINUTE</strong></div><div class="event-countdown"><small>${round.state === "ENTER_NOW" ? "SETUPUL EXPIRĂ" : round.state === "TRACKING" ? "REZULTAT PROXY" : "TRIGGER VALID"}</small><b>${countdownTarget ? remaining(countdownTarget) : "—"}</b></div></div>
       <div class="terminal-forecast">
-        <div class="forecast-side forecast-up"><small>ESTIMARE TEHNICĂ UP</small><b>↑ ${forecastAvailable ? `${forecast.upPercent}%` : "—"}</b></div>
-        <div class="forecast-center"><div class="forecast-track"><i class="forecast-up-fill" style="width:${forecastAvailable ? forecast.upPercent : 0}%"></i><i class="forecast-down-fill" style="width:${forecastAvailable ? forecast.downPercent : 0}%"></i></div><strong>${escape(forecastAvailable ? (forecast.leader === "NEUTRAL" ? "ECHILIBRU" : `${directionMeta(forecast.leader).label} DOMINANT`) : "DATE INSUFICIENTE")}</strong><span>${escape(forecastAvailable ? `${forecast.confidence} · scor tehnic necalibrat, nu rată garantată` : "Procentele apar numai după minimum 50 de lumânări închise pe toate intervalele")}</span></div>
-        <div class="forecast-side forecast-down"><small>ESTIMARE TEHNICĂ DOWN</small><b>${forecastAvailable ? `${forecast.downPercent}%` : "—"} ↓</b></div>
+        <div class="forecast-side forecast-up"><small>SCOR BRUT UP · NOT PROBABILITY</small><b>↑ ${forecastAvailable ? `${forecast.upPercent}%` : "—"}</b></div>
+        <div class="forecast-center"><div class="forecast-track"><i class="forecast-up-fill" style="width:${forecastAvailable ? forecast.upPercent : 0}%"></i><i class="forecast-down-fill" style="width:${forecastAvailable ? forecast.downPercent : 0}%"></i></div><strong>${escape(forecastAvailable ? (forecast.leader === "NEUTRAL" ? "ECHILIBRU" : `${directionMeta(forecast.leader).label} DOMINANT`) : "DATE INSUFICIENTE")}</strong><span>${escape(forecastAvailable ? `${forecast.confidence} · RAW TECHNICAL SCORE · NOT PROBABILITY` : "Procentele apar numai după minimum 50 de lumânări închise pe toate intervalele")}</span></div>
+        <div class="forecast-side forecast-down"><small>SCOR BRUT DOWN · NOT PROBABILITY</small><b>${forecastAvailable ? `${forecast.downPercent}%` : "—"} ↓</b></div>
       </div>
       <div class="terminal-decision-grid">
         <div class="terminal-bias ${directionClass(trendDirection)}"><small>TREND STABILIT PE 5m</small><b>${escape(bias.label)}</b><span>${escape(outlookLabel(fiveTrend.outlook))} · acord ${fiveTrend.confidencePercent ?? 0}%</span></div>
@@ -683,7 +738,15 @@ function renderManualSignals() {
   };
   $("manual-signal-cards").innerHTML = terminal?.rounds?.length ? terminal.rounds.map(roundMarkup).join("") : '<div class="empty-card">Terminalul așteaptă date coerente pentru simbolul selectat.</div>';
 
-  $("manual-confidence").innerHTML = (manual.forecastCalibration ?? []).map((item) => `<div class="confidence-row"><strong>${escape(item.symbol)} · ${item.horizonMinutes}m</strong><span class="segment-${segmentClass(item.status)}">${escape(item.status)}</span><b>${item.measuredAccuracy == null ? "ACCURACY WARMUP" : pct(item.measuredAccuracy)}</b><small>${item.directionalSample ?? item.decisiveSample}/${item.minSample} apeluri direcționale · ${item.brierSample ?? item.decisiveSample}/${item.minSample} rezultate pentru Brier ${item.brierScore == null ? "—" : item.brierScore.toFixed(4)} · READY + WAIT · proxy Spot</small></div>`).join("") || '<div class="empty-card">Calibrarea rămâne WARMUP până la eșantionul minim prospectiv.</div>';
+  const calibrationItems = state.calibration?.status?.length ? state.calibration.status : (manual.forecastCalibration ?? []);
+  $("manual-confidence").innerHTML = calibrationItems.map((item) => {
+    const selectedMetrics = item.selectedMethod ? item.metrics?.[item.selectedMethod] : null;
+    const brier = selectedMetrics?.brierScore ?? item.brierScore;
+    const logloss = selectedMetrics?.logLoss ?? item.logLoss;
+    const ece = selectedMetrics?.expectedCalibrationError ?? item.expectedCalibrationError;
+    const model = item.status === "READY" ? `${item.selectedMethod ?? item.calibrationMethod ?? "MODEL"} · ${item.models?.[item.selectedMethod]?.id ?? item.calibrationModelId ?? "active"}` : "NO MODEL · RAW SCORES ONLY";
+    return `<div class="confidence-row"><strong>${escape(item.symbol)} · ${item.horizonMinutes}m${item.direction ? ` · ${escape(item.direction)}` : ""}</strong><span class="segment-${segmentClass(item.status)}">${escape(item.status)}</span><b>${escape(model)}</b><small>sample ${item.sampleSize ?? item.directionalSample ?? item.decisiveSample ?? 0}/${item.minSample ?? item.minSampleSize ?? manual.policy?.forecastCalibrationMinSample ?? 50} · Brier ${finiteText(brier, 4)} · log loss ${finiteText(logloss, 4)} · ECE ${finiteText(ece, 4)} · Spot proxy research only</small></div>`;
+  }).join("") || '<div class="empty-card">Calibrarea rămâne WARMUP până la eșantionul minim prospectiv.</div>';
   $("manual-history").innerHTML = (manual.recent ?? []).slice(0, 12).map((signal) => `<div class="manual-history-row"><span>${time(signal.generatedAt)}</span><strong>${escape(signal.symbol)} · ${signal.horizonMinutes}m</strong><b class="${directionClass(signal.direction)}">${escape(directionMeta(signal.direction).label)}</b><span>${escape(localManualActionState(signal))}</span><span>${signal.qualityScore}/100</span><small>${escape(signal.proxyOutcome ?? signal.reasons?.at(-1) ?? "Înregistrat")}</small></div>`).join("") || '<div class="empty-card">Nu există încă istoric.</div>';
   notifyNewManualSignal(manual.ready ?? []);
   if (manualDeadlineTimer) clearTimeout(manualDeadlineTimer);

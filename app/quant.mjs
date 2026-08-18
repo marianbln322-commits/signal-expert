@@ -1,3 +1,6 @@
+import { evaluate10m } from "./engine-10m.mjs";
+import { evaluate30m } from "./engine-30m.mjs";
+
 const last = (values) => values.at(-1);
 const finite = (values) => values.filter(Number.isFinite);
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
@@ -5,7 +8,7 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 export const QUALITY_THRESHOLDS = Object.freeze({ standard: 68, high: 78, exceptional: 88 });
 export const STAKE_PROFILES = Object.freeze({ FLAT: "FLAT", ADAPTIVE_CAPPED: "ADAPTIVE_CAPPED", OBSERVED_10_30_90_270: "OBSERVED_10_30_90_270" });
 const AUTONOMOUS_STRATEGY = "completed-candle-mtf-entry-gates";
-export const AUTONOMOUS_STRATEGY_VERSION = "0.8.0";
+export const AUTONOMOUS_STRATEGY_VERSION = "0.9.0";
 const analysisTimeframes = ["1m", "5m", "15m", "1h"];
 
 export function sma(values, period) {
@@ -394,7 +397,7 @@ export function detectMarketRegime(completed, analyses, structureFeatures) {
   };
 }
 
-export function generateSignals(candles, options = {}) {
+function generateLegacySignals(candles, options = {}) {
   const thresholds = { ...QUALITY_THRESHOLDS, ...(options.thresholds ?? {}) };
   const symbol = options.symbol ?? "UNKNOWN";
   const completed = Object.fromEntries(analysisTimeframes.map((timeframe) => [timeframe, (candles[timeframe] ?? []).filter((candle) => candle.closed === true)]));
@@ -606,6 +609,62 @@ export function generateSignals(candles, options = {}) {
   });
 }
 
+export function generateSignals(candles, options = {}) {
+  const completed = Object.fromEntries(analysisTimeframes.map((timeframe) => [timeframe, (candles[timeframe] ?? []).filter((candle) => candle.closed === true)]));
+  const legacyCandidates = generateLegacySignals(completed, options);
+  if (options.deepEnabled === false) return legacyCandidates;
+  const analyses = Object.fromEntries(analysisTimeframes.map((timeframe) => [timeframe, timeframeAnalysis(timeframe, completed[timeframe])]));
+  return legacyCandidates.map((candidate) => {
+    const context = {
+      ...candidate,
+      completed,
+      analyses,
+      orderFlow: options.orderFlow ?? null,
+      orderBookMetrics: options.orderBookMetrics ?? null,
+      regimeThresholds: options.regimeThresholds,
+    };
+    const engine = candidate.horizonMinutes === 10 ? evaluate10m(context) : evaluate30m(context);
+    const extendedRegime = engine.regimeDetails;
+    const conflict = ["UP", "DOWN"].includes(engine.direction) && engine.direction !== candidate.setupDirection;
+    const engineBlockers = [
+      ...engine.blockers,
+      ...(conflict ? [{ code: "ENGINE_STRUCTURE_CONFLICT", reason: `Canonical ${candidate.horizonMinutes}m engine direction ${engine.direction} conflicts with the structural setup ${candidate.setupDirection}.`, evidence: { engineDirection: engine.direction, setupDirection: candidate.setupDirection } }] : []),
+    ];
+    const engineDirectional = ["UP", "DOWN"].includes(engine.direction) && engineBlockers.length === 0;
+    const qualified = candidate.qualified === true && engineDirectional && !conflict;
+    const direction = qualified ? engine.direction : "WAIT";
+    const forecast = {
+      ...candidate.forecast,
+      upPercent: engine.technical.upPercent,
+      downPercent: engine.technical.downPercent,
+      leader: engine.technical.upPercent === engine.technical.downPercent ? "NEUTRAL" : engine.technical.upPercent > engine.technical.downPercent ? "UP" : "DOWN",
+      edgePercent: Math.abs(engine.technical.upPercent - engine.technical.downPercent),
+      confidence: Math.abs(engine.technical.upPercent - engine.technical.downPercent) >= 30 ? "HIGH" : Math.abs(engine.technical.upPercent - engine.technical.downPercent) >= 16 ? "MEDIUM" : "LOW",
+      available: engineBlockers.length === 0,
+      classification: engine.technical.classification,
+      engineVersion: engine.version,
+    };
+    const canonicalReason = engineBlockers.length
+      ? `Canonical ${candidate.horizonMinutes}m engine fails closed: ${engineBlockers.map((blocker) => blocker.code).join(", ")}.`
+      : `Canonical ${candidate.horizonMinutes}m engine verdict is ${engine.direction} in ${extendedRegime.regime}.`;
+    return {
+      ...candidate,
+      direction,
+      actionableDirection: qualified ? engine.direction : null,
+      qualified,
+      forecast,
+      extendedRegime,
+      engine: { ...engine, blockers: engineBlockers },
+      engineBlockers,
+      canonicalVerdict: { direction, rawDirection: engine.direction, qualified, horizonMinutes: candidate.horizonMinutes, engineVersion: engine.version, regime: extendedRegime.regime, failClosed: engineBlockers.length > 0 },
+      volatilityRegime: extendedRegime.regime,
+      marketRegime: { ...candidate.marketRegime, extended: extendedRegime, canonical: extendedRegime.regime },
+      technicalFeatures: { ...candidate.technicalFeatures, orderFlow: options.orderFlow ?? null, extendedRegime, engine: { version: engine.version, components: engine.components } },
+      reasons: [...candidate.reasons, canonicalReason],
+    };
+  });
+}
+
 export const autonomousCandidates = generateSignals;
 
 export function analyzeMarket(candles, payoutRate, now = new Date(), options = {}) {
@@ -641,7 +700,7 @@ export function analyzeMarket(candles, payoutRate, now = new Date(), options = {
   if (indicators.support !== null) invalidation.push(`Bullish scenario invalid below 1m support ${indicators.support.toFixed(2)}.`);
   if (indicators.resistance !== null) invalidation.push(`Bearish scenario invalid above 1m resistance ${indicators.resistance.toFixed(2)}.`);
   const candidates = generateSignals(completedCandles, options);
-  return { direction, upScore, downScore, technicalUpProbability, technicalDownProbability, confidence: Math.abs(difference) >= 30 ? "HIGH" : Math.abs(difference) >= 15 ? "MEDIUM" : "LOW", calibrationStatus: "UNCALIBRATED", breakEvenProbability: breakEven, heuristicProbability, reasons, invalidation, timeframes, candidates, classification: "MODEL_ESTIMATE", modelVersion: "rules-v0.8.0", calculatedAt: now.toISOString() };
+  return { direction, upScore, downScore, technicalUpProbability, technicalDownProbability, confidence: Math.abs(difference) >= 30 ? "HIGH" : Math.abs(difference) >= 15 ? "MEDIUM" : "LOW", calibrationStatus: "UNCALIBRATED", breakEvenProbability: breakEven, heuristicProbability, reasons, invalidation, timeframes, candidates, classification: "MODEL_ESTIMATE", modelVersion: "rules-deep-v0.9.0", calculatedAt: now.toISOString() };
 }
 export function adaptiveStake(input) {
   const reasons = []; const breakEven = breakEvenProbability(input.payoutRate);

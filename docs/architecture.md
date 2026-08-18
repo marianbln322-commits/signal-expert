@@ -1,107 +1,135 @@
-# Architecture decision record
+# Signal Expert Deep v0.9.0 architecture
 
-## MVP boundary
+## Boundary and invariants
 
-Read-only MEXC Spot analytics, durable manual 10m/30m research signals, and explicitly labeled PAPER shadow contracts for BTCUSDT and ETHUSDT. The decision engine uses completed candles only on 1m, 5m, 15m and 1h. A manual operator may act during the signal's strict entry window, but no exchange-order endpoint exists. Live Event Futures feed, execution, and settlement remain unavailable until official contracts and semantics are verified.
+Signal Expert is a local, read-only market analytics and PAPER research system for BTCUSDT and ETHUSDT. It has no exchange credentials, custody, withdrawal, or live-order path. MEXC Event Futures contract, payout, execution, and settlement interfaces are not verified; Spot observations are therefore labeled as proxies and never represented as Event Futures truth.
 
-## Data flow
+Core invariants:
+
+- decisions consume completed candles only;
+- provider attribution is explicit and incompatible providers are never merged into actionable evidence;
+- incremental depth/order flow is available only from a synchronized Binance stream;
+- missing, stale, gapped, low-liquidity, or abnormal-volatility inputs fail closed;
+- forecast calibration uses resolved prospective observations only;
+- replay is ordered by receipt time and sequence and cannot see future or incomplete observations;
+- 10m and 30m engines are separate implementations;
+- every executable action is local PAPER simulation.
+
+## Isolated Windows/runtime topology
+
+The Deep runtime is pinned to `127.0.0.1:4020` by `START-SIGNAL-EXPERT-4020.cmd`:
 
 ```text
-Binance Spot REST market data (primary)
-  -> explicit MEXC Spot REST v3 bundle fallback only when primary fails
-  -> active source + primary error displayed
-  -> timeout, retry, runtime schema checks
-  -> separate transport freshness and timeframe-aware latest-completed-close freshness
-  -> in-memory market cache and freshness state
-  -> deterministic quantitative + completed-candle structure engine
-  -> completed 1m trigger + explicitly aligned completed 5m confirmation + completed 15m trend
-  -> one-provider coherence across candle, ticker and order-book inputs before action
-  -> EMA20/50, FVG/IFVG, sweep, CHoCH/MSS and finite invalidation audit
-  -> completed-candle 10m/30m setup ranking
-  -> one shared auditable entry policy:
-       fresh ticker/candles + trigger deadline
-       -> one provider across 1m/5m/15m/1h candles, ticker and order book
-       -> validated Spot spread + cumulative 10-level near-book liquidity
-       -> ticker/book provider and timestamp coherence
-       -> macro PASS / BLOCKED, or SKIPPED when disabled (not filtered)
-  -> research-window setup state + immutable Spot-proxy provenance
-  -> selected-symbol 10m/30m cards assembled atomically from one candidate key
-  -> prospective symbol+horizon confidence hidden until minimum sample
-  -> Wilson safeguard against configured-payout break-even
-  -> bankroll-aware autonomous PAPER shadow state machine
-  -> immediate shared-policy recheck before every local PAPER open
-  -> SQLite signal/decision/state/position and entry-gate audit trail
-  -> dependency-free Node HTTP API
-  -> static responsive dashboard
-
-Manual signal scan -> unique four-timeframe candidate key
-  -> require fresh completed 1m trigger aligned with completed 5m structure and completed 15m trend
-  -> require quality + horizon-specific support/resistance + finite completed-close invalidation + fresh usable attributed Spot ticker/candles
-  -> require one provider across candles/ticker/book plus validated Spot spread/near-book liquidity and timestamp coherence
-  -> require macro CLEAR when enabled; disabled records SKIPPED, not filtered
-  -> READY and ENTER_NOW for configured short entry window
-  -> TRACKING_DO_NOT_ENTER_LATE until target horizon
-  -> first timely post-horizon Spot-proxy observation
-  -> PROXY_CORRECT / PROXY_INCORRECT / PROXY_TIE / NO_TIMELY_OBSERVATION
-  -> confidence unavailable below minimum decisive sample
-  -> Wilson VALIDATED / MONITOR / UNDERPERFORMING gate
-
-Autonomous PAPER scan -> same unique completed-candle candidate key
-  -> same shared 1m/5m/freshness/spread/liquidity/source/macro entry policy
-  -> quality/alignment/structure/volatility/invalidation gate
-  -> BTC/ETH × 10m/30m sample-aware segment safeguard
-  -> exact hard-capped stake plan
-  -> immediate shared-policy recheck (TOCTOU protection)
-  -> at most one local PAPER position -> wait for Spot-proxy settlement
-  -> WON reset / LOST capped recovery stage / REFUNDED retain stage
-
-Manual PAPER request -> input/cap checks -> find matching current candidate
-  -> immediate shared-policy recheck; no bypass for stale or newly blocked entries
-  -> immutable entry timestamp + migration-007 gate evidence
-  -> SQLite local PAPER ledger -> first fresh Spot ticker after resolution
-  -> WON / LOST / REFUNDED and realized simulated P&L
-  -> no live Event Futures order adapter or exchange request
+instance: phase2
+strict port: 4020
+database: data/instances/phase2/signal-expert.db
+lock/state: data/instances/phase2/
+stream: enabled
 ```
 
-## Classifications
+Strict-port mode fails if 4020 is occupied. It does not discover, reuse, stop, or mutate the older Windows instance on 4101. Runtime and persistence paths are independent.
 
-- `RAW`: validated provider value.
-- `CALCULATED`: deterministic transformation or configured paper assumption.
-- `MODEL_ESTIMATE`: deterministic rules output with calibration status; setup quality is not probability.
-- `SPOT_PROXY`: an attributed underlying-market entry observation, not an Event Futures contract value.
-- `SPOT_PROXY_PROSPECTIVE_OUTCOMES_NOT_EVENT_FUTURES_CALIBRATION`: measured manual-signal shadow outcomes shown only after the minimum decisive sample.
-- `NOT_EVENT_FUTURES_SETTLEMENT`: explicit classification for proxy resolution observations.
-- `UNAVAILABLE`: no verified source, insufficient sample, or no data.
+## Live data flow
 
-## Strategy and entry policy v0.8
+```text
+Official Binance Spot REST
+  -> ticker + completed-candle bootstrap/reconciliation
+  -> authoritative depth snapshot
 
-Rules are used because no historical Event Futures labels exist. Strategy v0.8 combines an eight-candle completed 1m flow with an objective completed 1m trigger, established 5m structure and trend outlook, and completed 15m/1h context. The 1m flow measures ATR-normalized displacement, body and wick pressure, directional move balance, and acceleration/deceleration; the 5m outlook separates continuation, reversal watch, and range/transition. The engine additionally builds objective structure on completed 5m/15m/1h candles: two-sided confirmed pivots, three-candle FVGs and later retests, completed-close FVG inversion, confirmed-level liquidity sweeps, completed-close CHoCH/MSS, and EMA20/50 trend/dynamic context. Each horizon receives nearest support/resistance with source and distance plus a finite structural invalidation that requires a completed 5m close for 10m setups or a completed 15m close for 30m setups. Completed 1m pullbacks against the established 5m trend are classified by depth, duration, direction and interaction with support/resistance; a confirmed local 1m level break blocks entry but is not mislabeled as higher-timeframe trend invalidation.
+Official Binance combined WebSocket
+  -> aggTrade (including maker flag m)
+  -> depth@100ms incremental updates
+  -> book ticker and kline events
 
-The shared entry-policy v0.8 is applied when a manual signal is created, during autonomous selection, and again immediately before a manual or autonomous PAPER position is persisted. Its immutable checks cover direction, quality, invalidation, completed 1m trigger, completed 5m confirmation, completed 15m alignment, trigger deadline, market freshness, validated Spot order book, configured spread, cumulative 10-level near-book notional, one provider across all candle/ticker/book inputs, receipt-time coherence, and macro/news state. MEXC and Binance failover occurs atomically within the ticker/depth bundle and within the four-timeframe candle bundle; if independently refreshed bundles disagree on provider, analysis may remain visible but entry fails closed. An enabled but stale, unavailable, or blacked-out macro source blocks. A disabled macro source is `SKIPPED` and means not filtered; it is never represented as `CLEAR` or `PASS`. Manual READY responses also carry a current non-mutating gate overlay, and both manual WAIT and autonomous BLOCKED decisions are reevaluated while the same trigger is still current so transient market gates are not frozen at their first observation.
+Depth synchronizer
+  -> buffer events while snapshot is requested
+  -> discard updates at/before snapshot lastUpdateId
+  -> require bridging update
+  -> apply contiguous updates
+  -> detect duplicate/out-of-order/gap
+  -> gap => invalidate + resynchronize
 
-The 10m evaluator emphasizes the completed 1m trigger and aligned 5m/15m context. The 30m evaluator emphasizes aligned 1h/15m structure with 5m confirmation. Forming candles are discarded at both service and model boundaries, swing points are not usable until their right-side confirmation candles close, and a deterministic key containing all four close timestamps prevents duplicate decisions.
+Attributed market state
+  -> transport/timeframe freshness
+  -> source and receipt-time coherence
+  -> bounded order-flow windows
+  -> persistent structure episodes
+  -> normalized multi-timeframe features
+  -> eight-regime classifier
+  -> independent 10m engine / independent 30m engine
+  -> shared fail-closed entry policy
+  -> prospective forecast + candidate audit
+  -> manual research view / autonomous PAPER scheduler
+  -> first complete post-horizon 1m close
+  -> outcome audit + eligible calibration sample
+  -> SQLite + local HTTP API + dashboard
+```
 
-The internal directional evidence becomes a complementary UP/DOWN split that always totals 100%; values such as 78/44 are never displayed as probabilities. Autonomous `STANDARD`, `HIGH`, and `EXCEPTIONAL` values are setup-quality tiers, not calibrated success probabilities. `WAIT` is the default whenever history, alignment, freshness, quality, or volatility gates fail. Measured win rate and ROI are derived only from settled paper positions and retain sample size.
+MEXC Spot can replace a failed compatible REST bundle only as an atomically attributed fallback. Binance incremental depth/order-flow state is not combined with MEXC REST state. In fallback, order flow is `UNAVAILABLE / REST_FALLBACK`, and gates that require it remain closed.
 
-The default 500 USDT `ADAPTIVE_CAPPED` simulation uses a 0.5% equity base, 1×/1.5×/2× quality multipliers, a 2% per-position equity cap, 25 USDT absolute cap, and at most one calculated recovery. `FLAT` and exact `OBSERVED_10_30_90_270` profiles are available for comparison, but all profiles obey cash, exposure, daily, and stake caps. Unaffordable exact stages are blocked, never clamped. A loss can advance a stake stage but can never create a setup.
+## Depth and order flow
 
-SQLite migration 004 adds durable decision/state metadata and a partial unique index that permits at most one open autonomous position. Migration 005 adds structured decision details and explicit invalidation persistence. Migration 006 adds durable manual signal lifecycle, entry deadline, immutable ticker/candle provenance, fixed non-settlement classifications, proxy outcomes, and one unresolved READY signal per symbol+horizon. Migration 007 stores the exact shared-policy version, evaluation timestamp, checks, order-book evidence, and macro/news evidence used immediately before a PAPER position is persisted; upgraded pre-v0.5 rows receive the explicit `NOT_EVALUATED_PRE_V0_5` classification rather than an ambiguous empty object. Manual confidence is grouped prospectively by strategy version, symbol, and horizon. Its percentage and Wilson bounds remain null before the configured minimum. Afterward the same conservative bound logic marks VALIDATED/MONITOR/UNDERPERFORMING; the enabled confidence gate holds only an UNDERPERFORMING segment at WAIT. The scheduler is busy-locked, persists `WAIT`/`BLOCKED`/`OPEN`, waits for settlement before scanning for another entry, and reconciles state on restart. Official Binance Spot is the selected primary underlying-market proxy; official MEXC Spot is used only as an explicitly attributed atomic bundle fallback. Neither source is asserted to be the Event Futures settlement index.
+`OrderBookService` follows Binance snapshot/incremental synchronization semantics. Its state includes update IDs, buffer bounds, duplicate/out-of-order/gap diagnostics, resync counts, freshness, and top levels. Snapshot or sequence uncertainty invalidates the book instead of preserving a possibly corrupt view.
 
-The manual signal service consumes only MarketService snapshots and contains no provider call, credential, account, or order method. The browser dashboard reads its five local views through one symbol-scoped `/api/v1/dashboard` snapshot every three seconds; refreshes are single-flight/coalesced and hidden tabs do not poll. Existing granular read endpoints remain available for compatibility, while the unchanged per-IP limiter continues to protect both reads and state changes. A READY signal stays stable until its proxy observation, while ENTER_NOW expires independently after the short entry deadline. PAPER settlement and manual proxy observation are both independent of candle availability: they require a fresh source timestamp at/after the horizon and reject observations more than 30 seconds late. Neither is labeled as Event Futures settlement. The local launcher binds to loopback, Docker publishes port 4100 on host loopback only, and autonomous pause/resume additionally requires a same-origin browser request.
+Order-flow windows are bounded by configured time and storage limits. Aggregate trade direction is derived from the attributed maker flag. Metrics include buyer/seller volume, delta, imbalance, absorption/exhaustion evidence, and spoof-risk heuristics. These are deterministic market microstructure indicators, not claims about participant intent.
 
-## Security
+## Structure, features, and regimes
 
-There are no private credentials or execution endpoints. Provider and user inputs are validated, payloads are size-limited, traversal is blocked, rate limiting and restrictive headers are applied, external requests time out with bounded backoff, and SQLite uses WAL mode.
+Completed-candle structure covers confirmed swings, FVG/IFVG, retests, sweeps, CHoCH/MSS, correction phases, level interactions, and completed-close invalidation. Structural episodes and transitions are durable so restart does not erase active context.
 
-## Gate for live execution
+The normalized feature layer prevents engine-specific interpretation drift. The regime engine classifies exactly one of:
 
-Required before implementation: official contract/payout feed, signed order and idempotency contract, settlement index plus tie/rounding rules, account reconciliation, rate/error documentation, regional authorization, restricted no-withdrawal key, paper/live parity tests and a persistent kill switch. Undocumented browser automation is not an acceptable production substitute.
+1. `LOW_LIQUIDITY`
+2. `ABNORMAL_VOLATILITY`
+3. `HIGH_VOLATILITY`
+4. `COMPRESSION`
+5. `BREAKOUT`
+6. `STRONG_TREND`
+7. `WEAK_TREND`
+8. `RANGE`
 
+Priority is safety-first: incomplete critical inputs classify fail-closed, then low liquidity and abnormal volatility override permissive regimes. `LOW_LIQUIDITY` and `ABNORMAL_VOLATILITY` cannot produce actionable readiness.
 
-## Phase-2 event-driven and isolated runtime
+## Independent horizon engines
 
-The opt-in `phase2` runtime is pinned to `127.0.0.1:4020` with strict-port behavior and uses `data/instances/phase2/` for its launcher lock, runtime state and SQLite database. The default 4100 runtime retains its original lock, state and database paths, so both instances can coexist without process or persistence collisions.
+`app/engine-10m.mjs` emphasizes current 1m flow/trigger, 5m confirmation, near-term structure, and synchronized microstructure. `app/engine-30m.mjs` applies a distinct policy emphasizing 15m/1h context while still requiring current lower-timeframe confirmation. The implementations and regime matrices are physically separate. Both emit deterministic verdict, quality, evidence, blockers, invalidation, regime, version, and audit metadata.
 
-Binance combined WebSocket events update trade, book-ticker and 1m/5m kline state. REST remains authoritative for depth snapshots, bootstraps every timeframe and periodically reconciles 1m/5m/15m/1h as one provider bundle. Atomic REST failover remains Binance→MEXC; stream events are ignored whenever the active reconciled bundle is not the Binance primary, preventing mixed-provider analysis. Required stream channels have persisted LIVE/RECOVERING/STALE/GAP state, exponential reconnect counters and deduplicated alerts. A phase-2 entry fails closed unless all required channels are LIVE.
+The shared entry policy is evaluated when candidates are created and immediately before a PAPER position is persisted. It covers completed 1m trigger, 5m confirmation, 15m alignment, finite invalidation, trigger deadline, event risk, ticker/candle/depth freshness, provider coherence, spread, liquidity, stream health, depth synchronization, order-flow availability, regime safety, and configured confidence safeguards. A transient failure produces WAIT/BLOCKED and can be reevaluated while the candidate remains current.
 
-Migrations 008–010 add persistent correction/level state transitions, unselected prospective forecast observations and feed/alert observability. Forecast observations are captured once per completed-candle decision key for READY and WAIT candidates, then resolved against a timely Spot-proxy observation. Calibration remains WARMUP until its configured sample and reports both directional accuracy and Brier score only afterward. The completed-candle regime classifier labels TREND, RANGE or TRANSITION plus volatility percentile; 10m and 30m candidates use distinct weight matrices per regime. The readiness explainer converts every blocked entry check into an ordered, auditable counterfactual requirement and, when derivable, the next completed-candle observation time.
+## Forecast audit and calibration
+
+Every canonical candidate, including WAIT, is stored prospectively with its decision key and input watermark. Resolution uses the first **complete 1m close after the exact horizon**; forming candles and earlier observations cannot resolve it. Missing timely truth remains explicit.
+
+Calibration is segmented by relevant model/symbol/horizon identity. Isotonic and regularized Platt fits are derived only from resolved prospective rows. Reports include sample counts and probability metrics. Before the configured minimum sample, status is `WARMUP` and calibrated values are null. The system never relabels setup quality or raw directional evidence as calibrated probability.
+
+Counterfactual readiness translates failed gates into ordered requirements and, where derivable, the next complete-candle observation time. It is explanatory only and cannot bypass a gate.
+
+## Replay and walk-forward
+
+The CLI accepts JSON, JSONL, database-export-shaped JSON, or stdin. Replay events are normalized and sorted by `receivedAt + sequence`. Candle close availability is enforced at the replay boundary, preventing decisions from seeing a forming candle or future event. Optional `--from`, `--to`, symbol filtering, deterministic seed, expanding/rolling walk-forward folds, and baselines are supported.
+
+Replay runs, predictions, outcomes, metrics, diagnostics, and folds are persisted through the v0.9 DAO layer. The dashboard/API exposes run summaries. Replay remains offline PAPER research and is not a route to live execution.
+
+## Operations and alert lifecycle
+
+Operational state uses bounded windows and durable episode/audit records. It tracks feed latency, watermark movement/stalls, reconnects, gap/resync events, failover episodes, and recovery. Alerts use one lifecycle with deduplication, hysteresis/cooldown, acknowledgement/resolution state, and restart reconciliation. Recovery closes the existing episode rather than creating disconnected success events.
+
+## Persistence
+
+SQLite uses WAL mode and sequential migrations. Migration `011_v0_9_deep_analytics.sql` adds calibration observations/models/reports, forecast audit, structural episodes, order-flow snapshots, journal records, replay runs/predictions, outcomes, and walk-forward folds. Existing signals, decisions, PAPER positions, event-risk state, stream observations, and alerts remain compatible.
+
+The package includes both `scripts/migrate.mjs` and `scripts/replay.mjs`.
+
+## HTTP/UI composition
+
+`app/server.mjs` composes market, structure, order book, order flow, regime, horizon engines, calibration, replay history, alert, operational, manual-signal, autonomous, and PAPER services. `/health` and API responses identify version `0.9.0`.
+
+The aggregate dashboard endpoint returns a coherent symbol-scoped snapshot containing market, depth, order flow, regime, engines, counterfactuals, calibration, operations, alerts, replay, account, autonomous, and manual signal state. Dedicated operations, calibration, replay-run, feed, alert, source, market, and event-risk reads are available. Browser polling is local and state-changing controls require same origin.
+
+## Security and failure handling
+
+The server binds to loopback, validates query/body/provider payloads, limits request sizes/rates, applies restrictive response headers, and uses bounded timeout/backoff. No secret handling or signing code exists. Unavailable external data is surfaced, never simulated. Unknown source, mixed attribution, malformed payload, stale timestamps, depth discontinuity, and insufficient calibration evidence preserve explicit unavailable/warmup states.
+
+## Live execution gate
+
+Any future live adapter requires independently verified official contract/payout discovery, signed idempotent order semantics, settlement index and tie/rounding rules, reconciliation, account/rate/error contracts, regional authorization, restricted credentials, paper/live parity validation, and a persistent kill switch. See [`live-execution-gate.md`](live-execution-gate.md). Undocumented browser automation and Spot substitution are not acceptable.
