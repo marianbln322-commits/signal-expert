@@ -1,0 +1,1 @@
+ALTER TABLE paper_positions ADD COLUMN entry_gate_json TEXT NOT NULL DEFAULT '{"classification":"NOT_EVALUATED_PRE_V0_5","policyVersion":null,"reason":"Position predates entry-gate audit migration."}';

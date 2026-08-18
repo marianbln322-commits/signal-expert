@@ -1,0 +1,20 @@
+{
+  "name": "signal-expert",
+  "version": "0.9.0",
+  "private": true,
+  "type": "module",
+  "description": "Transparent Binance-primary market analytics and event-futures research platform",
+  "engines": { "node": ">=22.5" },
+  "scripts": {
+    "dev": "node --watch app/server.mjs",
+    "start": "node app/server.mjs",
+    "start:4020": "node launcher.mjs --instance phase2 --port 4020 --strict-port --database data/instances/phase2/signal-expert.db --stream",
+    "build": "node scripts/build.mjs",
+    "lint": "node --check app/config.mjs && node --check app/quant.mjs && node --check app/mexc-provider.mjs && node --check app/binance-stream-provider.mjs && node --check app/alert-service.mjs && node --check app/operational-service.mjs && node --check app/feed-observability-service.mjs && node --check app/order-book-service.mjs && node --check app/order-flow.mjs && node --check app/reaction-zone-engine.mjs && node --check app/signal-features.mjs && node --check app/regime-engine.mjs && node --check app/engine-10m.mjs && node --check app/engine-30m.mjs && node --check app/counterfactual-engine.mjs && node --check app/readiness.mjs && node --check app/calibration.mjs && node --check app/calibration-service.mjs && node --check app/replay-service.mjs && node --check app/structure-state-service.mjs && node --check app/event-risk-service.mjs && node --check app/entry-gates.mjs && node --check app/database.mjs && node --check app/market-service.mjs && node --check app/paper-service.mjs && node --check app/autonomous-service.mjs && node --check app/manual-signal-service.mjs && node --check app/server.mjs && node --check scripts/replay.mjs && node --check launcher.mjs && node --check public/app.js",
+    "replay": "node scripts/replay.mjs",
+    "typecheck": "npm run lint",
+    "test": "node --test",
+    "db:migrate": "node scripts/migrate.mjs",
+    "package:release": "node scripts/package-release.mjs"
+  }
+}
